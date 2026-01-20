@@ -1,0 +1,523 @@
+const std = @import("std");
+const posix = std.posix;
+const core = @import("core");
+const ipc = core.ipc;
+const state = @import("state.zig");
+const server = @import("server.zig");
+const persist = @import("persist.zig");
+
+/// Arguments for ses commands
+pub const SesArgs = struct {
+    daemon: bool = false,
+    debug: bool = false,
+    list: bool = false,
+    full: bool = false,
+    notify_message: ?[]const u8 = null,
+    notify_uuid: ?[]const u8 = null,
+};
+
+/// Debug logging - only outputs when debug mode is enabled
+pub var debug_enabled: bool = false;
+
+pub fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!debug_enabled) return;
+    std.debug.print("[ses] " ++ fmt ++ "\n", args);
+}
+
+pub fn debugLogUuid(uuid: []const u8, comptime fmt: []const u8, args: anytype) void {
+    if (!debug_enabled) return;
+    const short_uuid = if (uuid.len >= 8) uuid[0..8] else uuid;
+    std.debug.print("[ses][{s}] " ++ fmt ++ "\n", .{short_uuid} ++ args);
+}
+
+/// Entry point for ses daemon - can be called directly from unified CLI
+pub fn run(args: SesArgs) !void {
+    const page_alloc = std.heap.page_allocator;
+
+    // Notify mode - send notification to muxes/panes (use page_alloc, no fork)
+    if (args.notify_message) |msg| {
+        try sendNotify(page_alloc, msg, args.notify_uuid);
+        return;
+    }
+
+    // List mode - connect to running daemon and show status (use page_alloc, no fork)
+    if (args.list) {
+        try listStatus(page_alloc, args.full);
+        return;
+    }
+
+    // Enable debug mode if requested
+    debug_enabled = args.debug;
+
+    // Avoid multiple daemons: if ses socket is connectable, exit.
+    {
+        const check_alloc = std.heap.page_allocator;
+        const socket_path = ipc.getSesSocketPath(check_alloc) catch "";
+        defer if (socket_path.len > 0) check_alloc.free(socket_path);
+
+        if (socket_path.len > 0) {
+            if (ipc.Client.connect(socket_path)) |c0| {
+                var c = c0;
+                c.close();
+                if (!args.daemon) {
+                    std.debug.print("ses daemon already running at: {s}\n", .{socket_path});
+                }
+                return;
+            } else |_| {
+                // Not running or stale socket.
+            }
+        }
+    }
+
+    // Daemonize BEFORE creating GPA
+    if (args.daemon) {
+        try daemonize();
+    }
+
+    // Now create GPA AFTER fork - this ensures clean allocator state
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // Initialize state
+    var ses_state = state.SesState.init(allocator);
+    defer ses_state.deinit();
+
+    // Load persisted registry/layout (best-effort)
+    persist.load(allocator, &ses_state) catch {};
+
+    // Initialize server
+    var srv = server.Server.init(allocator, &ses_state) catch |err| {
+        if (!args.daemon) {
+            std.debug.print("ses: server init failed: {}\n", .{err});
+        }
+        return err;
+    };
+    defer srv.deinit();
+
+    // Set up signal handlers
+    setupSignalHandlers(&srv);
+
+    // Print socket path if not daemon
+    if (!args.daemon) {
+        const socket_path = ipc.getSesSocketPath(allocator) catch "";
+        defer if (socket_path.len > 0) allocator.free(socket_path);
+        std.debug.print("ses: listening on {s}\n", .{socket_path});
+    }
+
+    // Run server
+    srv.run() catch |err| {
+        if (!args.daemon) {
+            std.debug.print("Server error: {}\n", .{err});
+        }
+        return err;
+    };
+}
+
+pub fn main() !void {
+    // Use page_allocator for arg parsing before fork (survives fork cleanly)
+    const page_alloc = std.heap.page_allocator;
+
+    const args = try std.process.argsAlloc(page_alloc);
+    defer std.process.argsFree(page_alloc, args);
+
+    // Check for command modes
+    var ses_args = SesArgs{};
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--daemon") or std.mem.eql(u8, arg, "-d")) {
+            ses_args.daemon = true;
+        } else if (std.mem.eql(u8, arg, "--list") or std.mem.eql(u8, arg, "-l")) {
+            ses_args.list = true;
+        } else if (std.mem.eql(u8, arg, "--full") or std.mem.eql(u8, arg, "-f")) {
+            ses_args.full = true;
+        } else if (std.mem.eql(u8, arg, "--notify") or std.mem.eql(u8, arg, "-n")) {
+            // Next arg is the message
+            if (i + 1 < args.len) {
+                i += 1;
+                ses_args.notify_message = args[i];
+            } else {
+                print("Error: --notify requires a message argument\n", .{});
+                return;
+            }
+        } else if (std.mem.eql(u8, arg, "--uuid") or std.mem.eql(u8, arg, "-u")) {
+            // Next arg is the UUID (mux or pane)
+            if (i + 1 < args.len) {
+                i += 1;
+                ses_args.notify_uuid = args[i];
+            } else {
+                print("Error: --uuid requires a UUID argument\n", .{});
+                return;
+            }
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printUsage();
+            return;
+        }
+    }
+
+    try run(ses_args);
+}
+
+fn print(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    _ = posix.write(posix.STDOUT_FILENO, msg) catch {};
+}
+
+fn printUsage() !void {
+    print(
+        \\hexa-ses - PTY session server
+        \\
+        \\Usage: hexa-ses [OPTIONS]
+        \\
+        \\Options:
+        \\  -d, --daemon       Run as a background daemon
+        \\  -l, --list         List connected muxes and their panes
+        \\  -f, --full         Show full tree (use with --list)
+        \\  -n, --notify MSG   Send notification to all connected muxes
+        \\  -u, --uuid UUID    Target specific mux or pane (use with --notify)
+        \\  -h, --help         Show this help message
+        \\
+        \\Notification targeting:
+        \\  --notify "msg"                   Broadcast to all muxes (MUX realm)
+        \\  --notify "msg" --uuid <mux_uuid> Send to specific mux (MUX realm)
+        \\  --notify "msg" --uuid <pane_uuid> Send to specific pane (PANE realm)
+        \\
+        \\The ses server holds PTY file descriptors to keep processes alive
+        \\when mux clients disconnect. It is automatically started by mux
+        \\if not already running.
+        \\
+    , .{});
+}
+
+fn sendNotify(allocator: std.mem.Allocator, message: []const u8, target_uuid: ?[]const u8) !void {
+    // Connect to running daemon
+    const socket_path = try ipc.getSesSocketPath(allocator);
+    defer allocator.free(socket_path);
+
+    var client = ipc.Client.connect(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            print("ses daemon is not running\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+
+    // Send notify request (broadcast or targeted)
+    var buf: [4096]u8 = undefined;
+    const request = if (target_uuid) |uuid|
+        std.fmt.bufPrint(&buf, "{{\"type\":\"targeted_notify\",\"message\":\"{s}\",\"uuid\":\"{s}\"}}", .{ message, uuid }) catch {
+            print("Message too long\n", .{});
+            return;
+        }
+    else
+        std.fmt.bufPrint(&buf, "{{\"type\":\"broadcast_notify\",\"message\":\"{s}\"}}", .{message}) catch {
+            print("Message too long\n", .{});
+            return;
+        };
+    try conn.sendLine(request);
+
+    // Receive response
+    var resp_buf: [256]u8 = undefined;
+    const line = try conn.recvLine(&resp_buf);
+    if (line) |resp| {
+        if (std.mem.indexOf(u8, resp, "\"ok\"") != null) {
+            print("Notification sent\n", .{});
+        } else if (std.mem.indexOf(u8, resp, "\"not_found\"") != null) {
+            print("Target UUID not found\n", .{});
+        } else {
+            print("Failed to send notification\n", .{});
+        }
+    }
+}
+
+fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
+    // Connect to running daemon
+    const socket_path = try ipc.getSesSocketPath(allocator);
+    defer allocator.free(socket_path);
+
+    var client = ipc.Client.connect(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            print("ses daemon is not running\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+
+    // Always request full status to get the tree
+    _ = full_mode;
+    try conn.sendLine("{\"type\":\"status\",\"full\":true}");
+
+    // Receive response - use larger buffer for full mode
+    var buf: [65536]u8 = undefined;
+    const line = try conn.recvLine(&buf);
+    if (line == null) {
+        print("No response from daemon\n", .{});
+        return;
+    }
+
+    // Parse and display
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line.?, .{}) catch {
+        print("Invalid response from daemon\n", .{});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    // Print clients (connected muxes) - only if there are any
+    if (root.get("clients")) |clients_val| {
+        const clients = clients_val.array;
+        if (clients.items.len > 0) {
+            print("Connected muxes: {d}\n", .{clients.items.len});
+
+            for (clients.items) |client_val| {
+                const c = client_val.object;
+                const id = c.get("id").?.integer;
+                const panes = c.get("panes").?.array;
+
+                // Get session name and id if available
+                const name = if (c.get("session_name")) |n| n.string else "unknown";
+                const sid = if (c.get("session_id")) |s| s.string else null;
+
+                if (sid) |session_id| {
+                    print("  {s} [{s}] (mux #{d}, {d} panes)\n", .{ name, session_id[0..8], id, panes.items.len });
+                } else {
+                    print("  {s} (mux #{d}, {d} panes)\n", .{ name, id, panes.items.len });
+                }
+
+                // Always show full mux state tree if available
+                if (c.get("mux_state")) |mux_state_val| {
+                    printMuxStateTree(allocator, mux_state_val.string, "    ");
+                } else {
+                    for (panes.items) |pane_val| {
+                        const p = pane_val.object;
+                        const uuid = p.get("uuid").?.string;
+                        const pid = p.get("pid").?.integer;
+
+                        print("    [{s}] pid={d}", .{ uuid[0..8], pid });
+
+                        if (p.get("sticky_pwd")) |pwd| {
+                            print(" pwd={s}", .{pwd.string});
+                        }
+                        print("\n", .{});
+                    }
+                }
+            }
+        }
+    }
+
+    // Print detached sessions
+    if (root.get("detached_sessions")) |sessions_val| {
+        const sessions = sessions_val.array;
+        if (sessions.items.len > 0) {
+            print("\nDetached sessions: {d}\n", .{sessions.items.len});
+
+            for (sessions.items) |sess_val| {
+                const s = sess_val.object;
+                const sid = s.get("session_id").?.string;
+                const pane_count = s.get("pane_count").?.integer;
+                const name = if (s.get("session_name")) |n| n.string else "unknown";
+
+                print("  {s} [{s}] {d} panes - reattach: hexa-mux -a {s}\n", .{ name, sid[0..8], pane_count, name });
+
+                // Always show full mux state tree if available
+                if (s.get("mux_state")) |mux_state_val| {
+                    printMuxStateTree(allocator, mux_state_val.string, "    ");
+                }
+            }
+        }
+    }
+
+    // Print orphaned panes (disowned)
+    if (root.get("orphaned")) |orphaned_val| {
+        const orphaned = orphaned_val.array;
+        if (orphaned.items.len > 0) {
+            print("\nOrphaned panes (disowned): {d}\n", .{orphaned.items.len});
+
+            for (orphaned.items) |pane_val| {
+                const p = pane_val.object;
+                const uuid = p.get("uuid").?.string;
+                const pid = p.get("pid").?.integer;
+
+                print("  [{s}] pid={d}\n", .{ uuid[0..8], pid });
+            }
+        }
+    }
+
+    // Print sticky panes
+    if (root.get("sticky")) |sticky_val| {
+        const sticky = sticky_val.array;
+        if (sticky.items.len > 0) {
+            print("\nSticky panes: {d}\n", .{sticky.items.len});
+
+            for (sticky.items) |pane_val| {
+                const p = pane_val.object;
+                const uuid = p.get("uuid").?.string;
+                const pid = p.get("pid").?.integer;
+
+                print("  [{s}] pid={d}", .{ uuid[0..8], pid });
+
+                if (p.get("pwd")) |pwd| {
+                    print(" pwd={s}", .{pwd.string});
+                }
+                if (p.get("key")) |key| {
+                    print(" key={s}", .{key.string});
+                }
+                print("\n", .{});
+            }
+        }
+    }
+}
+
+fn printMuxStateTree(allocator: std.mem.Allocator, mux_state_json: []const u8, indent: []const u8) void {
+    // Parse the mux state JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, mux_state_json, .{}) catch {
+        print("{s}(failed to parse mux state)\n", .{indent});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    // Print tabs
+    if (root.get("tabs")) |tabs_val| {
+        const tabs = tabs_val.array;
+        const active_tab = if (root.get("active_tab")) |at| @as(usize, @intCast(at.integer)) else 0;
+
+        for (tabs.items, 0..) |tab_val, ti| {
+            const tab = tab_val.object;
+            const tab_name = if (tab.get("name")) |n| n.string else "tab";
+            const marker = if (ti == active_tab) "*" else " ";
+
+            print("{s}{s} Tab: {s}\n", .{ indent, marker, tab_name });
+
+            // Print panes in this tab
+            if (tab.get("panes")) |panes_val| {
+                const panes = panes_val.array;
+                for (panes.items) |pane_val| {
+                    const pane = pane_val.object;
+                    const uuid = if (pane.get("uuid")) |u| u.string else "?";
+                    const pane_id = if (pane.get("id")) |id| @as(i64, id.integer) else 0;
+                    const focused = if (pane.get("focused")) |f| f.bool else false;
+                    const focus_marker = if (focused) ">" else " ";
+
+                    print("{s}  {s} Pane {d} [{s}]\n", .{ indent, focus_marker, pane_id, uuid[0..@min(8, uuid.len)] });
+                }
+            }
+
+            // Print layout tree if present
+            if (tab.get("tree")) |tree_val| {
+                if (tree_val != .null) {
+                    printLayoutTree(tree_val.object, indent, 2);
+                }
+            }
+        }
+    }
+
+    // Print floats
+    if (root.get("floats")) |floats_val| {
+        const floats = floats_val.array;
+        if (floats.items.len > 0) {
+            const active_float = if (root.get("active_floating")) |af|
+                if (af != .null) @as(?usize, @intCast(af.integer)) else null
+            else
+                null;
+
+            print("{s}Floats:\n", .{indent});
+            for (floats.items, 0..) |float_val, fi| {
+                const float = float_val.object;
+                const uuid = if (float.get("uuid")) |u| u.string else "?";
+                const visible = if (float.get("visible")) |v| v.bool else true;
+                const is_pwd = if (float.get("is_pwd")) |p| p.bool else false;
+                const marker = if (active_float != null and active_float.? == fi) "*" else " ";
+                const vis_str = if (visible) "" else " (hidden)";
+                const pwd_str = if (is_pwd) " [pwd]" else "";
+
+                print("{s}  {s} Float [{s}]{s}{s}\n", .{ indent, marker, uuid[0..@min(8, uuid.len)], pwd_str, vis_str });
+            }
+        }
+    }
+}
+
+fn printLayoutTree(_: std.json.ObjectMap, _: []const u8, _: usize) void {
+    // Layout tree printing is optional - the pane list above shows the essentials
+}
+
+fn daemonize() !void {
+    // First fork
+    const pid1 = try posix.fork();
+    if (pid1 != 0) {
+        // Parent exits
+        posix.exit(0);
+    }
+
+    // Create new session
+    _ = posix.setsid() catch {};
+
+    // Second fork (prevent reacquiring terminal)
+    const pid2 = try posix.fork();
+    if (pid2 != 0) {
+        // First child exits
+        posix.exit(0);
+    }
+
+    // We are now the daemon process
+
+    // Redirect stdin/stdout/stderr to /dev/null
+    const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch return;
+    posix.dup2(devnull, posix.STDIN_FILENO) catch {};
+    posix.dup2(devnull, posix.STDOUT_FILENO) catch {};
+    posix.dup2(devnull, posix.STDERR_FILENO) catch {};
+    if (devnull > 2) {
+        posix.close(devnull);
+    }
+
+    // Change to root directory
+    std.posix.chdir("/") catch {};
+}
+
+var global_server: ?*server.Server = null;
+
+fn setupSignalHandlers(srv: *server.Server) void {
+    global_server = srv;
+
+    // Ignore SIGPIPE - we handle closed connections gracefully
+    const sigpipe_action = std.os.linux.Sigaction{
+        .handler = .{ .handler = std.os.linux.SIG.IGN },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.os.linux.sigaction(posix.SIG.PIPE, &sigpipe_action, null);
+
+    // Set up SIGTERM and SIGINT handlers
+    const sigterm_action = std.os.linux.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+
+    _ = std.os.linux.sigaction(posix.SIG.TERM, &sigterm_action, null);
+    _ = std.os.linux.sigaction(posix.SIG.INT, &sigterm_action, null);
+}
+
+fn signalHandler(sig: c_int) callconv(.c) void {
+    _ = sig;
+    if (global_server) |srv| {
+        srv.stop();
+    }
+}
+
+// Module exports for use by mux
+pub const SesState = state.SesState;
+pub const Pane = state.Pane;
+pub const PaneState = state.PaneState;
+pub const Client = state.Client;
+pub const Server = server.Server;
