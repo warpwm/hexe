@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
 const ipc = core.ipc;
+const log = core.log;
 const ses = @import("main.zig");
 
 /// Pane state - minimal, just keeps process alive
@@ -518,9 +519,12 @@ pub const SesState = struct {
         sticky_key: ?u8,
     ) !*Pane {
         const uuid = ipc.generateUuid();
+        log.infoUuid(&uuid, "createPane: client_id={d} shell={s} cwd={s}", .{ client_id, shell, cwd orelse "(null)" });
+
         const pod_socket_path = try ipc.getPodSocketPath(self.allocator, &uuid);
 
         const spawn = try self.spawnPod(uuid, pod_socket_path, shell, cwd);
+        log.debugUuid(&uuid, "createPane: pod spawned pid={d} child_pid={d}", .{ spawn.pod_pid, spawn.child_pid });
 
         // Copy sticky_pwd if provided
         const owned_pwd: ?[]const u8 = if (sticky_pwd) |pwd|
@@ -563,6 +567,7 @@ pub const SesState = struct {
         shell: []const u8,
         cwd: ?[]const u8,
     ) !struct { pod_pid: posix.pid_t, child_pid: posix.pid_t } {
+        log.traceUuid(&uuid, "spawnPod: socket={s}", .{pod_socket_path});
         var args_list: std.ArrayList([]const u8) = .empty;
         defer args_list.deinit(self.allocator);
 
@@ -581,6 +586,11 @@ pub const SesState = struct {
         if (cwd) |dir| {
             try args_list.append(self.allocator, "--cwd");
             try args_list.append(self.allocator, dir);
+        }
+        // Pass debug logfile to pod if set in ses
+        if (ses.g_logfile) |logpath| {
+            try args_list.append(self.allocator, "--debug-log");
+            try args_list.append(self.allocator, logpath);
         }
         try args_list.append(self.allocator, "--foreground");
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
 const ipc = core.ipc;
+const log = core.log;
 const state = @import("state.zig");
 
 // Import handler modules
@@ -114,6 +115,7 @@ pub const Server = struct {
             // Check server socket for new connections
             if (poll_fds.items[0].revents & posix.POLL.IN != 0) {
                 if (self.socket.tryAccept() catch null) |conn| {
+                    log.debug("New connection accepted: fd={d}", .{conn.fd});
                     try poll_fds.append(page_alloc, .{
                         .fd = conn.fd,
                         .events = posix.POLL.IN,
@@ -180,6 +182,7 @@ pub const Server = struct {
         // Parse JSON message - use page_allocator to avoid GPA issues after fork
         const page_alloc = std.heap.page_allocator;
         const parsed = std.json.parseFromSlice(std.json.Value, page_alloc, msg, .{}) catch {
+            log.warn("handleMessage: invalid JSON from fd={d}", .{fd});
             try self.sendError(conn, "invalid_json");
             return;
         };
@@ -187,11 +190,20 @@ pub const Server = struct {
 
         const root = parsed.value.object;
         const msg_type = root.get("type") orelse {
+            log.warn("handleMessage: missing type from fd={d}", .{fd});
             try self.sendError(conn, "missing_type");
             return;
         };
 
         const type_str = msg_type.string;
+        // Only log non-frequent message types (skip update_pane_aux, sync_state, get_pane_cwd, ping)
+        if (!std.mem.eql(u8, type_str, "update_pane_aux") and
+            !std.mem.eql(u8, type_str, "sync_state") and
+            !std.mem.eql(u8, type_str, "get_pane_cwd") and
+            !std.mem.eql(u8, type_str, "ping"))
+        {
+            log.debug("handleMessage: type={s} fd={d} client_id={any}", .{ type_str, fd, client_id });
+        }
 
         // Read-only queries - don't need a registered client
         if (std.mem.eql(u8, type_str, "ping")) {

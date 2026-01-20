@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
+const mux_main = @import("main.zig");
 
 /// Client for communicating with the ses daemon
 pub const SesClient = struct {
@@ -139,8 +140,26 @@ pub const SesClient = struct {
     /// Start the ses daemon
     fn startSes(self: *SesClient) !void {
         _ = self;
+        // Build command with optional logfile
+        var args_buf: [5][]const u8 = undefined;
+        var arg_count: usize = 0;
+        args_buf[arg_count] = "hexe";
+        arg_count += 1;
+        args_buf[arg_count] = "ses";
+        arg_count += 1;
+        args_buf[arg_count] = "daemon";
+        arg_count += 1;
+
+        // Pass debug logfile if set by mux
+        if (mux_main.g_logfile) |logpath| {
+            args_buf[arg_count] = "--debug-log";
+            arg_count += 1;
+            args_buf[arg_count] = logpath;
+            arg_count += 1;
+        }
+
         // Fork and exec hexe ses daemon
-        var child = std.process.Child.init(&[_][]const u8{ "hexe", "ses", "daemon" }, std.heap.page_allocator);
+        var child = std.process.Child.init(args_buf[0..arg_count], std.heap.page_allocator);
         child.spawn() catch |err| {
             std.debug.print("Failed to start ses daemon: {}\n", .{err});
             return err;

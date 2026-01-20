@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
 const ipc = core.ipc;
+const log = core.log;
 const state = @import("state.zig");
 const server = @import("server.zig");
 const persist = @import("persist.zig");
@@ -14,7 +15,12 @@ pub const SesArgs = struct {
     full: bool = false,
     notify_message: ?[]const u8 = null,
     notify_uuid: ?[]const u8 = null,
+    /// Optional debug log file path (chained to pods)
+    logfile: ?[]const u8 = null,
 };
+
+/// Global debug log file path (set from args, used by daemonize and passed to pods)
+pub var g_logfile: ?[]const u8 = null;
 
 /// Debug logging - only outputs when debug mode is enabled
 pub var debug_enabled: bool = false;
@@ -49,6 +55,9 @@ pub fn run(args: SesArgs) !void {
     // Enable debug mode if requested
     debug_enabled = args.debug;
 
+    // Set global logfile for daemonize and pod spawning
+    g_logfile = args.logfile;
+
     // Avoid multiple daemons: if ses socket is connectable, exit.
     {
         const check_alloc = std.heap.page_allocator;
@@ -73,6 +82,17 @@ pub fn run(args: SesArgs) !void {
     if (args.daemon) {
         try daemonize();
     }
+
+    // Initialize logging (after daemonize, stderr is already redirected to logfile)
+    // For daemon mode, use stderr fd (which daemonize redirected to logfile)
+    // For foreground mode, use the logfile path if provided
+    if (args.daemon) {
+        log.initWithFd(posix.STDERR_FILENO, .ses);
+    } else if (g_logfile) |logpath| {
+        log.init(logpath, .ses);
+    }
+    defer log.deinit();
+    log.info("=== SES STARTING === (daemon={any}, debug={any})", .{ args.daemon, args.debug });
 
     // Now create GPA AFTER fork - this ensures clean allocator state
     // Note: GPA still has issues after fork, so we use page_allocator for most operations
@@ -468,12 +488,14 @@ fn daemonize() !void {
 
     // We are now the daemon process
 
-    // Redirect stdin/stdout to /dev/null, stderr to debug log
+    // Redirect stdin/stdout to /dev/null
     const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch return;
     posix.dup2(devnull, posix.STDIN_FILENO) catch {};
     posix.dup2(devnull, posix.STDOUT_FILENO) catch {};
-    // Keep stderr for debugging - write to a log file
-    const logfd = posix.open("/tmp/hexe-ses-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch {
+
+    // Redirect stderr to debug logfile if specified, else default location
+    const logpath = g_logfile orelse "/tmp/hexe-ses-debug.log";
+    const logfd = posix.open(logpath, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch {
         posix.dup2(devnull, posix.STDERR_FILENO) catch {};
         if (devnull > 2) posix.close(devnull);
         std.posix.chdir("/") catch {};

@@ -3,6 +3,7 @@ const posix = std.posix;
 const core = @import("core");
 const ghostty = @import("ghostty-vt");
 const pod_protocol = core.pod_protocol;
+const log = core.log;
 
 const notification = @import("notification.zig");
 const NotificationManager = notification.NotificationManager;
@@ -83,6 +84,10 @@ pub const Pane = struct {
 
     // Tracks whether we saw a clear-screen sequence in the last output.
     did_clear: bool = false,
+    // Track VT feed errors for recovery
+    vt_error_count: u16 = 0,
+    // Rate limiting: frames processed this poll cycle
+    frames_this_poll: usize = 0,
     // Keep last bytes so we can detect escape sequences across boundaries.
     esc_tail: [3]u8 = .{ 0, 0, 0 },
     esc_tail_len: u8 = 0,
@@ -163,6 +168,8 @@ pub const Pane = struct {
     /// Initialize a pane backed by a per-pane pod process.
     /// `pod_socket_path` is duped and owned by the pane.
     pub fn initWithPod(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16, pod_socket_path: []const u8, uuid: [32]u8) !void {
+        log.infoUuid(&uuid, "initWithPod: id={d} size={d}x{d} socket={s}", .{ id, width, height, pod_socket_path });
+
         self.* = .{ .allocator = allocator, .id = id, .x = x, .y = y, .width = width, .height = height, .uuid = uuid };
 
         const owned_path = try allocator.dupe(u8, pod_socket_path);
@@ -183,9 +190,11 @@ pub const Pane = struct {
 
         // Tell pod initial size.
         self.sendResizeToPod(width, height);
+        log.debugUuid(&uuid, "initWithPod: complete", .{});
     }
 
     pub fn deinit(self: *Pane) void {
+        log.infoUuid(&self.uuid, "deinit: closing pane id={d}", .{self.id});
         switch (self.backend) {
             .local => |*pty| pty.close(),
             .pod => |*pod| pod.deinit(self.allocator),
@@ -276,6 +285,7 @@ pub const Pane = struct {
     /// Read from backend and feed to VT. Returns true if data was read.
     pub fn poll(self: *Pane, buffer: []u8) !bool {
         self.did_clear = false;
+        self.frames_this_poll = 0; // Reset rate limit counter
 
         return switch (self.backend) {
             .local => |*pty| blk: {
@@ -303,8 +313,15 @@ pub const Pane = struct {
         };
     }
 
+    const MAX_FRAMES_PER_POLL: usize = 16;
+
     fn podFrameCallback(ctx: *anyopaque, frame: pod_protocol.Frame) void {
         const self: *Pane = @ptrCast(@alignCast(ctx));
+        // Rate limit: skip excess frames this poll cycle to prevent overwhelming VT
+        if (self.frames_this_poll >= MAX_FRAMES_PER_POLL) {
+            return;
+        }
+        self.frames_this_poll += 1;
         self.handlePodFrame(frame);
     }
 
@@ -312,9 +329,15 @@ pub const Pane = struct {
         switch (frame.frame_type) {
             .output => {
                 self.processOutput(frame.payload);
-                self.vt.feed(frame.payload) catch {};
+                self.vt.feed(frame.payload) catch |err| {
+                    // Log error and track for potential recovery
+                    log.warnUuid(&self.uuid, "VT feed error: {} (error_count={d}, payload_len={d})", .{ err, self.vt_error_count, frame.payload.len });
+                    self.vt_error_count +|= 1; // Saturating add to prevent overflow
+                };
             },
-            .backlog_end => {},
+            .backlog_end => {
+                log.debugUuid(&self.uuid, "Received backlog_end", .{});
+            },
             else => {},
         }
     }
@@ -608,7 +631,7 @@ pub const Pane = struct {
     }
 
     /// Get a stable snapshot of the viewport for rendering.
-    pub fn getRenderState(self: *Pane) !*const ghostty.RenderState {
+    pub fn getRenderState(self: *Pane) *const ghostty.RenderState {
         return self.vt.getRenderState();
     }
 
@@ -711,6 +734,37 @@ pub const Pane = struct {
     /// Check if we're scrolled (not at bottom)
     pub fn isScrolled(self: *Pane) bool {
         return !self.vt.terminal.screens.active.viewportIsBottom();
+    }
+
+    /// Check and recover from corrupted VT state if too many errors have occurred.
+    /// Returns true if recovery was attempted.
+    pub fn recoverVtIfNeeded(self: *Pane) bool {
+        const VT_ERROR_THRESHOLD: u16 = 10;
+        if (self.vt_error_count < VT_ERROR_THRESHOLD) {
+            return false;
+        }
+
+        log.warnUuid(&self.uuid, "RECOVERY: attempting VT reset after {d} errors", .{self.vt_error_count});
+
+        // Reset VT state
+        self.vt.deinit();
+        self.vt.init(self.allocator, self.width, self.height) catch |err| {
+            log.errUuid(&self.uuid, "RECOVERY FAILED: reinit error: {}", .{err});
+            return false;
+        };
+        self.vt_error_count = 0;
+
+        // For pod panes, send resize to trigger state refresh from pod
+        switch (self.backend) {
+            .pod => {
+                log.infoUuid(&self.uuid, "RECOVERY: sending resize to trigger backlog replay", .{});
+                self.sendResizeToPod(self.width, self.height);
+            },
+            else => {},
+        }
+
+        log.infoUuid(&self.uuid, "RECOVERY: complete", .{});
+        return true;
     }
 
     /// Show a notification on this pane

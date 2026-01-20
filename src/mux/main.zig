@@ -253,6 +253,7 @@ const State = struct {
 
     /// Create a new tab with one pane
     fn createTab(self: *State) !void {
+        core.log.info("createTab: creating new tab (current count={d})", .{self.tabs.items.len});
         const parent_uuid = self.getCurrentFocusedUuid();
         // Get cwd from currently focused pane, or use mux's cwd for first tab
         var cwd: ?[]const u8 = null;
@@ -287,6 +288,7 @@ const State = struct {
     fn closeCurrentTab(self: *State) bool {
         if (self.tabs.items.len <= 1) return false;
         const closing_tab = self.active_tab;
+        core.log.info("closeCurrentTab: closing tab {d} of {d}", .{ closing_tab, self.tabs.items.len });
 
         // Handle tab-bound floats belonging to this tab
         var i: usize = 0;
@@ -978,8 +980,12 @@ const State = struct {
         if (!self.ses_client.isConnected()) return;
         if (pane.uuid[0] == 0) return; // Skip if UUID not set
 
+        const start = std.time.milliTimestamp();
+        core.log.debugUuid(&pane.uuid, "syncPaneFocus: START", .{});
+
         // First unfocus all panes
         self.unfocusAllPanes();
+        core.log.debugUuid(&pane.uuid, "syncPaneFocus: after unfocusAllPanes", .{});
 
         // Then focus this pane
         pane.focused = true;
@@ -999,9 +1005,16 @@ const State = struct {
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
+        core.log.debugUuid(&pane.uuid, "syncPaneFocus: after updatePaneAux", .{});
 
         // Sync full state so hexe com list shows updated focus
         self.syncStateToSes();
+        core.log.debugUuid(&pane.uuid, "syncPaneFocus: after syncStateToSes", .{});
+
+        const elapsed = std.time.milliTimestamp() - start;
+        if (elapsed > 5) {
+            core.log.warnUuid(&pane.uuid, "syncPaneFocus: SLOW took {d}ms", .{elapsed});
+        }
     }
 
     /// Sync that a pane lost focus
@@ -1084,11 +1097,26 @@ pub const MuxArgs = struct {
     attach: ?[]const u8 = null,
     notify_message: ?[]const u8 = null,
     list: bool = false,
+    /// Optional debug log file path (chained to ses and pods)
+    logfile: ?[]const u8 = null,
 };
+
+/// Global debug log file path (set from args, passed to ses)
+pub var g_logfile: ?[]const u8 = null;
 
 /// Entry point for mux - can be called directly from unified CLI
 pub fn run(mux_args: MuxArgs) !void {
     const allocator = std.heap.page_allocator;
+
+    // Set global logfile for ses spawning
+    g_logfile = mux_args.logfile;
+
+    // Initialize logging
+    if (mux_args.logfile) |logpath| {
+        core.log.init(logpath, .mux);
+        core.log.info("=== MUX STARTING ===", .{});
+    }
+    defer core.log.deinit();
 
     // Handle --notify: send to parent mux and exit
     if (mux_args.notify_message) |msg| {
@@ -1481,6 +1509,21 @@ fn runMainLoop(state: *State) !void {
                     dead_floating.append(allocator, fi) catch {};
                 }
                 idx += 1;
+            }
+        }
+
+        // Check for VT recovery on all panes (helps recover from fast output corruption)
+        {
+            var recovery_pane_it = state.currentLayout().splitIterator();
+            while (recovery_pane_it.next()) |pane| {
+                if (pane.*.recoverVtIfNeeded()) {
+                    state.needs_render = true;
+                }
+            }
+            for (state.floats.items) |pane| {
+                if (pane.recoverVtIfNeeded()) {
+                    state.needs_render = true;
+                }
             }
         }
 
@@ -3123,7 +3166,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
     // Draw splits into the cell buffer
     var pane_it = state.currentLayout().splitIterator();
     while (pane_it.next()) |pane| {
-        const render_state = pane.*.getRenderState() catch continue;
+        const render_state = pane.*.getRenderState();
         renderer.drawRenderState(render_state, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
 
         const is_scrolled = pane.*.isScrolled();
@@ -3157,7 +3200,7 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
 
         borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, "", pane.border_color, pane.float_style);
 
-        const render_state = pane.getRenderState() catch continue;
+        const render_state = pane.getRenderState();
         renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
 
         if (pane.isScrolled()) {
@@ -3181,9 +3224,8 @@ fn renderTo(state: *State, stdout: std.fs.File) !void {
         if (pane.isVisibleOnTab(state.active_tab) and can_render) {
             borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, "", pane.border_color, pane.float_style);
 
-            if (pane.getRenderState()) |render_state| {
-                renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
-            } else |_| {}
+            const render_state = pane.getRenderState();
+            renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
 
             if (pane.isScrolled()) {
                 borders.drawScrollIndicator(renderer, pane.x, pane.y, pane.width);

@@ -3,6 +3,7 @@ const posix = std.posix;
 
 const core = @import("core");
 const pod_protocol = core.pod_protocol;
+const log = core.log;
 
 pub const PodArgs = struct {
     daemon: bool = true,
@@ -12,7 +13,12 @@ pub const PodArgs = struct {
     cwd: ?[]const u8 = null,
     /// When true, print a single JSON line on stdout once ready.
     emit_ready: bool = false,
+    /// Optional debug log file path (shared with ses)
+    logfile: ?[]const u8 = null,
 };
+
+/// Global debug log file path (set from args, used by daemonize)
+var g_logfile: ?[]const u8 = null;
 
 /// Run a per-pane pod process.
 ///
@@ -26,9 +32,21 @@ pub fn run(args: PodArgs) !void {
 
     const sh = args.shell orelse (posix.getenv("SHELL") orelse "/bin/sh");
 
+    // Set global logfile for daemonize
+    g_logfile = args.logfile;
+
     if (args.daemon) {
         try daemonize();
     }
+
+    // Initialize logging (after daemonize, stderr is already redirected to logfile)
+    if (args.daemon) {
+        log.initWithFd(posix.STDERR_FILENO, .pod);
+    } else if (g_logfile) |logpath| {
+        log.init(logpath, .pod);
+    }
+    defer log.deinit();
+    log.infoUuid(args.uuid, "=== POD STARTING === (shell={s})", .{sh});
 
     var pod = try Pod.init(allocator, args.uuid, args.socket_path, sh, args.cwd);
     defer pod.deinit();
@@ -55,13 +73,26 @@ fn daemonize() !void {
     const pid2 = try posix.fork();
     if (pid2 != 0) posix.exit(0);
 
-    // Redirect stdin/stdout/stderr to /dev/null
+    // Redirect stdin/stdout to /dev/null
     const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch return;
     posix.dup2(devnull, posix.STDIN_FILENO) catch {};
     posix.dup2(devnull, posix.STDOUT_FILENO) catch {};
-    posix.dup2(devnull, posix.STDERR_FILENO) catch {};
-    if (devnull > 2) posix.close(devnull);
 
+    // Redirect stderr to debug logfile if specified, else /dev/null
+    if (g_logfile) |logpath| {
+        const logfd = posix.open(logpath, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644) catch {
+            posix.dup2(devnull, posix.STDERR_FILENO) catch {};
+            if (devnull > 2) posix.close(devnull);
+            std.posix.chdir("/") catch {};
+            return;
+        };
+        posix.dup2(logfd, posix.STDERR_FILENO) catch {};
+        if (logfd > 2) posix.close(logfd);
+    } else {
+        posix.dup2(devnull, posix.STDERR_FILENO) catch {};
+    }
+
+    if (devnull > 2) posix.close(devnull);
     std.posix.chdir("/") catch {};
 }
 
@@ -196,9 +227,11 @@ const Pod = struct {
                 if (self.server.tryAccept() catch null) |conn| {
                     if (self.client == null) {
                         // No existing client - this is the main mux connection
+                        log.infoUuid(&self.uuid, "Client connected: fd={d}", .{conn.fd});
                         self.client = conn;
                         // Replay backlog.
                         const n = self.backlog.copyOut(&backlog_tmp);
+                        log.debugUuid(&self.uuid, "Replaying backlog: {d} bytes", .{n});
                         var off: usize = 0;
                         while (off < n) {
                             const chunk = @min(@as(usize, 16 * 1024), n - off);
@@ -206,6 +239,7 @@ const Pod = struct {
                             off += chunk;
                         }
                         pod_protocol.writeFrame(&self.client.?, .backlog_end, &[_]u8{}) catch {};
+                        log.debugUuid(&self.uuid, "Backlog replay complete, sent backlog_end", .{});
                     } else {
                         // Already have a client - this is an input-only connection (e.g., hexe com send)
                         // Read any input frames and process them, then close
@@ -241,6 +275,7 @@ const Pod = struct {
                 self.backlog.append(data);
                 if (self.client) |*c| {
                     pod_protocol.writeFrame(c, .output, data) catch {
+                        log.warnUuid(&self.uuid, "Client write failed, disconnecting", .{});
                         c.close();
                         self.client = null;
                     };
@@ -255,6 +290,7 @@ const Pod = struct {
                         else => return err,
                     };
                     if (n == 0) {
+                        log.infoUuid(&self.uuid, "Client EOF, disconnecting", .{});
                         self.client.?.close();
                         self.client = null;
                     } else {
@@ -263,11 +299,13 @@ const Pod = struct {
                     }
                 }
                 if (poll_fds[2].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0) {
+                    log.infoUuid(&self.uuid, "Client HUP/ERR, disconnecting", .{});
                     self.client.?.close();
                     self.client = null;
                 }
             }
         }
+        log.infoUuid(&self.uuid, "=== POD EXITING ===", .{});
     }
 
     fn handleFrame(self: *Pod, frame: pod_protocol.Frame) void {

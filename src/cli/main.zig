@@ -59,6 +59,7 @@ pub fn main() !void {
     const ses_daemon = try ses_cmd.newCommand("daemon", "Start the session daemon");
     const ses_daemon_fg = try ses_daemon.flag("f", "foreground", null);
     const ses_daemon_dbg = try ses_daemon.flag("d", "debug", null);
+    const ses_daemon_logfile = try ses_daemon.string("D", "debug-log", null);
     _ = try ses_cmd.newCommand("info", "Show daemon info");
 
     // POD subcommands (mostly for ses-internal use)
@@ -68,13 +69,16 @@ pub fn main() !void {
     const pod_daemon_shell = try pod_daemon.string("S", "shell", null);
     const pod_daemon_cwd = try pod_daemon.string("C", "cwd", null);
     const pod_daemon_fg = try pod_daemon.flag("f", "foreground", null);
+    const pod_daemon_logfile = try pod_daemon.string("D", "debug-log", null);
 
     // MUX subcommands
     const mux_new = try mux_cmd.newCommand("new", "Create new multiplexer session");
     const mux_new_name = try mux_new.string("n", "name", null);
+    const mux_new_logfile = try mux_new.string("D", "debug-log", null);
 
     const mux_attach = try mux_cmd.newCommand("attach", "Attach to existing session");
     const mux_attach_name = try mux_attach.stringPositional(null);
+    const mux_attach_logfile = try mux_attach.string("D", "debug-log", null);
 
     // POP subcommands
     const shp_prompt = try shp_cmd.newCommand("prompt", "Render shell prompt");
@@ -239,7 +243,7 @@ pub fn main() !void {
         for (ses_cmd.commands.items) |cmd| {
             if (cmd.happened) {
                 if (std.mem.eql(u8, cmd.name, "daemon")) {
-                    try runSesDaemon(ses_daemon_fg.*, ses_daemon_dbg.*);
+                    try runSesDaemon(ses_daemon_fg.*, ses_daemon_dbg.*, ses_daemon_logfile.*);
                 } else if (std.mem.eql(u8, cmd.name, "info")) {
                     try runSesInfo(allocator);
                 }
@@ -254,14 +258,15 @@ pub fn main() !void {
                 pod_daemon_socket.*,
                 pod_daemon_shell.*,
                 pod_daemon_cwd.*,
+                pod_daemon_logfile.*,
             );
         }
         return;
     } else if (mux_cmd.happened) {
         if (mux_new.happened) {
-            try runMuxNew(mux_new_name.*);
+            try runMuxNew(mux_new_name.*, mux_new_logfile.*);
         } else if (mux_attach.happened) {
-            try runMuxAttach(mux_attach_name.*);
+            try runMuxAttach(mux_attach_name.*, mux_attach_logfile.*);
         }
     } else if (shp_cmd.happened) {
         if (shp_prompt.happened) {
@@ -284,9 +289,13 @@ pub fn main() !void {
 // SES handlers
 // ============================================================================
 
-fn runSesDaemon(foreground: bool, debug: bool) !void {
+fn runSesDaemon(foreground: bool, debug: bool, logfile: []const u8) !void {
     // Call ses run() - daemon mode unless foreground flag is set
-    try ses.run(.{ .daemon = !foreground, .debug = debug });
+    try ses.run(.{
+        .daemon = !foreground,
+        .debug = debug,
+        .logfile = if (logfile.len > 0) logfile else null,
+    });
 }
 
 fn runSesInfo(allocator: std.mem.Allocator) !void {
@@ -309,7 +318,7 @@ fn runSesInfo(allocator: std.mem.Allocator) !void {
 // POD handlers
 // ============================================================================
 
-fn runPodDaemon(foreground: bool, uuid: []const u8, socket_path: []const u8, shell: []const u8, cwd: []const u8) !void {
+fn runPodDaemon(foreground: bool, uuid: []const u8, socket_path: []const u8, shell: []const u8, cwd: []const u8, logfile: []const u8) !void {
     if (uuid.len == 0 or socket_path.len == 0) {
         print("Error: --uuid and --socket required\n", .{});
         return;
@@ -322,6 +331,7 @@ fn runPodDaemon(foreground: bool, uuid: []const u8, socket_path: []const u8, she
         .shell = if (shell.len > 0) shell else null,
         .cwd = if (cwd.len > 0) cwd else null,
         .emit_ready = foreground,
+        .logfile = if (logfile.len > 0) logfile else null,
     });
 }
 
@@ -329,18 +339,20 @@ fn runPodDaemon(foreground: bool, uuid: []const u8, socket_path: []const u8, she
 // MUX handlers
 // ============================================================================
 
-fn runMuxNew(name: []const u8) !void {
+fn runMuxNew(name: []const u8, logfile: []const u8) !void {
     // Call mux run() directly
     try mux.run(.{
         .name = if (name.len > 0) name else null,
+        .logfile = if (logfile.len > 0) logfile else null,
     });
 }
 
-fn runMuxAttach(name: []const u8) !void {
+fn runMuxAttach(name: []const u8, logfile: []const u8) !void {
     if (name.len > 0) {
         // Call mux run() directly with attach option
         try mux.run(.{
             .attach = name,
+            .logfile = if (logfile.len > 0) logfile else null,
         });
     } else {
         print("Error: session name required\n", .{});

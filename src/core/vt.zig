@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 
 // Re-export ghostty-vt - this IS our terminal emulation
 pub const ghostty = @import("ghostty-vt");
@@ -95,29 +96,47 @@ pub const VT = struct {
     /// fragile when pins/pages are shifting due to scrollback or resize.
     ///
     /// SAFETY: When scrollback is very large, this can fail or return invalid data.
-    /// Callers should check the returned RenderState's rows/cols are reasonable.
-    pub fn getRenderState(self: *VT) !*const ghostty.RenderState {
-        // Clear previous state before updating to free memory from previous large scrollback
-        self.render_state.deinit(self.allocator);
-        self.render_state = .empty;
-
-        // Update render state - this allocates based on current VT dimensions
-        try self.render_state.update(self.allocator, &self.terminal);
-
-        // Validate the RenderState dimensions are reasonable
-        // Large scrollback can cause rows to become extremely large
+    /// This function now keeps previous valid state as fallback when update fails.
+    pub fn getRenderState(self: *VT) *const ghostty.RenderState {
+        // Validation constants
         const MAX_REASONABLE_ROWS: usize = 10000;
         const MAX_REASONABLE_COLS: usize = 1000;
 
-        if (self.render_state.rows > MAX_REASONABLE_ROWS or
-            self.render_state.cols > MAX_REASONABLE_COLS)
-        {
-            // RenderState has invalid dimensions - likely due to corrupted scrollback
-            // Return empty state to prevent rendering corruption
+        // Check if current state is valid (for fallback purposes)
+        const current_valid = self.render_state.rows > 0 and
+            self.render_state.cols > 0 and
+            self.render_state.rows <= MAX_REASONABLE_ROWS and
+            self.render_state.cols <= MAX_REASONABLE_COLS;
+
+        // Try to create new state
+        var new_state: ghostty.RenderState = .empty;
+        new_state.update(self.allocator, &self.terminal) catch |err| {
+            // Update failed - return previous state if valid, else empty
+            log.warn("RenderState update failed: {}, using fallback (valid={any})", .{ err, current_valid });
+            if (current_valid) {
+                return &self.render_state;
+            }
+            // Previous state also invalid - return empty
+            return &self.render_state;
+        };
+
+        // Validate the new RenderState dimensions
+        if (new_state.rows > MAX_REASONABLE_ROWS or new_state.cols > MAX_REASONABLE_COLS) {
+            // New state has invalid dimensions - keep previous state if valid
+            log.warn("RenderState has invalid dimensions ({d}x{d}), using fallback", .{ new_state.rows, new_state.cols });
+            new_state.deinit(self.allocator);
+            if (current_valid) {
+                return &self.render_state;
+            }
+            // Previous state also invalid - reset to empty
             self.render_state.deinit(self.allocator);
             self.render_state = .empty;
+            return &self.render_state;
         }
 
+        // Success - swap states (free old, keep new)
+        self.render_state.deinit(self.allocator);
+        self.render_state = new_state;
         return &self.render_state;
     }
 };
