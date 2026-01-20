@@ -164,9 +164,9 @@ fn print(comptime fmt: []const u8, args: anytype) void {
 
 fn printUsage() !void {
     print(
-        \\hexa-ses - PTY session server
+        \\hexe-ses - PTY session server
         \\
-        \\Usage: hexa-ses [OPTIONS]
+        \\Usage: hexe-ses [OPTIONS]
         \\
         \\Options:
         \\  -d, --daemon       Run as a background daemon
@@ -323,7 +323,7 @@ fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
                 const pane_count = s.get("pane_count").?.integer;
                 const name = if (s.get("session_name")) |n| n.string else "unknown";
 
-                print("  {s} [{s}] {d} panes - reattach: hexa-mux -a {s}\n", .{ name, sid[0..8], pane_count, name });
+                print("  {s} [{s}] {d} panes - reattach: hexe-mux -a {s}\n", .{ name, sid[0..8], pane_count, name });
 
                 // Always show full mux state tree if available
                 if (s.get("mux_state")) |mux_state_val| {
@@ -473,7 +473,7 @@ fn daemonize() !void {
     posix.dup2(devnull, posix.STDIN_FILENO) catch {};
     posix.dup2(devnull, posix.STDOUT_FILENO) catch {};
     // Keep stderr for debugging - write to a log file
-    const logfd = posix.open("/tmp/hexa-ses-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch {
+    const logfd = posix.open("/tmp/hexe-ses-debug.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch {
         posix.dup2(devnull, posix.STDERR_FILENO) catch {};
         if (devnull > 2) posix.close(devnull);
         std.posix.chdir("/") catch {};

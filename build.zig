@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
     });
     ses_module.addImport("core", core_module);
 
-    // Create pod module (per-pane PTY + scrollback; launched via `hexa pod daemon`)
+    // Create pod module (per-pane PTY + scrollback; launched via `hexe pod daemon`)
     const pod_module = b.createModule(.{
         .root_source_file = b.path("src/pod/mod.zig"),
         .target = target,
@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
     });
     pod_module.addImport("core", core_module);
 
-    // Build unified hexa CLI executable
+    // Build unified hexe CLI executable
     const cli_root = b.createModule(.{
         .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
@@ -89,17 +89,17 @@ pub fn build(b: *std.Build) void {
         cli_root.addImport("argonaut", arg);
     }
     const cli_exe = b.addExecutable(.{
-        .name = "hexa",
+        .name = "hexe",
         .root_module = cli_root,
     });
     b.installArtifact(cli_exe);
 
-    // Run hexa step
-    const run_hexa = b.addRunArtifact(cli_exe);
-    run_hexa.step.dependOn(b.getInstallStep());
+    // Run hexe step
+    const run_hexe = b.addRunArtifact(cli_exe);
+    run_hexe.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        run_hexa.addArgs(args);
+        run_hexe.addArgs(args);
     }
-    const run_step = b.step("run", "Run hexa");
-    run_step.dependOn(&run_hexa.step);
+    const run_step = b.step("run", "Run hexe");
+    run_step.dependOn(&run_hexe.step);
 }

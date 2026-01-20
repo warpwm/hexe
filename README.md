@@ -1,18 +1,18 @@
-# Hexa
+# Hexe
 
 A terminal multiplexer, session manager, and shell prompt renderer jammed into one.
 
-Hexa is built around a flipped architecture: the UI is disposable, your shells are not.
+Hexe is built around a flipped architecture: the UI is disposable, your shells are not.
 Crash the UI, restart it, reattach, keep going.
 
 ---
 
 ## What you get
 
-- A fast terminal multiplexer (`hexa mux`) with tabs, splits, floats, popups, and notifications.
-- A session daemon (`hexa ses`) that tracks sessions, panes, and layouts.
-- Per-pane pods (`hexa pod`) that own PTYs, keep processes alive, and buffer output.
-- A prompt renderer (`hexa shp`) that can power your shell prompt and mux status bar.
+- A fast terminal multiplexer (`hexe mux`) with tabs, splits, floats, popups, and notifications.
+- A session daemon (`hexe ses`) that tracks sessions, panes, and layouts.
+- Per-pane pods (`hexe pod`) that own PTYs, keep processes alive, and buffer output.
+- A prompt renderer (`hexe shp`) that can power your shell prompt and mux status bar.
 
 ---
 
@@ -21,20 +21,20 @@ Crash the UI, restart it, reattach, keep going.
 Traditional multiplexers often tie UI and process ownership together.
 If the UI dies at the wrong time, you lose state or your PTYs get stuck.
 
-Hexa splits responsibilities on purpose:
+Hexe splits responsibilities on purpose:
 
-- hexa-mux (UI)
+- hexe-mux (UI)
   - Rendering, tabs/splits layout, keybinds, mouse handling
   - Runs Ghostty VT state per pane
   - Safe to restart
 
-- hexa-pod (one per pane)
+- hexe-pod (one per pane)
   - Owns the PTY master file descriptor
   - Spawns/holds the shell process
   - Continuously drains PTY output so processes do not block
   - Buffers scrollback so detach/reattach does not lose history
 
-- hexa-ses (registry)
+- hexe-ses (registry)
   - Knows what panes exist and where their pods are
   - Stores detached session layouts
   - Periodically persists state so a daemon crash is survivable
@@ -204,7 +204,7 @@ Positions: `topleft`, `topcenter`, `topright`, `bottomleft`, `bottomcenter`, `bo
     },
     {
       "key": "h",
-      "command": "hexa-help",
+      "command": "hexe-help",
       "alone": true,
       "width": 70,
       "height": 50
@@ -242,7 +242,7 @@ The first entry in `floats` without a `key` field sets defaults for all floats:
 
 ### Persistent scrollback
 
-Hexa keeps scrollback even across detach/reattach.
+Hexe keeps scrollback even across detach/reattach.
 
 How:
 
@@ -254,9 +254,9 @@ Result: detach, do work, reattach, and your output is still there.
 
 ### Clipboard and OSC
 
-Hexa runs a VT inside mux, which means control sequences like OSC are not automatically visible to the host terminal.
+Hexe runs a VT inside mux, which means control sequences like OSC are not automatically visible to the host terminal.
 
-Hexa forwards important OSC sequences to the host terminal, including:
+Hexe forwards important OSC sequences to the host terminal, including:
 
 - OSC 52 clipboard
 - OSC 4 / 10-19 / 104 / 110-119 color palette sequences (pywal-friendly)
@@ -265,18 +265,18 @@ Hexa forwards important OSC sequences to the host terminal, including:
 
 Color queries:
 
-- If an app inside a pane asks the terminal for colors (OSC color queries), Hexa forwards the query to the host terminal and routes the reply back into the correct pane.
+- If an app inside a pane asks the terminal for colors (OSC color queries), Hexe forwards the query to the host terminal and routes the reply back into the correct pane.
 
 ### Colors (pywal-friendly)
 
-Hexa preserves 256-color palette indices (SGR 38;5 / 48;5).
+Hexe preserves 256-color palette indices (SGR 38;5 / 48;5).
 This matters because tools like pywal update the host terminal palette and then expect applications to keep using palette indices.
 
-If you use scripts that emit OSC 4/10/11 etc (pywal and friends), Hexa forwards those sequences so the host terminal palette updates live.
+If you use scripts that emit OSC 4/10/11 etc (pywal and friends), Hexe forwards those sequences so the host terminal palette updates live.
 
 ### Shell prompt renderer (shp)
 
-Hexa includes a prompt renderer you can use for bash, zsh, and fish.
+Hexe includes a prompt renderer you can use for bash, zsh, and fish.
 
 - Left and right prompt rendering
 - Segment system (git, directory, time, cpu, memory, battery, jobs, duration, etc.)
@@ -288,7 +288,7 @@ Hexa includes a prompt renderer you can use for bash, zsh, and fish.
 
 ### Build
 
-Hexa is a Zig project.
+Hexe is a Zig project.
 
 Always build with ReleaseFast:
 
@@ -298,19 +298,19 @@ Always build with ReleaseFast:
 
 Start the session daemon:
 
-- hexa ses daemon
+- hexe ses daemon
 
 Start a mux:
 
-- hexa mux new
+- hexe mux new
 
 Detach (keeps panes alive), then reattach:
 
-- hexa mux --attach <session-uuid-or-prefix>
+- hexe mux --attach <session-uuid-or-prefix>
 
 List what is available to attach:
 
-- hexa mux --list
+- hexe mux --list
 
 ---
 
@@ -318,11 +318,11 @@ List what is available to attach:
 
 Config is read from:
 
-- ~/.config/hexa/
+- ~/.config/hexe/
 
 State is stored under XDG state home (by default):
 
-- ~/.local/state/hexa/
+- ~/.local/state/hexe/
 
 ---
 
@@ -359,5 +359,5 @@ Also - real talk - having AI assistants that can help convert concepts between l
 
 ## Notes
 
-- Clipboard: OSC 52 is forwarded to the host terminal. Hexa also attempts to set the system clipboard via wl-copy (Wayland) or xclip/xsel (X11) when available.
-- Hyperlinks (OSC 8): full hyperlink rendering requires renderer-level support because Hexa renders from cells rather than passing through the raw byte stream.
+- Clipboard: OSC 52 is forwarded to the host terminal. Hexe also attempts to set the system clipboard via wl-copy (Wayland) or xclip/xsel (X11) when available.
+- Hyperlinks (OSC 8): full hyperlink rendering requires renderer-level support because Hexe renders from cells rather than passing through the raw byte stream.

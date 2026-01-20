@@ -311,7 +311,7 @@ pub fn generateSessionName() []const u8 {
 pub fn getSocketDir(allocator: std.mem.Allocator) ![]const u8 {
     // Use XDG_RUNTIME_DIR if available, otherwise /tmp
     const runtime_dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse "/tmp";
-    return std.fmt.allocPrint(allocator, "{s}/hexa", .{runtime_dir});
+    return std.fmt.allocPrint(allocator, "{s}/hexe", .{runtime_dir});
 }
 
 /// Get the default ses socket path
@@ -354,11 +354,11 @@ pub fn getSesStatePath(allocator: std.mem.Allocator) ![]const u8 {
     };
     defer if (state_home_env == null) allocator.free(state_home);
 
-    const dir = try std.fmt.allocPrint(allocator, "{s}/hexa", .{state_home});
+    const dir = try std.fmt.allocPrint(allocator, "{s}/hexe", .{state_home});
     defer allocator.free(dir);
     std.fs.cwd().makePath(dir) catch {};
 
-    return std.fmt.allocPrint(allocator, "{s}/hexa/ses_state.json", .{state_home});
+    return std.fmt.allocPrint(allocator, "{s}/hexe/ses_state.json", .{state_home});
 }
 
 // ============================================================================

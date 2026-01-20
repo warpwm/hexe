@@ -7,18 +7,14 @@ const Style = @import("../style.zig").Style;
 var last_rx_bytes: u64 = 0;
 var last_tx_bytes: u64 = 0;
 var last_time_ns: i128 = 0;
-var cached_iface: [32]u8 = undefined;
-var cached_iface_len: usize = 0;
+var initialized: bool = false;
 
-/// Netspeed segment - displays network upload/download speed
+/// Netspeed segment - displays cumulative network upload/download speed across all interfaces
 /// Format: ▲468K | ▼130K
 pub fn render(ctx: *Context) ?[]const Segment {
-    // Get active interface
-    const iface = getActiveInterface() orelse return null;
-
-    // Read current bytes
-    const rx_bytes = readSysFile("/sys/class/net/", iface, "/statistics/rx_bytes") orelse return null;
-    const tx_bytes = readSysFile("/sys/class/net/", iface, "/statistics/tx_bytes") orelse return null;
+    // Read total bytes from all interfaces
+    const rx_bytes = getTotalBytes("/statistics/rx_bytes") orelse return null;
+    const tx_bytes = getTotalBytes("/statistics/tx_bytes") orelse return null;
 
     const now_ns = std.time.nanoTimestamp();
 
@@ -26,7 +22,7 @@ pub fn render(ctx: *Context) ?[]const Segment {
     var rx_speed: u64 = 0;
     var tx_speed: u64 = 0;
 
-    if (last_time_ns > 0) {
+    if (initialized) {
         const elapsed_ns: u64 = @intCast(now_ns - last_time_ns);
         if (elapsed_ns > 0) {
             const elapsed_sec = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
@@ -43,8 +39,9 @@ pub fn render(ctx: *Context) ?[]const Segment {
     last_rx_bytes = rx_bytes;
     last_tx_bytes = tx_bytes;
     last_time_ns = now_ns;
+    initialized = true;
 
-    // Format the output
+    // Format the output (shows 0K on first render)
     const tx_str = formatBytes(ctx, tx_speed) orelse return null;
     const rx_str = formatBytes(ctx, rx_speed) orelse return null;
 
@@ -53,46 +50,36 @@ pub fn render(ctx: *Context) ?[]const Segment {
     return ctx.addSegment(text, Style{}) catch return null;
 }
 
-fn getActiveInterface() ?[]const u8 {
-    // Check cached
-    if (cached_iface_len > 0) {
-        return cached_iface[0..cached_iface_len];
-    }
+/// Sum up bytes from all network interfaces
+fn getTotalBytes(suffix: []const u8) ?u64 {
+    var total: u64 = 0;
 
-    // Read /proc/net/route to find default interface
-    const file = std.fs.openFileAbsolute("/proc/net/route", .{}) catch return null;
-    defer file.close();
+    // Open /sys/class/net directory with iteration permissions
+    var net_dir = std.fs.openDirAbsolute("/sys/class/net", .{ .iterate = true }) catch return null;
+    defer net_dir.close();
 
-    var buf: [2048]u8 = undefined;
-    const len = file.read(&buf) catch return null;
-    const content = buf[0..len];
+    // Iterate over all interfaces
+    var iter = net_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        // Skip . and ..
+        if (entry.name[0] == '.') continue;
 
-    // Parse lines
-    var lines = std.mem.tokenizeScalar(u8, content, '\n');
-    _ = lines.next(); // Skip header
+        // Skip loopback
+        if (std.mem.eql(u8, entry.name, "lo")) continue;
 
-    // Find default route (destination 00000000)
-    while (lines.next()) |line| {
-        var iter = std.mem.tokenizeAny(u8, line, " \t");
-        const iface = iter.next() orelse continue;
-        const dest = iter.next() orelse continue;
-
-        if (std.mem.eql(u8, dest, "00000000")) {
-            // Found default route
-            if (iface.len <= cached_iface.len) {
-                @memcpy(cached_iface[0..iface.len], iface);
-                cached_iface_len = iface.len;
-                return cached_iface[0..cached_iface_len];
-            }
+        // Read bytes for this interface (even if entry.kind is unknown/symlink)
+        if (readInterfaceBytes(entry.name, suffix)) |bytes| {
+            total += bytes;
         }
     }
 
-    return null;
+    return total;
 }
 
-fn readSysFile(prefix: []const u8, iface: []const u8, suffix: []const u8) ?u64 {
+/// Read bytes from a single interface's statistics file
+fn readInterfaceBytes(iface: []const u8, suffix: []const u8) ?u64 {
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}{s}{s}", .{ prefix, iface, suffix }) catch return null;
+    const path = std.fmt.bufPrint(&path_buf, "/sys/class/net/{s}{s}", .{ iface, suffix }) catch return null;
 
     const file = std.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();

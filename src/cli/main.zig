@@ -19,7 +19,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     // Create main parser
-    const parser = try argonaut.newParser(allocator, "hexa", "Hexa terminal multiplexer");
+    const parser = try argonaut.newParser(allocator, "hexe", "Hexe terminal multiplexer");
     defer parser.deinit();
 
     // Top-level subcommands only
@@ -149,47 +149,47 @@ pub fn main() !void {
     if (has_help) {
         // Show help for the most specific command found (manual strings to avoid argonaut crash)
         if (found_com and found_send) {
-            print("Usage: hexa com send [OPTIONS] [text]\n\nSend keystrokes to pane (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all attached panes\n  -e, --enter        Append Enter key after text\n  -C, --ctrl <char>  Send Ctrl+<char> (e.g., -C c for Ctrl+C)\n", .{});
+            print("Usage: hexe com send [OPTIONS] [text]\n\nSend keystrokes to pane (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all attached panes\n  -e, --enter        Append Enter key after text\n  -C, --ctrl <char>  Send Ctrl+<char> (e.g., -C c for Ctrl+C)\n", .{});
         } else if (found_com and found_notify) {
-            print("Usage: hexa com notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all muxes\n", .{});
+            print("Usage: hexe com notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all muxes\n", .{});
         } else if (found_com and found_info) {
-            print("Usage: hexa com info [OPTIONS]\n\nShow information about a pane\n\nOptions:\n  -u, --uuid <UUID>  Query specific pane by UUID (works from anywhere)\n  -c, --creator      Print only the creator pane UUID\n  -l, --last         Print only the last focused pane UUID\n\nWithout --uuid, queries current pane (requires running inside mux)\n", .{});
+            print("Usage: hexe com info [OPTIONS]\n\nShow information about a pane\n\nOptions:\n  -u, --uuid <UUID>  Query specific pane by UUID (works from anywhere)\n  -c, --creator      Print only the creator pane UUID\n  -l, --last         Print only the last focused pane UUID\n\nWithout --uuid, queries current pane (requires running inside mux)\n", .{});
         } else if (found_com and found_list) {
-            print("Usage: hexa com list [OPTIONS]\n\nList all sessions and panes\n\nOptions:\n  -d, --details  Show extra details\n", .{});
+            print("Usage: hexe com list [OPTIONS]\n\nList all sessions and panes\n\nOptions:\n  -d, --details  Show extra details\n", .{});
         } else if (found_ses and found_daemon) {
-            print("Usage: hexa ses daemon [OPTIONS]\n\nStart the session daemon\n\nOptions:\n  -f, --foreground  Run in foreground (don't daemonize)\n  -d, --debug       Enable debug output\n", .{});
+            print("Usage: hexe ses daemon [OPTIONS]\n\nStart the session daemon\n\nOptions:\n  -f, --foreground  Run in foreground (don't daemonize)\n  -d, --debug       Enable debug output\n", .{});
         } else if (found_ses and found_info) {
-            print("Usage: hexa ses info\n\nShow daemon status and socket path\n", .{});
+            print("Usage: hexe ses info\n\nShow daemon status and socket path\n", .{});
         } else if (found_pod and found_daemon) {
-            print("Usage: hexa pod daemon [OPTIONS]\n\nStart a per-pane pod daemon (normally launched by ses)\n\nOptions:\n  -u, --uuid <UUID>    Pane UUID (32 hex chars)\n  -s, --socket <PATH>  Pod unix socket path\n  -S, --shell <CMD>    Shell/command to run\n  -C, --cwd <DIR>      Working directory\n  -f, --foreground     Run in foreground (prints pod_ready JSON)\n", .{});
+            print("Usage: hexe pod daemon [OPTIONS]\n\nStart a per-pane pod daemon (normally launched by ses)\n\nOptions:\n  -u, --uuid <UUID>    Pane UUID (32 hex chars)\n  -s, --socket <PATH>  Pod unix socket path\n  -S, --shell <CMD>    Shell/command to run\n  -C, --cwd <DIR>      Working directory\n  -f, --foreground     Run in foreground (prints pod_ready JSON)\n", .{});
         } else if (found_mux and found_new) {
-            print("Usage: hexa mux new [OPTIONS]\n\nCreate new multiplexer session\n\nOptions:\n  -n, --name <NAME>  Session name\n", .{});
+            print("Usage: hexe mux new [OPTIONS]\n\nCreate new multiplexer session\n\nOptions:\n  -n, --name <NAME>  Session name\n", .{});
         } else if (found_mux and found_attach) {
-            print("Usage: hexa mux attach <name>\n\nAttach to existing session by name or UUID prefix\n", .{});
+            print("Usage: hexe mux attach <name>\n\nAttach to existing session by name or UUID prefix\n", .{});
         } else if (found_shp and found_prompt) {
-            print("Usage: hexa shp prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
+            print("Usage: hexe shp prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
         } else if (found_shp and found_init) {
-            print("Usage: hexa shp init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
+            print("Usage: hexe shp init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
         } else if (found_pop and found_notify) {
-            print("Usage: hexa pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Duration in milliseconds (default: 3000)\n", .{});
+            print("Usage: hexe pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Duration in milliseconds (default: 3000)\n", .{});
         } else if (found_pop and found_confirm) {
-            print("Usage: hexa pop confirm [OPTIONS] <message>\n\nYes/No dialog (blocking)\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Auto-cancel after milliseconds (returns false)\n\nExit codes: 0=confirmed, 1=cancelled/timeout\n", .{});
+            print("Usage: hexe pop confirm [OPTIONS] <message>\n\nYes/No dialog (blocking)\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Auto-cancel after milliseconds (returns false)\n\nExit codes: 0=confirmed, 1=cancelled/timeout\n", .{});
         } else if (found_pop and found_choose) {
-            print("Usage: hexa pop choose [OPTIONS] <message>\n\nSelect from options (blocking)\n\nOptions:\n  -u, --uuid <UUID>      Target mux/tab/pane UUID\n  -t, --timeout <MS>     Auto-cancel after milliseconds\n  -i, --items <ITEMS>    Comma-separated list of options\n\nExit codes: 0=selected (index on stdout), 1=cancelled/timeout\n", .{});
+            print("Usage: hexe pop choose [OPTIONS] <message>\n\nSelect from options (blocking)\n\nOptions:\n  -u, --uuid <UUID>      Target mux/tab/pane UUID\n  -t, --timeout <MS>     Auto-cancel after milliseconds\n  -i, --items <ITEMS>    Comma-separated list of options\n\nExit codes: 0=selected (index on stdout), 1=cancelled/timeout\n", .{});
         } else if (found_pop) {
-            print("Usage: hexa pop <command>\n\nPopup overlays\n\nCommands:\n  notify   Show notification\n  confirm  Yes/No dialog\n  choose   Select from options\n", .{});
+            print("Usage: hexe pop <command>\n\nPopup overlays\n\nCommands:\n  notify   Show notification\n  confirm  Yes/No dialog\n  choose   Select from options\n", .{});
         } else if (found_com) {
-            print("Usage: hexa com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  info    Show current pane info\n  notify  Send notification\n  send    Send keystrokes to pane\n", .{});
+            print("Usage: hexe com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  info    Show current pane info\n  notify  Send notification\n  send    Send keystrokes to pane\n", .{});
         } else if (found_ses) {
-            print("Usage: hexa ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
+            print("Usage: hexe ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
         } else if (found_pod) {
-            print("Usage: hexa pod <command>\n\nPer-pane PTY daemon (internal)\n\nCommands:\n  daemon  Start a per-pane pod daemon\n", .{});
+            print("Usage: hexe pod <command>\n\nPer-pane PTY daemon (internal)\n\nCommands:\n  daemon  Start a per-pane pod daemon\n", .{});
         } else if (found_mux) {
-            print("Usage: hexa mux <command>\n\nTerminal multiplexer\n\nCommands:\n  new     Create new multiplexer session\n  attach  Attach to existing session\n", .{});
+            print("Usage: hexe mux <command>\n\nTerminal multiplexer\n\nCommands:\n  new     Create new multiplexer session\n  attach  Attach to existing session\n", .{});
         } else if (found_shp) {
-            print("Usage: hexa shp <command>\n\nShell prompt renderer\n\nCommands:\n  prompt  Render shell prompt\n  init    Print shell initialization script\n", .{});
+            print("Usage: hexe shp <command>\n\nShell prompt renderer\n\nCommands:\n  prompt  Render shell prompt\n  init    Print shell initialization script\n", .{});
         } else {
-            print("Usage: hexa <command>\n\nHexa terminal multiplexer\n\nCommands:\n  com  Communication with sessions and panes\n  ses  Session daemon management\n  pod  Per-pane PTY daemon (internal)\n  mux  Terminal multiplexer\n  shp  Shell prompt renderer\n  pop  Popup overlays\n", .{});
+            print("Usage: hexe <command>\n\nHexe terminal multiplexer\n\nCommands:\n  com  Communication with sessions and panes\n  ses  Session daemon management\n  pod  Per-pane PTY daemon (internal)\n  mux  Terminal multiplexer\n  shp  Shell prompt renderer\n  pop  Popup overlays\n", .{});
         }
         return;
     }
@@ -400,7 +400,7 @@ fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, me
     if (uuid.len > 0) {
         target_uuid = uuid;
     } else {
-        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
     }
 
     if (target_uuid) |t| {
@@ -408,7 +408,7 @@ fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, me
         const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}", .{ t, message, timeout_ms });
         try conn.sendLine(msg);
     } else {
-        print("Error: --uuid required (or run inside hexa mux)\n", .{});
+        print("Error: --uuid required (or run inside hexe mux)\n", .{});
         return;
     }
 
@@ -453,7 +453,7 @@ fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, m
     if (uuid.len > 0) {
         target_uuid = uuid;
     } else {
-        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
     }
 
     if (target_uuid) |t| {
@@ -465,7 +465,7 @@ fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, m
             try conn.sendLine(msg);
         }
     } else {
-        print("Error: --uuid required (or run inside hexa mux)\n", .{});
+        print("Error: --uuid required (or run inside hexe mux)\n", .{});
         return;
     }
 
@@ -522,7 +522,7 @@ fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, it
     if (uuid.len > 0) {
         target_uuid = uuid;
     } else {
-        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
     }
 
     if (target_uuid) |t| {
@@ -554,7 +554,7 @@ fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, it
             try conn.sendLine(msg);
         }
     } else {
-        print("Error: --uuid required (or run inside hexa mux)\n", .{});
+        print("Error: --uuid required (or run inside hexe mux)\n", .{});
         return;
     }
 

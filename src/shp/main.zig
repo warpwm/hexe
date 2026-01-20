@@ -141,14 +141,14 @@ fn printInit(shell: []const u8) !void {
 
     if (std.mem.eql(u8, shell, "bash")) {
         try stdout.writeAll(
-            \\# Hexa prompt initialization for Bash
+            \\# Hexe prompt initialization for Bash
             \\__shp_precmd() {
             \\    local exit_status=$?
             \\    local duration=0
             \\    if [[ -n "$__shp_start" ]]; then
             \\        duration=$(( $(date +%s%3N) - __shp_start ))
             \\    fi
-            \\    PS1="$(hexa shp prompt --status=$exit_status --duration=$duration --jobs=$(jobs -p 2>/dev/null | wc -l)) "
+            \\    PS1="$(hexe shp prompt --status=$exit_status --duration=$duration --jobs=$(jobs -p 2>/dev/null | wc -l)) "
             \\    unset __shp_start
             \\}
             \\
@@ -162,15 +162,15 @@ fn printInit(shell: []const u8) !void {
         );
     } else if (std.mem.eql(u8, shell, "zsh")) {
         try stdout.writeAll(
-            \\# Hexa prompt initialization for Zsh
+            \\# Hexe prompt initialization for Zsh
             \\__shp_precmd() {
             \\    local exit_status=$?
             \\    local duration=0
             \\    if [[ -n "$__shp_start" ]]; then
             \\        duration=$(( $(date +%s%3N) - __shp_start ))
             \\    fi
-            \\    PROMPT="$(hexa shp prompt --shell=zsh --status=$exit_status --duration=$duration --jobs=${(M)#jobstates}) "
-            \\    RPROMPT="$(hexa shp prompt --shell=zsh --right --status=$exit_status)"
+            \\    PROMPT="$(hexe shp prompt --shell=zsh --status=$exit_status --duration=$duration --jobs=${(M)#jobstates}) "
+            \\    RPROMPT="$(hexe shp prompt --shell=zsh --right --status=$exit_status)"
             \\    unset __shp_start
             \\}
             \\
@@ -186,17 +186,17 @@ fn printInit(shell: []const u8) !void {
         );
     } else if (std.mem.eql(u8, shell, "fish")) {
         try stdout.writeAll(
-            \\# Hexa prompt initialization for Fish
+            \\# Hexe prompt initialization for Fish
             \\function fish_prompt
             \\    set -l exit_status $status
             \\    set -l duration (math $CMD_DURATION)
             \\    set -l jobs (count (jobs -p))
-            \\    hexa shp prompt --status=$exit_status --duration=$duration --jobs=$jobs
+            \\    hexe shp prompt --status=$exit_status --duration=$duration --jobs=$jobs
             \\    echo -n " "
             \\end
             \\
             \\function fish_right_prompt
-            \\    hexa shp prompt --right
+            \\    hexe shp prompt --right
             \\end
             \\
         );
@@ -317,11 +317,11 @@ fn loadConfig(allocator: std.mem.Allocator) ?std.json.Parsed(JsonConfig) {
 fn getConfigPath(allocator: std.mem.Allocator) ![]const u8 {
     const config_home = posix.getenv("XDG_CONFIG_HOME");
     if (config_home) |ch| {
-        return std.fmt.allocPrint(allocator, "{s}/hexa/shp.json", .{ch});
+        return std.fmt.allocPrint(allocator, "{s}/hexe/shp.json", .{ch});
     }
 
     const home = posix.getenv("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.config/hexa/shp.json", .{home});
+    return std.fmt.allocPrint(allocator, "{s}/.config/hexe/shp.json", .{home});
 }
 
 fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdout: std.fs.File, is_zsh: bool) !void {

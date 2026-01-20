@@ -1000,7 +1000,7 @@ const State = struct {
             // Silently ignore errors - pane might not exist in ses
         };
 
-        // Sync full state so hexa com list shows updated focus
+        // Sync full state so hexe com list shows updated focus
         self.syncStateToSes();
     }
 
@@ -1115,7 +1115,7 @@ pub fn run(mux_args: MuxArgs) !void {
             std.debug.print("Detached sessions:\n", .{});
             for (sessions[0..sess_count]) |s| {
                 const name = s.session_name[0..s.session_name_len];
-                std.debug.print("  {s} [{s}] {d} tabs - attach with: hexa mux attach {s}\n", .{ name, s.session_id[0..8], s.pane_count, name });
+                std.debug.print("  {s} [{s}] {d} tabs - attach with: hexe mux attach {s}\n", .{ name, s.session_id[0..8], s.pane_count, name });
             }
         }
 
@@ -1168,11 +1168,11 @@ pub fn run(mux_args: MuxArgs) !void {
         }
     }
 
-    // Set HEXA_MUX_SOCKET environment for child processes
+    // Set HEXE_MUX_SOCKET environment for child processes
     if (state.socket_path) |path| {
         const path_z = allocator.dupeZ(u8, path) catch null;
         if (path_z) |p| {
-            _ = c.setenv("HEXA_MUX_SOCKET", p.ptr, 1);
+            _ = c.setenv("HEXE_MUX_SOCKET", p.ptr, 1);
             allocator.free(p);
         }
     }
@@ -2153,8 +2153,8 @@ fn sendPopResponse(state: *State) void {
 
 fn sendNotifyToParentMux(_: std.mem.Allocator, message: []const u8) void {
     // Get parent mux socket from environment
-    const socket_path = std.posix.getenv("HEXA_MUX_SOCKET") orelse {
-        _ = posix.write(posix.STDERR_FILENO, "Not inside a hexa-mux session (HEXA_MUX_SOCKET not set)\n") catch {};
+    const socket_path = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
+        _ = posix.write(posix.STDERR_FILENO, "Not inside a hexe-mux session (HEXE_MUX_SOCKET not set)\n") catch {};
         return;
     };
 
@@ -2465,7 +2465,7 @@ fn performDetach(state: *State) void {
         return;
     };
     // Print session_id (our UUID) so user can reattach
-    std.debug.print("\nSession detached: {s}\nReattach with: hexa-mux --attach {s}\n", .{ state.uuid, state.uuid[0..8] });
+    std.debug.print("\nSession detached: {s}\nReattach with: hexe-mux --attach {s}\n", .{ state.uuid, state.uuid[0..8] });
     state.running = false;
 }
 

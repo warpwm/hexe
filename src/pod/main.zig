@@ -16,7 +16,7 @@ pub const PodArgs = struct {
 
 /// Run a per-pane pod process.
 ///
-/// In normal operation pods are launched by `hexa-ses`.
+/// In normal operation pods are launched by `hexe-ses`.
 pub fn run(args: PodArgs) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -142,7 +142,7 @@ const Pod = struct {
         var uuid: [32]u8 = undefined;
         @memcpy(&uuid, uuid_str[0..32]);
 
-        const extra_env = [_][2][]const u8{.{ "HEXA_PANE_UUID", uuid_str }};
+        const extra_env = [_][2][]const u8{.{ "HEXE_PANE_UUID", uuid_str }};
         var pty = try core.Pty.spawnWithEnv(shell, cwd, &extra_env);
         errdefer pty.close();
 
@@ -207,7 +207,7 @@ const Pod = struct {
                         }
                         pod_protocol.writeFrame(&self.client.?, .backlog_end, &[_]u8{}) catch {};
                     } else {
-                        // Already have a client - this is an input-only connection (e.g., hexa com send)
+                        // Already have a client - this is an input-only connection (e.g., hexe com send)
                         // Read any input frames and process them, then close
                         var input_buf: [4096]u8 = undefined;
                         var input_reader: pod_protocol.Reader = .{};

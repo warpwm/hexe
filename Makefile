@@ -4,4 +4,4 @@ build:
 	zig build -Doptimize=ReleaseFast
 
 install: build
-	cp ./zig-out/bin/hexa ~/.local/bin/
+	cp ./zig-out/bin/hexe ~/.local/bin/

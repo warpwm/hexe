@@ -75,7 +75,7 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
                 const pane_count = s.get("pane_count").?.integer;
                 const name = if (s.get("session_name")) |n| n.string else "unknown";
 
-                print("  {s} [{s}] {d} panes - reattach: hexa mux attach {s}\n", .{ name, sid[0..8], pane_count, name });
+                print("  {s} [{s}] {d} panes - reattach: hexe mux attach {s}\n", .{ name, sid[0..8], pane_count, name });
 
                 if (s.get("mux_state")) |mux_state_val| {
                     printMuxTree(allocator, mux_state_val.string, "    ");
@@ -147,8 +147,8 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
         target_uuid = uuid_arg;
     } else if (show_creator or show_last) {
         // Need current pane UUID first, then get creator/last from it
-        const current_uuid = std.posix.getenv("HEXA_PANE_UUID") orelse {
-            print("--creator/--last requires running inside hexa mux\n", .{});
+        const current_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("--creator/--last requires running inside hexe mux\n", .{});
             return;
         };
 
@@ -198,9 +198,9 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
         }
     } else {
         // Default: query current pane
-        const pane_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        const pane_uuid = std.posix.getenv("HEXE_PANE_UUID");
         if (pane_uuid == null) {
-            print("Not inside a hexa mux session (use --uuid to query specific pane)\n", .{});
+            print("Not inside a hexe mux session (use --uuid to query specific pane)\n", .{});
             return;
         }
         target_uuid = pane_uuid.?;
@@ -296,8 +296,8 @@ pub fn runNotify(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, 
         target_uuid = uuid;
     } else if (creator or last) {
         // Query pane_info to get creator or last focused pane
-        const current_uuid = std.posix.getenv("HEXA_PANE_UUID") orelse {
-            print("Error: --creator/--last requires running inside hexa mux\n", .{});
+        const current_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --creator/--last requires running inside hexe mux\n", .{});
             return;
         };
 
@@ -343,7 +343,7 @@ pub fn runNotify(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, 
             }
         }
     } else if (!broadcast) {
-        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
     }
 
     if (target_uuid) |t| {
@@ -498,8 +498,8 @@ pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, la
         target_uuid = uuid;
     } else if (creator or last) {
         // Query pane_info to get creator or last focused pane
-        const current_uuid = std.posix.getenv("HEXA_PANE_UUID") orelse {
-            print("Error: --creator/--last requires running inside hexa mux\n", .{});
+        const current_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --creator/--last requires running inside hexe mux\n", .{});
             return;
         };
 
@@ -545,7 +545,7 @@ pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, la
             }
         }
     } else if (!broadcast) {
-        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
     }
 
     // Build send_keys request with hex-encoded data

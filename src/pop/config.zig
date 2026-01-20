@@ -54,7 +54,7 @@ pub const PaneConfig = struct {
     choose: ChooseStyle = .{},
 };
 
-/// Pop configuration - loaded from ~/.config/hexa/pop.json
+/// Pop configuration - loaded from ~/.config/hexe/pop.json
 pub const PopConfig = struct {
     carrier: CarrierConfig = .{},
     pane: PaneConfig = .{},
@@ -139,7 +139,7 @@ fn applyChooseStyle(target: *ChooseStyle, source: ?JsonChooseStyle) void {
 
 fn getConfigPath(allocator: std.mem.Allocator) ![]const u8 {
     const home = posix.getenv("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.config/hexa/pop.json", .{home});
+    return std.fmt.allocPrint(allocator, "{s}/.config/hexe/pop.json", .{home});
 }
 
 // JSON parsing types
