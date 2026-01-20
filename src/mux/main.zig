@@ -1709,11 +1709,53 @@ fn handleInput(state: *State, input_bytes: []const u8) void {
                                         else => {},
                                     }
                                 } else {
-                                    // User cancelled - if exit was from shell death, spawn new shell
+                                    // User cancelled - if exit was from shell death, respawn
                                     if (action == .exit and state.exit_from_shell_death) {
                                         if (state.currentLayout().getFocusedPane()) |pane| {
-                                            pane.respawn() catch {};
-                                            state.skip_dead_check = true; // Skip dead check this iteration
+                                            switch (pane.backend) {
+                                                .local => {
+                                                    pane.respawn() catch {
+                                                        state.notifications.show("Respawn failed");
+                                                    };
+                                                    state.skip_dead_check = true;
+                                                },
+                                                .pod => {
+                                                    const cwd = pane.getPwd();
+                                                    const old_aux = state.ses_client.getPaneAux(pane.uuid) catch SesClient.PaneAuxInfo{
+                                                        .created_from = null,
+                                                        .focused_from = null,
+                                                    };
+                                                    state.ses_client.killPane(pane.uuid) catch {};
+                                                    if (state.ses_client.createPane(null, cwd, null, null)) |result| {
+                                                        defer state.allocator.free(result.socket_path);
+                                                        var replaced = true;
+                                                        pane.replaceWithPod(result.socket_path, result.uuid) catch {
+                                                            replaced = false;
+                                                        };
+                                                        if (replaced) {
+                                                            const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
+                                                            const cursor = pane.getCursorPos();
+                                                            state.ses_client.updatePaneAux(
+                                                                pane.uuid,
+                                                                pane.floating,
+                                                                pane.focused,
+                                                                pane_type,
+                                                                old_aux.created_from,
+                                                                old_aux.focused_from,
+                                                                .{ .x = cursor.x, .y = cursor.y },
+                                                                pane.getPwd(),
+                                                                null,
+                                                                null,
+                                                            ) catch {};
+                                                            state.skip_dead_check = true;
+                                                        } else {
+                                                            state.notifications.show("Respawn failed");
+                                                        }
+                                                    } else |_| {
+                                                        state.notifications.show("Respawn failed");
+                                                    }
+                                                },
+                                            }
                                         }
                                     }
                                 }
@@ -2626,13 +2668,17 @@ fn startAdoptFlow(state: *State) void {
         state.popups.showConfirm("Destroy current pane?", .{}) catch {};
     } else {
         // Multiple orphans - show picker
-        // Build items list for picker
-        var items: [32][]const u8 = undefined;
+        // Build items list for picker (owned by popup)
+        var items_list: std.ArrayList([]const u8) = .empty;
+        defer items_list.deinit(state.allocator);
         for (0..count) |i| {
-            items[i] = &state.adopt_orphans[i].uuid;
+            items_list.append(state.allocator, state.adopt_orphans[i].uuid[0..]) catch {
+                state.notifications.show("Failed to show picker");
+                return;
+            };
         }
         state.pending_action = .adopt_choose;
-        state.popups.showPicker(items[0..count], .{ .title = "Select pane to adopt" }) catch {
+        state.popups.showPickerOwned(items_list.items, .{ .title = "Select pane to adopt" }) catch {
             state.notifications.show("Failed to show picker");
             state.pending_action = null;
         };
