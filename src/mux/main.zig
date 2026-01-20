@@ -1051,6 +1051,20 @@ const State = struct {
         return pane.getRealCwd();
     }
 
+    /// Fetch a spawn-safe CWD for pod panes (prefer /proc from ses).
+    fn getSpawnCwd(self: *State, pane: *Pane) ?[]const u8 {
+        switch (pane.backend) {
+            .pod => {
+                if (self.ses_client.getPaneCwd(pane.uuid)) |cwd| {
+                    pane.setSesCwd(cwd);
+                    return cwd;
+                }
+            },
+            .local => {},
+        }
+        return pane.getRealCwd();
+    }
+
     /// Periodically sync focused pane info (CWD, fg_process) to ses
     fn syncFocusedPaneInfo(self: *State) void {
         if (!self.ses_client.isConnected()) return;
@@ -1720,7 +1734,7 @@ fn handleInput(state: *State, input_bytes: []const u8) void {
                                                     state.skip_dead_check = true;
                                                 },
                                                 .pod => {
-                                                    const cwd = pane.getPwd();
+                                                    const cwd = state.getSpawnCwd(pane);
                                                     const old_aux = state.ses_client.getPaneAux(pane.uuid) catch SesClient.PaneAuxInfo{
                                                         .created_from = null,
                                                         .focused_from = null,
@@ -2554,7 +2568,7 @@ fn performDisown(state: *State) void {
         switch (p.backend) {
             .pod => {
                 // Get current working directory from the process before orphaning
-                const cwd = p.getPwd();
+                const cwd = state.getSpawnCwd(p);
 
                 // Get the old pane's auxiliary info (created_from, focused_from) to inherit
                 const old_aux = state.ses_client.getPaneAux(p.uuid) catch SesClient.PaneAuxInfo{
@@ -2585,7 +2599,7 @@ fn performDisown(state: *State) void {
                         old_aux.created_from, // Inherit creator
                         old_aux.focused_from, // Inherit last focus
                         .{ .x = cursor.x, .y = cursor.y },
-                        p.getPwd(),
+                        cwd,
                         null,
                         null,
                     ) catch {};
