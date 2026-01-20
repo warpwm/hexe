@@ -191,22 +191,33 @@ const Pod = struct {
                 return err;
             };
 
-            // Accept new mux connection.
+            // Accept new connection.
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 if (self.server.tryAccept() catch null) |conn| {
-                    if (self.client) |*old| {
-                        old.close();
+                    if (self.client == null) {
+                        // No existing client - this is the main mux connection
+                        self.client = conn;
+                        // Replay backlog.
+                        const n = self.backlog.copyOut(&backlog_tmp);
+                        var off: usize = 0;
+                        while (off < n) {
+                            const chunk = @min(@as(usize, 16 * 1024), n - off);
+                            pod_protocol.writeFrame(&self.client.?, .output, backlog_tmp[off .. off + chunk]) catch {};
+                            off += chunk;
+                        }
+                        pod_protocol.writeFrame(&self.client.?, .backlog_end, &[_]u8{}) catch {};
+                    } else {
+                        // Already have a client - this is an input-only connection (e.g., hexa com send)
+                        // Read any input frames and process them, then close
+                        var input_buf: [4096]u8 = undefined;
+                        var input_reader: pod_protocol.Reader = .{};
+                        const n = posix.read(conn.fd, &input_buf) catch 0;
+                        if (n > 0) {
+                            input_reader.feed(input_buf[0..n], @ptrCast(self), podFrameCallback);
+                        }
+                        var tmp_conn = conn;
+                        tmp_conn.close();
                     }
-                    self.client = conn;
-                    // Replay backlog.
-                    const n = self.backlog.copyOut(&backlog_tmp);
-                    var off: usize = 0;
-                    while (off < n) {
-                        const chunk = @min(@as(usize, 16 * 1024), n - off);
-                        pod_protocol.writeFrame(&self.client.?, .output, backlog_tmp[off .. off + chunk]) catch {};
-                        off += chunk;
-                    }
-                    pod_protocol.writeFrame(&self.client.?, .backlog_end, &[_]u8{}) catch {};
                 }
             }
 

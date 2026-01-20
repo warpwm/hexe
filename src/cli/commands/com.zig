@@ -438,3 +438,152 @@ pub fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []co
         }
     }
 }
+
+pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, last: bool, broadcast: bool, enter: bool, ctrl: []const u8, text: []const u8) !void {
+    // Build the data to send
+    var data_buf: [4096]u8 = undefined;
+    var data_len: usize = 0;
+
+    // Handle --ctrl option (e.g., --ctrl c sends Ctrl+C)
+    if (ctrl.len > 0) {
+        if (ctrl.len == 1 and ctrl[0] >= 'a' and ctrl[0] <= 'z') {
+            data_buf[0] = ctrl[0] - 'a' + 1; // Ctrl+a = 0x01, Ctrl+c = 0x03, etc.
+            data_len = 1;
+        } else if (ctrl.len == 1 and ctrl[0] >= 'A' and ctrl[0] <= 'Z') {
+            data_buf[0] = ctrl[0] - 'A' + 1;
+            data_len = 1;
+        } else {
+            print("Error: --ctrl requires a single letter (a-z)\n", .{});
+            return;
+        }
+    } else if (text.len > 0) {
+        if (text.len > data_buf.len - 1) {
+            print("Error: text too long\n", .{});
+            return;
+        }
+        @memcpy(data_buf[0..text.len], text);
+        data_len = text.len;
+    }
+
+    // Append newline if --enter
+    if (enter and data_len < data_buf.len) {
+        data_buf[data_len] = '\n';
+        data_len += 1;
+    }
+
+    if (data_len == 0) {
+        print("Error: no data to send (use text argument, --ctrl, or --enter)\n", .{});
+        return;
+    }
+
+    const socket_path = try ipc.getSesSocketPath(allocator);
+    defer allocator.free(socket_path);
+
+    var client = ipc.Client.connect(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            print("ses daemon is not running\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+    var buf: [4096]u8 = undefined;
+
+    var target_uuid: ?[]const u8 = null;
+    var uuid_buf: [32]u8 = undefined;
+
+    if (uuid.len > 0) {
+        target_uuid = uuid;
+    } else if (creator or last) {
+        // Query pane_info to get creator or last focused pane
+        const current_uuid = std.posix.getenv("HEXA_PANE_UUID") orelse {
+            print("Error: --creator/--last requires running inside hexa mux\n", .{});
+            return;
+        };
+
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{current_uuid});
+        try conn.sendLine(msg);
+
+        var resp_buf: [4096]u8 = undefined;
+        if (try conn.recvLine(&resp_buf)) |r| {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
+                print("Error: invalid response from daemon\n", .{});
+                return;
+            };
+            defer parsed.deinit();
+
+            const root = parsed.value.object;
+            if (root.get("type")) |t| {
+                if (std.mem.eql(u8, t.string, "pane_info")) {
+                    if (creator) {
+                        if (root.get("created_from")) |cf| {
+                            if (cf.string.len == 32) {
+                                @memcpy(&uuid_buf, cf.string[0..32]);
+                                target_uuid = &uuid_buf;
+                            }
+                        } else {
+                            print("Error: current pane has no creator\n", .{});
+                            return;
+                        }
+                    } else if (last) {
+                        if (root.get("focused_from")) |ff| {
+                            if (ff.string.len == 32) {
+                                @memcpy(&uuid_buf, ff.string[0..32]);
+                                target_uuid = &uuid_buf;
+                            }
+                        } else {
+                            print("Error: current pane has no previous focus\n", .{});
+                            return;
+                        }
+                    }
+                } else {
+                    print("Error: pane not found\n", .{});
+                    return;
+                }
+            }
+        }
+    } else if (!broadcast) {
+        target_uuid = std.posix.getenv("HEXA_PANE_UUID");
+    }
+
+    // Build send_keys request with hex-encoded data
+    // Manually encode to hex
+    var hex_buf: [8192]u8 = undefined;
+    for (data_buf[0..data_len], 0..) |byte, i| {
+        const hex_chars = "0123456789abcdef";
+        hex_buf[i * 2] = hex_chars[byte >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+    const hex_data = hex_buf[0 .. data_len * 2];
+
+    if (target_uuid) |t| {
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"send_keys\",\"uuid\":\"{s}\",\"hex\":\"{s}\"}}", .{ t, hex_data });
+        try conn.sendLine(msg);
+    } else if (broadcast) {
+        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"send_keys\",\"broadcast\":true,\"hex\":\"{s}\"}}", .{hex_data});
+        try conn.sendLine(msg);
+    } else {
+        print("Error: no target specified (use --uuid, --creator, --last, --broadcast, or run inside mux)\n", .{});
+        return;
+    }
+
+    var resp_buf: [1024]u8 = undefined;
+    if (try conn.recvLine(&resp_buf)) |r| {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
+        defer parsed.deinit();
+
+        if (parsed.value.object.get("type")) |t| {
+            if (std.mem.eql(u8, t.string, "error")) {
+                if (parsed.value.object.get("message")) |m| {
+                    print("Error: {s}\n", .{m.string});
+                }
+            } else if (std.mem.eql(u8, t.string, "ok")) {
+                // Success - silent
+            } else if (std.mem.eql(u8, t.string, "not_found")) {
+                print("Target pane not found\n", .{});
+            }
+        }
+    }
+}

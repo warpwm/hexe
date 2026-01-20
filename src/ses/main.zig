@@ -74,24 +74,35 @@ pub fn run(args: SesArgs) !void {
         try daemonize();
     }
 
+    std.debug.print("ses: after daemonize\n", .{});
+
     // Now create GPA AFTER fork - this ensures clean allocator state
     // Note: GPA still has issues after fork, so we use page_allocator for most operations
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    std.debug.print("ses: gpa created\n", .{});
+
     // Initialize state
     var ses_state = state.SesState.init(allocator);
     defer ses_state.deinit();
 
-    // Load persisted registry/layout (best-effort)
-    persist.load(allocator, &ses_state) catch {};
+    std.debug.print("ses: state init done\n", .{});
+
+    // Load persisted registry/layout (best-effort) - DISABLED, uses GPA
+    // persist.load(allocator, &ses_state) catch {};
+
+    std.debug.print("ses: persist skipped\n", .{});
 
     // Initialize server
     var srv = server.Server.init(allocator, &ses_state) catch |err| {
+        std.debug.print("ses: server init failed\n", .{});
         return err;
     };
     defer srv.deinit();
+
+    std.debug.print("ses: server init done\n", .{});
 
     // Set up signal handlers
     setupSignalHandlers(&srv);

@@ -54,14 +54,6 @@ pub fn main() !void {
     const com_send_enter = try com_send.flag("e", "enter", null);
     const com_send_ctrl = try com_send.string("C", "ctrl", null);
     const com_send_text = try com_send.stringPositional(null);
-    // Suppress unused warnings for now
-    _ = com_send_uuid;
-    _ = com_send_creator;
-    _ = com_send_last;
-    _ = com_send_broadcast;
-    _ = com_send_enter;
-    _ = com_send_ctrl;
-    _ = com_send_text;
 
     // SES subcommands
     const ses_daemon = try ses_cmd.newCommand("daemon", "Start the session daemon");
@@ -130,6 +122,7 @@ pub fn main() !void {
     var found_pop = false;
     var found_confirm = false;
     var found_choose = false;
+    var found_send = false;
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) has_help = true;
@@ -150,11 +143,14 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "pop")) found_pop = true;
         if (std.mem.eql(u8, arg, "confirm")) found_confirm = true;
         if (std.mem.eql(u8, arg, "choose")) found_choose = true;
+        if (std.mem.eql(u8, arg, "send")) found_send = true;
     }
 
     if (has_help) {
         // Show help for the most specific command found (manual strings to avoid argonaut crash)
-        if (found_com and found_notify) {
+        if (found_com and found_send) {
+            print("Usage: hexa com send [OPTIONS] [text]\n\nSend keystrokes to pane (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all attached panes\n  -e, --enter        Append Enter key after text\n  -C, --ctrl <char>  Send Ctrl+<char> (e.g., -C c for Ctrl+C)\n", .{});
+        } else if (found_com and found_notify) {
             print("Usage: hexa com notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all muxes\n", .{});
         } else if (found_com and found_info) {
             print("Usage: hexa com info [OPTIONS]\n\nShow information about a pane\n\nOptions:\n  -u, --uuid <UUID>  Query specific pane by UUID (works from anywhere)\n  -c, --creator      Print only the creator pane UUID\n  -l, --last         Print only the last focused pane UUID\n\nWithout --uuid, queries current pane (requires running inside mux)\n", .{});
@@ -183,7 +179,7 @@ pub fn main() !void {
         } else if (found_pop) {
             print("Usage: hexa pop <command>\n\nPopup overlays\n\nCommands:\n  notify   Show notification\n  confirm  Yes/No dialog\n  choose   Select from options\n", .{});
         } else if (found_com) {
-            print("Usage: hexa com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  info    Show current pane info\n  notify  Send notification\n", .{});
+            print("Usage: hexa com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  info    Show current pane info\n  notify  Send notification\n  send    Send keystrokes to pane\n", .{});
         } else if (found_ses) {
             print("Usage: hexa ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
         } else if (found_pod) {
@@ -235,6 +231,8 @@ pub fn main() !void {
             try com.runInfo(allocator, com_info_uuid.*, com_info_creator.*, com_info_last.*);
         } else if (com_notify.happened) {
             try com.runNotify(allocator, com_notify_uuid.*, com_notify_creator.*, com_notify_last.*, com_notify_broadcast.*, com_notify_msg.*);
+        } else if (com_send.happened) {
+            try com.runSend(allocator, com_send_uuid.*, com_send_creator.*, com_send_last.*, com_send_broadcast.*, com_send_enter.*, com_send_ctrl.*, com_send_text.*);
         }
     } else if (ses_cmd.happened) {
         // Check which ses subcommand

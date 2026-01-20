@@ -9,6 +9,7 @@ const pane_handlers = @import("handlers/pane.zig");
 const session_handlers = @import("handlers/session.zig");
 const notify_handlers = @import("handlers/notify.zig");
 const pop_handlers = @import("handlers/pop.zig");
+const keys_handlers = @import("handlers/keys.zig");
 
 /// Message types from mux to ses
 pub const RequestType = enum {
@@ -264,6 +265,8 @@ pub const Server = struct {
             try pane_handlers.handleUpdatePaneAux(self.ses_state, conn, root, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "pop_response")) {
             try pop_handlers.handlePopResponse(&self.pending_pop_requests, conn, root);
+        } else if (std.mem.eql(u8, type_str, "send_keys")) {
+            try keys_handlers.handleSendKeys(self.ses_state, conn, root, sendErrorFn);
         } else {
             try self.sendError(conn, "unknown_type");
         }
