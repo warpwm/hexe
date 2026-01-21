@@ -97,8 +97,20 @@ const RingBuffer = struct {
     start: usize = 0,
     len: usize = 0,
 
-    pub fn init(allocator: std.mem.Allocator, capacity: usize) !RingBuffer {
-        return .{ .buf = try allocator.alloc(u8, capacity) };
+    pub fn capacity(self: *const RingBuffer) usize {
+        return self.buf.len;
+    }
+
+    pub fn available(self: *const RingBuffer) usize {
+        return self.buf.len - self.len;
+    }
+
+    pub fn isFull(self: *const RingBuffer) bool {
+        return self.len == self.buf.len;
+    }
+
+    pub fn init(allocator: std.mem.Allocator, cap_bytes: usize) !RingBuffer {
+        return .{ .buf = try allocator.alloc(u8, cap_bytes) };
     }
 
     pub fn deinit(self: *RingBuffer, allocator: std.mem.Allocator) void {
@@ -142,6 +154,23 @@ const RingBuffer = struct {
         self.len += data.len;
     }
 
+    /// Append without dropping any existing bytes.
+    /// Returns false if there isn't enough remaining capacity.
+    pub fn appendNoDrop(self: *RingBuffer, data: []const u8) bool {
+        if (self.buf.len == 0) return false;
+        if (data.len > self.available()) return false;
+
+        const cap = self.buf.len;
+        const end = (self.start + self.len) % cap;
+        const first = @min(cap - end, data.len);
+        @memcpy(self.buf[end .. end + first], data[0..first]);
+        if (first < data.len) {
+            @memcpy(self.buf[0 .. data.len - first], data[first..]);
+        }
+        self.len += data.len;
+        return true;
+    }
+
     pub fn copyOut(self: *const RingBuffer, out: []u8) usize {
         const n = @min(out.len, self.len);
         if (n == 0) return 0;
@@ -165,6 +194,7 @@ const Pod = struct {
     backlog: RingBuffer,
     reader: pod_protocol.Reader,
     input_reader: pod_protocol.Reader,
+    pty_paused: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, uuid_str: []const u8, socket_path: []const u8, shell: []const u8, cwd: ?[]const u8) !Pod {
         var uuid: [32]u8 = undefined;
@@ -222,7 +252,14 @@ const Pod = struct {
             // server socket
             poll_fds[0] = .{ .fd = self.server.getFd(), .events = posix.POLL.IN, .revents = 0 };
             // pty
-            poll_fds[1] = .{ .fd = self.pty.master_fd, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+            if (self.client == null and self.backlog.isFull()) {
+                self.pty_paused = true;
+            }
+            const pty_events: i16 = if (self.pty_paused)
+                @intCast(posix.POLL.HUP | posix.POLL.ERR)
+            else
+                @intCast(posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR);
+            poll_fds[1] = .{ .fd = self.pty.master_fd, .events = pty_events, .revents = 0 };
             // client (optional)
             poll_fds[2] = .{ .fd = if (self.client) |c| c.fd else -1, .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
 
@@ -246,6 +283,11 @@ const Pod = struct {
                             off += chunk;
                         }
                         pod_protocol.writeFrame(&self.client.?, .backlog_end, &[_]u8{}) catch {};
+
+                        // Backlog has been delivered. Clear it so we can resume
+                        // capturing new output without dropping.
+                        self.backlog.clear();
+                        self.pty_paused = false;
                     } else {
                         // Already have a client - this is an input-only connection (e.g., hexe com send)
                         // Read any input frames and process them, then close
@@ -266,6 +308,37 @@ const Pod = struct {
                 break;
             }
             if (poll_fds[1].revents & posix.POLL.IN != 0) {
+                // If the mux is disconnected and backlog is full, pause PTY
+                // reads to apply backpressure instead of silently dropping.
+                if (self.client == null) {
+                    const free = self.backlog.available();
+                    if (free == 0) {
+                        self.pty_paused = true;
+                        continue;
+                    }
+
+                    const read_buf = buf[0..@min(buf.len, free)];
+                    const n = self.pty.read(read_buf) catch |err| switch (err) {
+                        error.WouldBlock => 0,
+                        else => return err,
+                    };
+                    if (n == 0) {
+                        // EOF => child exited / PTY closed.
+                        break;
+                    }
+                    const data = read_buf[0..n];
+                    if (containsClearSeq(data)) {
+                        self.backlog.clear();
+                    }
+                    if (!self.backlog.appendNoDrop(data)) {
+                        // Shouldn't happen due to bounded read, but be safe.
+                        self.pty_paused = true;
+                    } else if (self.backlog.isFull()) {
+                        self.pty_paused = true;
+                    }
+                    continue;
+                }
+
                 const n = self.pty.read(buf) catch |err| switch (err) {
                     error.WouldBlock => 0,
                     else => return err,

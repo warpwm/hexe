@@ -28,12 +28,19 @@ const state_tabs = @import("state_tabs.zig");
 const state_serialize = @import("state_serialize.zig");
 const state_sync = @import("state_sync.zig");
 
+pub const TabFocusKind = enum { split, float };
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     config: core.Config,
     pop_config: pop.PopConfig,
     tabs: std.ArrayList(Tab),
     active_tab: usize,
+    /// Per-tab remembered floating focus (by pane UUID).
+    /// This is used to restore float focus when switching tabs.
+    tab_last_floating_uuid: std.ArrayList(?[32]u8),
+    /// Remembers whether the last focus in a tab was a split or a float.
+    tab_last_focus_kind: std.ArrayList(TabFocusKind),
     floats: std.ArrayList(*Pane),
     active_floating: ?usize,
     running: bool,
@@ -93,6 +100,8 @@ pub const State = struct {
             .pop_config = pop_cfg,
             .tabs = .empty,
             .active_tab = 0,
+            .tab_last_floating_uuid = .empty,
+            .tab_last_focus_kind = .empty,
             .floats = .empty,
             .active_floating = null,
             .running = true,
@@ -178,6 +187,8 @@ pub const State = struct {
             tab.deinit();
         }
         self.tabs.deinit(self.allocator);
+        self.tab_last_floating_uuid.deinit(self.allocator);
+        self.tab_last_focus_kind.deinit(self.allocator);
         self.config.deinit();
         self.osc_reply_buf.deinit(self.allocator);
         self.renderer.deinit();

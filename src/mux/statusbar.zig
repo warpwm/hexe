@@ -290,6 +290,99 @@ pub fn draw(
     }
 }
 
+/// If the mouse click at (x,y) hits a tab in the center tabs widget,
+/// return the tab index.
+pub fn hitTestTab(
+    allocator: std.mem.Allocator,
+    config: *const core.Config,
+    term_width: u16,
+    term_height: u16,
+    tabs: anytype,
+    active_tab: usize,
+    session_name: []const u8,
+    x: u16,
+    y: u16,
+) ?usize {
+    if (!config.tabs.status.enabled) return null;
+    if (term_height == 0) return null;
+    const bar_y = term_height - 1;
+    if (y != bar_y) return null;
+
+    const width = term_width;
+    const cfg = &config.tabs.status;
+
+    // Create shp context for tab name resolution.
+    var ctx = shp.Context.init(allocator);
+    defer ctx.deinit();
+    ctx.terminal_width = width;
+
+    // Find the tabs module and its tab_title setting.
+    var use_basename = true;
+    var tabs_mod: ?*const core.StatusModule = null;
+    for (cfg.center) |mod| {
+        if (std.mem.eql(u8, mod.name, "tabs")) {
+            use_basename = std.mem.eql(u8, mod.tab_title, "basename");
+            tabs_mod = &mod;
+            break;
+        }
+    }
+    if (tabs_mod == null) return null;
+
+    var tab_names: [16][]const u8 = undefined;
+    var tab_count: usize = 0;
+    for (tabs.items) |*tab| {
+        if (tab_count >= tab_names.len) break;
+        if (use_basename) {
+            if (tab.layout.getFocusedPane()) |pane| {
+                const pwd = pane.getRealCwd();
+                tab_names[tab_count] = if (pwd) |p| blk: {
+                    const base = std.fs.path.basename(p);
+                    break :blk if (base.len == 0) "/" else base;
+                } else tab.name;
+            } else {
+                tab_names[tab_count] = tab.name;
+            }
+        } else {
+            tab_names[tab_count] = tab.name;
+        }
+        tab_count += 1;
+    }
+    if (tab_count == 0) return null;
+
+    ctx.tab_names = tab_names[0..tab_count];
+    ctx.active_tab = active_tab;
+    ctx.session_name = session_name;
+
+    const mod = tabs_mod.?;
+    const center_width = measureTabsWidth(ctx.tab_names, mod.separator, mod.left_arrow, mod.right_arrow);
+    if (center_width == 0) return null;
+    const center_start = (width -| center_width) / 2;
+
+    var cx: u16 = center_start;
+    const left_arrow_width = measureText(mod.left_arrow);
+    const right_arrow_width = measureText(mod.right_arrow);
+    const sep_width = measureText(mod.separator);
+
+    for (ctx.tab_names, 0..) |tab_name, ti| {
+        if (ti > 0) {
+            cx +|= sep_width;
+        }
+        const start_x = cx;
+        cx +|= left_arrow_width;
+        cx +|= 1;
+        cx +|= measureText(tab_name);
+        cx +|= 1;
+        cx +|= right_arrow_width;
+        const end_x = cx;
+
+        if (x >= start_x and x < end_x) {
+            return ti;
+        }
+    }
+
+    return null;
+}
+
 // Helper to measure tabs width - mirrors exact rendering logic
 fn measureTabsWidth(tab_names: []const []const u8, separator: []const u8, left_arrow: []const u8, right_arrow: []const u8) u16 {
     var w: u16 = 0;

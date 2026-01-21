@@ -58,6 +58,9 @@ pub fn createTab(self: anytype) !void {
     tab.layout.setPanePopConfig(&self.pop_config.pane.notification);
     const first_pane = try tab.layout.createFirstPane(cwd);
     try self.tabs.append(self.allocator, tab);
+    // Keep per-tab float focus state in sync.
+    try self.tab_last_floating_uuid.append(self.allocator, null);
+    try self.tab_last_focus_kind.append(self.allocator, .split);
     self.active_tab = self.tabs.items.len - 1;
     self.syncPaneAux(first_pane, parent_uuid);
     self.renderer.invalidate();
@@ -100,6 +103,8 @@ pub fn closeCurrentTab(self: anytype) bool {
 
     var tab = self.tabs.orderedRemove(self.active_tab);
     tab.deinit();
+    _ = self.tab_last_floating_uuid.orderedRemove(self.active_tab);
+    _ = self.tab_last_focus_kind.orderedRemove(self.active_tab);
     if (self.active_tab >= self.tabs.items.len) {
         self.active_tab = self.tabs.items.len - 1;
     }
@@ -407,6 +412,19 @@ pub fn reattachSession(self: anytype, session_id_prefix: []const u8) bool {
 
             self.tabs.append(self.allocator, tab) catch continue;
         }
+    }
+
+    // Reset per-tab float focus tracking to match restored tabs.
+    self.tab_last_floating_uuid.clearRetainingCapacity();
+    self.tab_last_floating_uuid.ensureTotalCapacity(self.allocator, self.tabs.items.len) catch {};
+    for (0..self.tabs.items.len) |_| {
+        self.tab_last_floating_uuid.appendAssumeCapacity(null);
+    }
+
+    self.tab_last_focus_kind.clearRetainingCapacity();
+    self.tab_last_focus_kind.ensureTotalCapacity(self.allocator, self.tabs.items.len) catch {};
+    for (0..self.tabs.items.len) |_| {
+        self.tab_last_focus_kind.appendAssumeCapacity(.split);
     }
 
     // Restore floats.

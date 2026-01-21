@@ -5,6 +5,40 @@ const core = @import("core");
 const SesClient = @import("ses_client.zig").SesClient;
 const Pane = @import("pane.zig").Pane;
 const helpers = @import("helpers.zig");
+const TabFocusKind = @import("state.zig").TabFocusKind;
+
+fn setLayoutFocusedSplitId(self: anytype, pane: *Pane) void {
+    if (pane.floating) return;
+
+    // Find which tab/layout owns this pane pointer and set its focused_split_id
+    // to match. This keeps per-tab focus stable when switching tabs.
+    for (self.tabs.items) |*tab| {
+        var it = tab.layout.splits.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* == pane) {
+                tab.layout.focused_split_id = entry.key_ptr.*;
+                return;
+            }
+        }
+    }
+}
+
+fn rememberFloatingFocus(self: anytype, pane: *Pane) void {
+    if (!pane.floating) return;
+    if (self.tab_last_floating_uuid.items.len == 0) return;
+    if (self.active_tab >= self.tab_last_floating_uuid.items.len) return;
+    self.tab_last_floating_uuid.items[self.active_tab] = pane.uuid;
+    if (self.active_tab < self.tab_last_focus_kind.items.len) {
+        self.tab_last_focus_kind.items[self.active_tab] = .float;
+    }
+}
+
+fn rememberSplitFocus(self: anytype, pane: *Pane) void {
+    if (pane.floating) return;
+    if (self.active_tab < self.tab_last_focus_kind.items.len) {
+        self.tab_last_focus_kind.items[self.active_tab] = .split;
+    }
+}
 
 pub fn syncStateToSes(self: anytype) void {
     if (!self.ses_client.isConnected()) return;
@@ -133,6 +167,13 @@ pub fn unfocusAllPanes(self: anytype) void {
 pub fn syncPaneFocus(self: anytype, pane: *Pane, focused_from: ?[32]u8) void {
     if (!self.ses_client.isConnected()) return;
     if (pane.uuid[0] == 0) return;
+
+    setLayoutFocusedSplitId(self, pane);
+    if (pane.floating) {
+        rememberFloatingFocus(self, pane);
+    } else {
+        rememberSplitFocus(self, pane);
+    }
 
     self.unfocusAllPanes();
 
