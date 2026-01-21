@@ -120,7 +120,7 @@ pub fn adoptStickyPanes(self: anytype) void {
 
     // Check each float definition for sticky floats.
     for (self.config.floats) |*float_def| {
-        if (!float_def.sticky) continue;
+        if (!float_def.attributes.sticky) continue;
 
         // Try to find a sticky pane in ses matching this directory + key.
         const result = self.ses_client.findStickyPane(cwd, float_def.key) catch continue;
@@ -178,10 +178,10 @@ pub fn adoptAsFloat(self: anytype, uuid: [32]u8, socket_path: []const u8, pid: s
     pane.floating = true;
     pane.focused = true;
     pane.float_key = float_def.key;
-    pane.sticky = float_def.sticky;
+    pane.sticky = float_def.attributes.sticky;
 
     // For global floats (special or pwd), set per-tab visibility.
-    if (float_def.special or float_def.pwd) {
+    if (float_def.attributes.global or float_def.attributes.per_cwd) {
         pane.setVisibleOnTab(self.active_tab, true);
     } else {
         pane.visible = true;
@@ -202,13 +202,13 @@ pub fn adoptAsFloat(self: anytype, uuid: [32]u8, socket_path: []const u8, pid: s
     pane.float_pad_y = @intCast(pad_y_cfg);
 
     // Store pwd for pwd floats.
-    if (float_def.pwd) {
+    if (float_def.attributes.per_cwd) {
         pane.is_pwd = true;
         pane.pwd_dir = self.allocator.dupe(u8, cwd) catch null;
     }
 
     // For tab-bound floats, set parent tab.
-    if (!float_def.special and !float_def.pwd) {
+    if (!float_def.attributes.global and !float_def.attributes.per_cwd) {
         pane.parent_tab = self.active_tab;
     }
 

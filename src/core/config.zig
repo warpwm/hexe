@@ -59,14 +59,27 @@ pub const FloatStyle = struct {
     module: ?StatusModule = null,
 };
 
+pub const FloatAttributes = struct {
+    /// Hide all other floats on the current tab when this float is shown.
+    /// Note: this is one-way today (we don't auto-restore hidden floats).
+    exclusive: bool = false,
+    /// Create one instance per current working directory.
+    /// A per-cwd float is always treated as "global" (not tab-bound).
+    per_cwd: bool = false,
+    /// Preserve by ses daemon across mux restarts.
+    sticky: bool = false,
+    /// If true, the float is global (not tab-bound).
+    /// If false, it is tab-bound and will be cleaned up when closing that tab.
+    global: bool = false,
+    /// Kill the float process when hiding it.
+    /// Ignored for per-cwd (and typically meaningless for global floats).
+    destroy: bool = false,
+};
+
 pub const FloatDef = struct {
     key: u8,
     command: ?[]const u8,
-    alone: bool = false, // hide all other floats when this one opens
-    pwd: bool = false, // if true, each directory gets its own instance
-    sticky: bool = false, // if true, preserved by ses daemon across mux restarts
-    special: bool = true, // if true, float is global; if false, float is tab-bound
-    destroy: bool = false, // if true, kill float on hide (ignored if pwd or special)
+    attributes: FloatAttributes = .{},
     // Per-float overrides (null = use default)
     width_percent: ?u8 = null,
     height_percent: ?u8 = null,
@@ -269,6 +282,7 @@ pub const Config = struct {
             var def_pad_y: ?u8 = null;
             var def_color: ?BorderColor = null;
             var def_style: ?FloatStyle = null;
+            var def_attrs = FloatAttributes{};
 
             for (json_floats, 0..) |jf, idx| {
                 // First entry without key = defaults
@@ -287,6 +301,16 @@ pub const Config = struct {
                     }
                     if (jf.style) |js| {
                         def_style = parseFloatStyle(allocator, js);
+                    }
+                    if (jf.attributes) |a| {
+                        if (a.exclusive orelse a.alone) |v| def_attrs.exclusive = v;
+                        if (a.per_cwd orelse a.pwd) |v| def_attrs.per_cwd = v;
+                        if (a.sticky) |v| def_attrs.sticky = v;
+                        if (a.global orelse a.special) |v| def_attrs.global = v;
+                        if (a.destroy orelse a.destroy_on_hide) |v| def_attrs.destroy = v;
+                        if (def_attrs.destroy and a.global == null and a.special == null) {
+                            def_attrs.global = false;
+                        }
                     }
                     // Apply defaults to config
                     if (def_width) |w| config.float_width_percent = w;
@@ -315,18 +339,23 @@ pub const Config = struct {
                 // Parse style if present
                 const style: ?FloatStyle = if (jf.style) |js| parseFloatStyle(allocator, js) else null;
 
-                const destroy = jf.destroy orelse false;
-                // If destroy is set and special not explicitly provided, default special to false
-                const special = jf.special orelse (if (destroy) false else true);
+                var attrs = def_attrs;
+                if (jf.attributes) |a| {
+                    if (a.exclusive orelse a.alone) |v| attrs.exclusive = v;
+                    if (a.per_cwd orelse a.pwd) |v| attrs.per_cwd = v;
+                    if (a.sticky) |v| attrs.sticky = v;
+                    if (a.destroy orelse a.destroy_on_hide) |v| attrs.destroy = v;
+                    if (a.global orelse a.special) |v| attrs.global = v;
+                    // If destroy is set and global not explicitly provided, default global to false.
+                    if (attrs.destroy and a.global == null and a.special == null) {
+                        attrs.global = false;
+                    }
+                }
 
                 float_list.append(allocator, .{
                     .key = key,
                     .command = command,
-                    .alone = jf.alone orelse false,
-                    .pwd = jf.pwd orelse false,
-                    .sticky = jf.sticky orelse false,
-                    .special = special,
-                    .destroy = destroy,
+                    .attributes = attrs,
                     .width_percent = if (jf.width) |v| @intCast(@min(100, @max(10, v))) else def_width,
                     .height_percent = if (jf.height) |v| @intCast(@min(100, @max(10, v))) else def_height,
                     .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else def_pos_x,
@@ -558,11 +587,19 @@ fn parseFloatStyle(allocator: std.mem.Allocator, js: JsonFloatStyle) ?FloatStyle
 const JsonFloatPane = struct {
     key: []const u8 = "",
     command: ?[]const u8 = null,
-    alone: ?bool = null,
-    pwd: ?bool = null,
-    sticky: ?bool = null,
-    special: ?bool = null,
-    destroy: ?bool = null,
+    attributes: ?struct {
+        // Preferred names
+        exclusive: ?bool = null,
+        per_cwd: ?bool = null,
+        sticky: ?bool = null,
+        global: ?bool = null,
+        destroy: ?bool = null,
+        // Legacy names (still accepted inside attributes)
+        alone: ?bool = null,
+        pwd: ?bool = null,
+        special: ?bool = null,
+        destroy_on_hide: ?bool = null,
+    } = null,
     width: ?i64 = null,
     height: ?i64 = null,
     pos_x: ?i64 = null,

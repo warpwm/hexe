@@ -320,7 +320,7 @@ pub fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
             }
 
             // For pwd floats, also check directory match.
-            if (float_def.pwd and pane.is_pwd) {
+            if (float_def.attributes.per_cwd and pane.is_pwd) {
                 // Both dirs must exist and match, or both be null.
                 const dirs_match = if (pane.pwd_dir) |pane_dir| blk: {
                     if (current_dir) |curr| {
@@ -347,7 +347,7 @@ pub fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
                 state.active_floating = i;
                 state.syncPaneFocus(pane, old_uuid);
                 // If alone mode, hide all other floats on this tab.
-                if (float_def.alone) {
+                if (float_def.attributes.exclusive) {
                     for (state.floats.items) |other| {
                         if (other.float_key != float_def.key) {
                             other.setVisibleOnTab(state.active_tab, false);
@@ -389,7 +389,7 @@ pub fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
     };
 
     // If alone mode, hide all other floats on this tab.
-    if (float_def.alone) {
+    if (float_def.attributes.exclusive) {
         for (state.floats.items) |pane| {
             if (pane.float_key != float_def.key) {
                 pane.setVisibleOnTab(state.active_tab, false);
@@ -397,7 +397,7 @@ pub fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
         }
     }
     // For pwd floats, hide other instances of same float (different dirs) on this tab.
-    if (float_def.pwd) {
+    if (float_def.attributes.per_cwd) {
         const new_idx = state.floats.items.len - 1;
         for (state.floats.items, 0..) |pane, i| {
             if (i != new_idx and pane.float_key == float_def.key) {
@@ -548,7 +548,7 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
     pane.float_key = float_def.key;
     // For global floats (special or pwd), set per-tab visibility.
     // For tab-bound floats, use simple visible field.
-    if (float_def.special or float_def.pwd) {
+    if (float_def.attributes.global or float_def.attributes.per_cwd) {
         pane.setVisibleOnTab(state.active_tab, true);
     } else {
         pane.visible = true;
@@ -568,7 +568,7 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
     pane.float_pad_y = @intCast(pad_y_cfg);
 
     // For pwd floats, store the directory and duplicate it.
-    if (float_def.pwd) {
+    if (float_def.attributes.per_cwd) {
         pane.is_pwd = true;
         if (current_dir) |dir| {
             pane.pwd_dir = state.allocator.dupe(u8, dir) catch null;
@@ -576,12 +576,12 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
     }
 
     // For tab-bound floats, set parent tab.
-    if (!float_def.special and !float_def.pwd) {
+    if (!float_def.attributes.global and !float_def.attributes.per_cwd) {
         pane.parent_tab = state.active_tab;
     }
 
     // For sticky floats, set sticky.
-    pane.sticky = float_def.sticky;
+    pane.sticky = float_def.attributes.sticky;
 
     // Store style reference.
     if (float_def.style) |*style| {

@@ -21,8 +21,10 @@
     },
     {
       "key": "1",
-      "pwd": true,
-      "sticky": true
+      "attributes": {
+        "per_cwd": true,
+        "sticky": true
+      }
     },
     {
       "key": "2"
@@ -35,16 +37,22 @@
       "height": 50,
       "padding_x": 0,
       "padding_y": 0,
-      "special": false
+      "attributes": {
+        "global": false
+      }
     },
     {
       "key": "4",
-      "destroy": true
+      "attributes": {
+        "destroy": true
+      }
     },
     {
       "key": "f",
       "command": "btop",
-      "alone": true,
+      "attributes": {
+        "exclusive": true
+      },
       "style": {
         "position": "topright",
         "name": "time",
