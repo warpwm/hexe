@@ -216,6 +216,7 @@ pub fn drawFloatingBorder(
     const horizontal: u21 = if (style) |s| s.horizontal else 0x2500;
     const vertical: u21 = if (style) |s| s.vertical else 0x2502;
 
+
     // Clear the interior with spaces first
     for (1..h -| 1) |row| {
         for (1..w -| 1) |col| {
@@ -228,23 +229,11 @@ pub fn drawFloatingBorder(
     // Top-left corner
     renderer.setCell(x, y, .{ .char = top_left, .fg = fg, .bold = bold });
 
-    // Top border with optional title (centered)
-    if (name.len > 0) {
-        var title_buf: [32]u8 = undefined;
-        const title = std.fmt.bufPrint(&title_buf, "[ {s} ]", .{name}) catch "[ float ]";
-        const title_start = @as(usize, (w -| 2) -| title.len) / 2;
-
-        for (0..w -| 2) |col| {
-            const char: u21 = if (col >= title_start and col < title_start + title.len)
-                title[col - title_start]
-            else
-                horizontal;
-            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = char, .fg = fg, .bold = bold });
-        }
-    } else {
-        for (0..w -| 2) |col| {
-            renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = horizontal, .fg = fg, .bold = bold });
-        }
+    // Top border (no built-in title).
+    // The float title should be rendered via the style module area so the
+    // user fully controls title placement and formatting.
+    for (0..w -| 2) |col| {
+        renderer.setCell(x + @as(u16, @intCast(col)) + 1, y, .{ .char = horizontal, .fg = fg, .bold = bold });
     }
 
     // Top-right corner
@@ -273,7 +262,11 @@ pub fn drawFloatingBorder(
             if (s.position) |pos| {
                 // Run the module to get output
                 var output_buf: [256]u8 = undefined;
-                const output = statusbar.runStatusModule(module, &output_buf) catch "";
+                // If a title is provided, treat the module area as the title widget.
+                const output = if (name.len > 0)
+                    name
+                else
+                    statusbar.runStatusModule(module, &output_buf) catch "";
                 if (output.len == 0) return;
 
                 // Render styled output
