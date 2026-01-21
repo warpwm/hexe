@@ -96,6 +96,7 @@ pub const Pane = struct {
     parent_tab: ?usize = null,
     // Border style and optional module
     float_style: ?*const core.FloatStyle = null,
+    float_title: ?[]u8 = null,
 
     // Tracks whether we saw a clear-screen sequence in the last output.
     did_clear: bool = false,
@@ -241,6 +242,10 @@ pub const Pane = struct {
         }
         if (self.popups_initialized) {
             self.popups.deinit();
+        }
+        if (self.float_title) |t| {
+            self.allocator.free(t);
+            self.float_title = null;
         }
     }
 

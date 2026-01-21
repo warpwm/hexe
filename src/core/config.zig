@@ -177,7 +177,8 @@ pub const Config = struct {
     float_height_percent: u8 = 60,
     float_padding_x: u8 = 1, // left/right padding inside border
     float_padding_y: u8 = 0, // top/bottom padding inside border
-    float_color: BorderColor = .{}, // border colors (active/passive)
+    // Float borders default to active=1, passive=237.
+    float_color: BorderColor = .{},
     float_style_default: ?FloatStyle = null,
 
     // Named floats

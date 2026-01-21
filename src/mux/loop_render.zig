@@ -47,7 +47,7 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
             if (parent != state.active_tab) continue;
         }
 
-        borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, "", pane.border_color, pane.float_style);
+        borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, false, if (pane.float_title) |t| t else "", pane.border_color, pane.float_style);
 
         const render_state = pane.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
@@ -71,7 +71,7 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
         else
             true;
         if (pane.isVisibleOnTab(state.active_tab) and can_render) {
-            borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, "", pane.border_color, pane.float_style);
+            borders.drawFloatingBorder(renderer, pane.border_x, pane.border_y, pane.border_w, pane.border_h, true, if (pane.float_title) |t| t else "", pane.border_color, pane.float_style);
 
             if (pane.getRenderState()) |render_state| {
                 renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);

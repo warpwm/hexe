@@ -410,6 +410,7 @@ pub fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
 pub fn createAdhocFloat(
     state: *State,
     command: []const u8,
+    title: ?[]const u8,
     cwd: ?[]const u8,
     env: ?[]const []const u8,
     extra_env: ?[]const []const u8,
@@ -463,6 +464,12 @@ pub fn createAdhocFloat(
     pane.focused = true;
     pane.float_key = 0;
     pane.visible = true;
+
+    if (title) |t| {
+        if (t.len > 0) {
+            pane.float_title = try state.allocator.dupe(u8, t);
+        }
+    }
 
     pane.border_x = outer_x;
     pane.border_y = outer_y;

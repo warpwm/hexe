@@ -202,7 +202,11 @@ pub fn drawFloatingBorder(
 ) void {
     const color = if (active) border_color.active else border_color.passive;
     const fg: render.Color = .{ .palette = color };
-    const bold = active;
+    // Do not rely on SGR bold for active borders.
+    // Many terminals render bold + low palette indices as the "bright" variant
+    // (e.g. palette 1 looks like palette 9). We want the configured palette
+    // index to be respected.
+    const bold = false;
 
     // Get border characters from style or use defaults
     const top_left: u21 = if (style) |s| s.top_left else 0x256D;

@@ -408,6 +408,11 @@ pub fn handleIpcConnection(state: *State, buffer: []u8) void {
 
         const command_to_run = command;
 
+        const title = if (root.get("title")) |tv|
+            if (tv == .string and tv.string.len > 0) tv.string else null
+        else
+            null;
+
         const old_uuid = state.getCurrentFocusedUuid();
         const focused_pane = if (state.active_floating) |idx| blk: {
             if (idx < state.floats.items.len) break :blk state.floats.items[idx];
@@ -428,7 +433,7 @@ pub fn handleIpcConnection(state: *State, buffer: []u8) void {
             state.syncPaneUnfocus(tiled);
         }
 
-        const new_uuid = actions.createAdhocFloat(state, command_to_run, spawn_cwd, env_items, extra_env_items, !wait_for_exit) catch |err| {
+        const new_uuid = actions.createAdhocFloat(state, command_to_run, title, spawn_cwd, env_items, extra_env_items, !wait_for_exit) catch |err| {
             const msg = std.fmt.allocPrint(state.allocator, "{{\"type\":\"error\",\"message\":\"{s}\"}}", .{@errorName(err)}) catch return;
             defer state.allocator.free(msg);
             conn.sendLine(msg) catch {};
