@@ -1,0 +1,600 @@
+const std = @import("std");
+const posix = std.posix;
+const core = @import("core");
+
+const layout_mod = @import("layout.zig");
+const SplitDir = layout_mod.SplitDir;
+
+const State = @import("state.zig").State;
+const Pane = @import("pane.zig").Pane;
+const SesClient = @import("ses_client.zig").SesClient;
+
+const helpers = @import("helpers.zig");
+const float_completion = @import("float_completion.zig");
+
+fn escapeForShell(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try out.append(allocator, '\'');
+    for (value) |ch| {
+        if (ch == '\'') {
+            try out.appendSlice(allocator, "'\\''");
+        } else {
+            try out.append(allocator, ch);
+        }
+    }
+    try out.append(allocator, '\'');
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn mergeEnvLines(allocator: std.mem.Allocator, env: ?[]const []const u8, extra: ?[]const []const u8) !?[]const []const u8 {
+    const env_len = if (env) |v| v.len else 0;
+    const extra_len = if (extra) |v| v.len else 0;
+    if (env_len + extra_len == 0) return null;
+    const out = try allocator.alloc([]const u8, env_len + extra_len);
+    var i: usize = 0;
+    if (env) |v| {
+        for (v) |item| {
+            out[i] = item;
+            i += 1;
+        }
+    }
+    if (extra) |v| {
+        for (v) |item| {
+            out[i] = item;
+            i += 1;
+        }
+    }
+    return out;
+}
+
+fn appendEnvExport(list: *std.ArrayList(u8), allocator: std.mem.Allocator, line: []const u8) !void {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return;
+    if (eq == 0) return;
+    const key = line[0..eq];
+    if (!isValidEnvKey(key)) return;
+    const value = line[eq + 1 ..];
+
+    const escaped = try escapeForShell(allocator, value);
+    defer allocator.free(escaped);
+
+    try list.appendSlice(allocator, "export ");
+    try list.appendSlice(allocator, key);
+    try list.appendSlice(allocator, "=");
+    try list.appendSlice(allocator, escaped);
+    try list.appendSlice(allocator, "; ");
+}
+
+fn isValidEnvKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+    const first = key[0];
+    if (!((first >= 'A' and first <= 'Z') or (first >= 'a' and first <= 'z') or first == '_')) return false;
+    for (key[1..]) |ch| {
+        if (!((ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '_')) return false;
+    }
+    return true;
+}
+
+/// Perform the actual detach action.
+pub fn performDetach(state: *State) void {
+    // Always set detach_mode to prevent killing panes on exit.
+    state.detach_mode = true;
+
+    // Serialize entire mux state.
+    const mux_state_json = state.serializeState() catch {
+        state.notifications.showFor("Failed to serialize state", 2000);
+        state.running = false;
+        return;
+    };
+    defer state.allocator.free(mux_state_json);
+
+    // Detach session with our UUID - panes stay grouped with full state.
+    state.ses_client.detachSession(state.uuid, mux_state_json) catch {
+        std.debug.print("\nDetach failed - panes orphaned\n", .{});
+        state.running = false;
+        return;
+    };
+    // Print session_id (our UUID) so user can reattach.
+    std.debug.print("\nSession detached: {s}\nReattach with: hexe-mux --attach {s}\n", .{ state.uuid, state.uuid[0..8] });
+    state.running = false;
+}
+
+/// Perform the actual disown action - orphan pane in ses and spawn new shell in same place.
+pub fn performDisown(state: *State) void {
+    const pane: ?*Pane = if (state.active_floating) |idx|
+        state.floats.items[idx]
+    else
+        state.currentLayout().getFocusedPane();
+
+    if (pane) |p| {
+        switch (p.backend) {
+            .pod => {
+                // Get current working directory from the process before orphaning.
+                const cwd = state.getSpawnCwd(p);
+
+                // Get the old pane's auxiliary info (created_from, focused_from) to inherit.
+                const old_aux = state.ses_client.getPaneAux(p.uuid) catch SesClient.PaneAuxInfo{
+                    .created_from = null,
+                    .focused_from = null,
+                };
+
+                // Orphan the current pane in ses (keeps process alive).
+                state.ses_client.orphanPane(p.uuid) catch {};
+
+                // Create a new shell via ses in the same directory and replace the pane's backend.
+                if (state.ses_client.createPane(null, cwd, null, null, null, null)) |result| {
+                    defer state.allocator.free(result.socket_path);
+                    p.replaceWithPod(result.socket_path, result.uuid) catch {
+                        state.notifications.show("Disown failed: couldn't replace pane");
+                        state.needs_render = true;
+                        return;
+                    };
+
+                    // Sync inherited auxiliary info to the new pane.
+                    const pane_type: SesClient.PaneType = if (p.floating) .float else .split;
+                    const cursor = p.getCursorPos();
+                    const cursor_style = p.vt.getCursorStyle();
+                    const cursor_visible = p.vt.isCursorVisible();
+                    const alt_screen = p.vt.inAltScreen();
+                    const layout_path = helpers.getLayoutPath(state, p) catch null;
+                    defer if (layout_path) |path| state.allocator.free(path);
+                    state.ses_client.updatePaneAux(
+                        p.uuid,
+                        p.floating,
+                        p.focused,
+                        pane_type,
+                        old_aux.created_from, // Inherit creator.
+                        old_aux.focused_from, // Inherit last focus.
+                        .{ .x = cursor.x, .y = cursor.y },
+                        cursor_style,
+                        cursor_visible,
+                        alt_screen,
+                        .{ .cols = p.width, .rows = p.height },
+                        cwd,
+                        null,
+                        null,
+                        layout_path,
+                    ) catch {};
+
+                    state.notifications.show("Pane disowned (adopt with Alt+a)");
+                } else |_| {
+                    state.notifications.show("Disown failed: couldn't create new pane");
+                }
+            },
+            .local => {
+                // Local process - just respawn.
+                p.respawn() catch {
+                    state.notifications.show("Respawn failed");
+                    state.needs_render = true;
+                    return;
+                };
+                state.notifications.show("Pane respawned");
+            },
+        }
+    }
+    state.needs_render = true;
+}
+
+/// Perform the actual close action - close current float or tab.
+pub fn performClose(state: *State) void {
+    if (state.active_floating) |idx| {
+        const old_uuid = state.getCurrentFocusedUuid();
+        const pane = state.floats.orderedRemove(idx);
+        state.syncPaneUnfocus(pane);
+        float_completion.handleBlockingFloatCompletion(state, pane);
+        // Kill in ses.
+        if (state.ses_client.isConnected()) {
+            state.ses_client.killPane(pane.uuid) catch {};
+        }
+        pane.deinit();
+        state.allocator.destroy(pane);
+        // Focus another float or fall back to tiled pane.
+        if (state.floats.items.len > 0) {
+            state.active_floating = 0;
+            state.syncPaneFocus(state.floats.items[0], old_uuid);
+        } else {
+            state.active_floating = null;
+            if (state.currentLayout().getFocusedPane()) |tiled| {
+                state.syncPaneFocus(tiled, old_uuid);
+            }
+        }
+        state.syncStateToSes();
+    } else {
+        // Close current tab, or quit if it's the last one.
+        if (!state.closeCurrentTab()) {
+            state.running = false;
+        }
+    }
+    state.needs_render = true;
+}
+
+/// Start the adopt orphaned pane flow.
+pub fn startAdoptFlow(state: *State) void {
+    if (!state.ses_client.isConnected()) {
+        state.notifications.show("Not connected to ses");
+        return;
+    }
+
+    // Get list of orphaned panes.
+    const count = state.ses_client.listOrphanedPanes(&state.adopt_orphans) catch {
+        state.notifications.show("Failed to list orphaned panes");
+        return;
+    };
+
+    if (count == 0) {
+        state.notifications.show("No orphaned panes");
+        return;
+    }
+
+    state.adopt_orphan_count = count;
+
+    if (count == 1) {
+        // Only one orphan - skip picker, go directly to confirm.
+        state.adopt_selected_uuid = state.adopt_orphans[0].uuid;
+        state.pending_action = .adopt_confirm;
+        state.popups.showConfirm("Destroy current pane?", .{}) catch {};
+    } else {
+        // Multiple orphans - show picker.
+        // Build items list for picker (owned by popup).
+        var items_list: std.ArrayList([]const u8) = .empty;
+        defer items_list.deinit(state.allocator);
+        for (0..count) |i| {
+            items_list.append(state.allocator, state.adopt_orphans[i].uuid[0..]) catch {
+                state.notifications.show("Failed to show picker");
+                return;
+            };
+        }
+        state.pending_action = .adopt_choose;
+        state.popups.showPickerOwned(items_list.items, .{ .title = "Select pane to adopt" }) catch {
+            state.notifications.show("Failed to show picker");
+            state.pending_action = null;
+        };
+    }
+    state.needs_render = true;
+}
+
+/// Perform the actual adopt action.
+/// If destroy_current is true, kills the current pane; otherwise orphans it (swap).
+pub fn performAdopt(state: *State, orphan_uuid: [32]u8, destroy_current: bool) void {
+    // Adopt the selected orphan from ses.
+    const result = state.ses_client.adoptPane(orphan_uuid) catch {
+        state.notifications.show("Failed to adopt pane");
+        return;
+    };
+
+    // Get the current focused pane.
+    const current_pane: ?*Pane = if (state.active_floating) |idx|
+        state.floats.items[idx]
+    else
+        state.currentLayout().getFocusedPane();
+
+    if (current_pane) |pane| {
+        if (destroy_current) {
+            // Kill current pane in ses, then replace with adopted.
+            state.ses_client.killPane(pane.uuid) catch {};
+        } else {
+            // Orphan current pane (swap mode).
+            state.ses_client.orphanPane(pane.uuid) catch {};
+            state.notifications.show("Swapped panes (old pane orphaned)");
+        }
+
+        defer state.allocator.free(result.socket_path);
+
+        pane.replaceWithPod(result.socket_path, result.uuid) catch {
+            state.notifications.show("Failed to replace pane");
+            return;
+        };
+
+        // Sync the new pane info.
+        state.syncPaneAux(pane, null);
+        state.syncStateToSes();
+
+        if (destroy_current) {
+            state.notifications.show("Adopted pane (old destroyed)");
+        }
+    } else {
+        state.notifications.show("No focused pane");
+    }
+
+    state.renderer.invalidate();
+    state.force_full_render = true;
+    state.needs_render = true;
+}
+
+pub fn toggleNamedFloat(state: *State, float_def: *const core.FloatDef) void {
+    // Get current directory from focused pane (for pwd floats).
+    // Use refreshPaneCwd which queries ses for pod panes.
+    var current_dir: ?[]const u8 = null;
+    if (state.currentLayout().getFocusedPane()) |focused| {
+        current_dir = state.refreshPaneCwd(focused);
+    }
+
+    // Find existing float by key (and directory if pwd).
+    for (state.floats.items, 0..) |pane, i| {
+        if (pane.float_key == float_def.key) {
+            // Tab-bound: skip if on wrong tab.
+            if (pane.parent_tab) |parent| {
+                if (parent != state.active_tab) continue;
+            }
+
+            // For pwd floats, also check directory match.
+            if (float_def.pwd and pane.is_pwd) {
+                // Both dirs must exist and match, or both be null.
+                const dirs_match = if (pane.pwd_dir) |pane_dir| blk: {
+                    if (current_dir) |curr| {
+                        break :blk std.mem.eql(u8, pane_dir, curr);
+                    }
+                    break :blk false;
+                } else current_dir == null;
+
+                if (!dirs_match) continue;
+            }
+
+            // Toggle visibility (per-tab for global floats).
+            const old_uuid = state.getCurrentFocusedUuid();
+            pane.toggleVisibleOnTab(state.active_tab);
+            if (pane.isVisibleOnTab(state.active_tab)) {
+                // Unfocus current pane (tiled or another float).
+                if (state.active_floating) |afi| {
+                    if (afi < state.floats.items.len) {
+                        state.syncPaneUnfocus(state.floats.items[afi]);
+                    }
+                } else if (state.currentLayout().getFocusedPane()) |tiled| {
+                    state.syncPaneUnfocus(tiled);
+                }
+                state.active_floating = i;
+                state.syncPaneFocus(pane, old_uuid);
+                // If alone mode, hide all other floats on this tab.
+                if (float_def.alone) {
+                    for (state.floats.items) |other| {
+                        if (other.float_key != float_def.key) {
+                            other.setVisibleOnTab(state.active_tab, false);
+                        }
+                    }
+                }
+            } else {
+                // Float was hidden. If it had focus, return focus to tiled pane.
+                if (state.active_floating == i) {
+                    state.syncPaneUnfocus(pane);
+                    state.active_floating = null;
+                    if (state.currentLayout().getFocusedPane()) |tiled| {
+                        state.syncPaneFocus(tiled, old_uuid);
+                    }
+                }
+            }
+
+            state.renderer.invalidate();
+            state.force_full_render = true;
+            state.needs_render = true;
+            return;
+        }
+    }
+
+    // No existing float - create new.
+    const old_uuid = state.getCurrentFocusedUuid();
+    if (state.active_floating) |afi| {
+        if (afi < state.floats.items.len) {
+            state.syncPaneUnfocus(state.floats.items[afi]);
+        }
+    } else if (state.currentLayout().getFocusedPane()) |tiled| {
+        state.syncPaneUnfocus(tiled);
+    }
+
+    createNamedFloat(state, float_def, current_dir, old_uuid) catch {
+        state.notifications.show("Failed to create float");
+        state.needs_render = true;
+        return;
+    };
+
+    // If alone mode, hide all other floats on this tab.
+    if (float_def.alone) {
+        for (state.floats.items) |pane| {
+            if (pane.float_key != float_def.key) {
+                pane.setVisibleOnTab(state.active_tab, false);
+            }
+        }
+    }
+    // For pwd floats, hide other instances of same float (different dirs) on this tab.
+    if (float_def.pwd) {
+        const new_idx = state.floats.items.len - 1;
+        for (state.floats.items, 0..) |pane, i| {
+            if (i != new_idx and pane.float_key == float_def.key) {
+                pane.setVisibleOnTab(state.active_tab, false);
+            }
+        }
+    }
+}
+
+pub fn createAdhocFloat(
+    state: *State,
+    command: []const u8,
+    cwd: ?[]const u8,
+    env: ?[]const []const u8,
+    extra_env: ?[]const []const u8,
+    use_pod: bool,
+) ![32]u8 {
+    const pane = try state.allocator.create(Pane);
+    errdefer state.allocator.destroy(pane);
+
+    const cfg = &state.config;
+    const width_pct: u16 = cfg.float_width_percent;
+    const height_pct: u16 = cfg.float_height_percent;
+    const pos_x_pct: u16 = 50;
+    const pos_y_pct: u16 = 50;
+    const pad_x_cfg: u16 = cfg.float_padding_x;
+    const pad_y_cfg: u16 = cfg.float_padding_y;
+    const border_color = cfg.float_color;
+
+    const avail_h = state.term_height - state.status_height;
+    const outer_w = state.term_width * width_pct / 100;
+    const outer_h = avail_h * height_pct / 100;
+    const max_x = state.term_width -| outer_w;
+    const max_y = avail_h -| outer_h;
+    const outer_x = max_x * pos_x_pct / 100;
+    const outer_y = max_y * pos_y_pct / 100;
+
+    const pad_x: u16 = 1 + pad_x_cfg;
+    const pad_y: u16 = 1 + pad_y_cfg;
+    const content_x = outer_x + pad_x;
+    const content_y = outer_y + pad_y;
+    const content_w = outer_w -| (pad_x * 2);
+    const content_h = outer_h -| (pad_y * 2);
+
+    const id: u16 = @intCast(100 + state.floats.items.len);
+
+    if (use_pod and state.ses_client.isConnected()) {
+        if (state.ses_client.createPane(command, cwd, null, null, env, extra_env)) |result| {
+            defer state.allocator.free(result.socket_path);
+            try pane.initWithPod(state.allocator, id, content_x, content_y, content_w, content_h, result.socket_path, result.uuid);
+        } else |_| {
+            const merged_env = mergeEnvLines(state.allocator, env, extra_env) catch null;
+            defer if (merged_env) |slice| state.allocator.free(slice);
+            try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, command, cwd, merged_env);
+        }
+    } else {
+        const merged_env = mergeEnvLines(state.allocator, env, extra_env) catch null;
+        defer if (merged_env) |slice| state.allocator.free(slice);
+        try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, command, cwd, merged_env);
+    }
+
+    pane.floating = true;
+    pane.focused = true;
+    pane.float_key = 0;
+    pane.visible = true;
+
+    pane.border_x = outer_x;
+    pane.border_y = outer_y;
+    pane.border_w = outer_w;
+    pane.border_h = outer_h;
+    pane.border_color = border_color;
+
+    pane.float_width_pct = @intCast(width_pct);
+    pane.float_height_pct = @intCast(height_pct);
+    pane.float_pos_x_pct = @intCast(pos_x_pct);
+    pane.float_pos_y_pct = @intCast(pos_y_pct);
+    pane.float_pad_x = @intCast(pad_x_cfg);
+    pane.float_pad_y = @intCast(pad_y_cfg);
+
+    pane.parent_tab = state.active_tab;
+    pane.sticky = false;
+
+    if (state.config.float_style_default) |*style| {
+        pane.float_style = style;
+    }
+
+    pane.configureNotificationsFromPop(&state.pop_config.pane.notification);
+
+    try state.floats.append(state.allocator, pane);
+    state.active_floating = state.floats.items.len - 1;
+    state.syncPaneAux(pane, null);
+    state.syncStateToSes();
+
+    return pane.uuid;
+}
+
+pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_dir: ?[]const u8, parent_uuid: ?[32]u8) !void {
+    const pane = try state.allocator.create(Pane);
+    errdefer state.allocator.destroy(pane);
+
+    const cfg = &state.config;
+
+    // Use per-float settings or fall back to defaults.
+    const width_pct: u16 = float_def.width_percent orelse cfg.float_width_percent;
+    const height_pct: u16 = float_def.height_percent orelse cfg.float_height_percent;
+    const pos_x_pct: u16 = float_def.pos_x orelse 50; // default center
+    const pos_y_pct: u16 = float_def.pos_y orelse 50; // default center
+    const pad_x_cfg: u16 = float_def.padding_x orelse cfg.float_padding_x;
+    const pad_y_cfg: u16 = float_def.padding_y orelse cfg.float_padding_y;
+    const border_color = float_def.color orelse cfg.float_color;
+
+    // Calculate outer frame size.
+    const avail_h = state.term_height - state.status_height;
+    const outer_w = state.term_width * width_pct / 100;
+    const outer_h = avail_h * height_pct / 100;
+
+    // Calculate position based on pos_x/pos_y percentages.
+    const max_x = state.term_width -| outer_w;
+    const max_y = avail_h -| outer_h;
+    const outer_x = max_x * pos_x_pct / 100;
+    const outer_y = max_y * pos_y_pct / 100;
+
+    // Content area: 1 cell border + configurable padding.
+    const pad_x: u16 = 1 + pad_x_cfg;
+    const pad_y: u16 = 1 + pad_y_cfg;
+    const content_x = outer_x + pad_x;
+    const content_y = outer_y + pad_y;
+    const content_w = outer_w -| (pad_x * 2);
+    const content_h = outer_h -| (pad_y * 2);
+
+    const id: u16 = @intCast(100 + state.floats.items.len);
+
+    // Try to create pane via ses if available.
+    if (state.ses_client.isConnected()) {
+        if (state.ses_client.createPane(float_def.command, current_dir, null, null, null, null)) |result| {
+            defer state.allocator.free(result.socket_path);
+            try pane.initWithPod(state.allocator, id, content_x, content_y, content_w, content_h, result.socket_path, result.uuid);
+        } else |_| {
+            // Fall back to local spawn.
+            try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command, current_dir, null);
+        }
+    } else {
+        try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command, current_dir, null);
+    }
+
+    pane.floating = true;
+    pane.focused = true;
+    pane.float_key = float_def.key;
+    // For global floats (special or pwd), set per-tab visibility.
+    // For tab-bound floats, use simple visible field.
+    if (float_def.special or float_def.pwd) {
+        pane.setVisibleOnTab(state.active_tab, true);
+    } else {
+        pane.visible = true;
+    }
+    // Store outer dimensions and style for border rendering.
+    pane.border_x = outer_x;
+    pane.border_y = outer_y;
+    pane.border_w = outer_w;
+    pane.border_h = outer_h;
+    pane.border_color = border_color;
+    // Store percentages for resize recalculation.
+    pane.float_width_pct = @intCast(width_pct);
+    pane.float_height_pct = @intCast(height_pct);
+    pane.float_pos_x_pct = @intCast(pos_x_pct);
+    pane.float_pos_y_pct = @intCast(pos_y_pct);
+    pane.float_pad_x = @intCast(pad_x_cfg);
+    pane.float_pad_y = @intCast(pad_y_cfg);
+
+    // For pwd floats, store the directory and duplicate it.
+    if (float_def.pwd) {
+        pane.is_pwd = true;
+        if (current_dir) |dir| {
+            pane.pwd_dir = state.allocator.dupe(u8, dir) catch null;
+        }
+    }
+
+    // For tab-bound floats, set parent tab.
+    if (!float_def.special and !float_def.pwd) {
+        pane.parent_tab = state.active_tab;
+    }
+
+    // For sticky floats, set sticky.
+    pane.sticky = float_def.sticky;
+
+    // Store style reference.
+    if (float_def.style) |*style| {
+        pane.float_style = style;
+    } else if (state.config.float_style_default) |*style| {
+        pane.float_style = style;
+    }
+
+    // Configure pane notifications.
+    pane.configureNotificationsFromPop(&state.pop_config.pane.notification);
+
+    try state.floats.append(state.allocator, pane);
+    state.active_floating = state.floats.items.len - 1;
+    state.syncPaneAux(pane, parent_uuid);
+    state.syncStateToSes();
+}

@@ -514,9 +514,10 @@ fn runMuxFloat(
     const root = parsed.value.object;
     if (root.get("type")) |t| {
         if (std.mem.eql(u8, t.string, "float_result")) {
-            const stdout = if (root.get("stdout")) |v| v.string else "";
-            if (stdout.len > 0) {
-                print("{s}", .{stdout});
+            const stdout_content = if (root.get("stdout")) |v| v.string else "";
+            if (stdout_content.len > 0) {
+                _ = std.posix.write(std.posix.STDOUT_FILENO, stdout_content) catch {};
+                _ = std.posix.write(std.posix.STDOUT_FILENO, "\n") catch {};
             }
             const exit_code: u8 = if (root.get("exit_code")) |v| @intCast(@max(@as(i64, 0), v.integer)) else 0;
             std.process.exit(exit_code);
