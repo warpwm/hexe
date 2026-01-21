@@ -116,7 +116,7 @@ pub fn runMainLoop(state: *State) !void {
         var pane_it = state.currentLayout().splitIterator();
         while (pane_it.next()) |pane| {
             if (fd_count < poll_fds.len) {
-                poll_fds[fd_count] = .{ .fd = pane.*.getFd(), .events = posix.POLL.IN, .revents = 0 };
+                poll_fds[fd_count] = .{ .fd = pane.*.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
                 fd_count += 1;
             }
         }
@@ -124,7 +124,7 @@ pub fn runMainLoop(state: *State) !void {
         // Add floats.
         for (state.floats.items) |pane| {
             if (fd_count < poll_fds.len) {
-                poll_fds[fd_count] = .{ .fd = pane.getFd(), .events = posix.POLL.IN, .revents = 0 };
+                poll_fds[fd_count] = .{ .fd = pane.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
                 fd_count += 1;
             }
         }
@@ -171,28 +171,9 @@ pub fn runMainLoop(state: *State) !void {
             state.syncFocusedPaneInfo();
         }
 
-        // Handle stdin.
-        if (poll_fds[0].revents & posix.POLL.IN != 0) {
-            const n = posix.read(posix.STDIN_FILENO, &buffer) catch break;
-            if (n == 0) break;
-            loop_input.handleInput(state, buffer[0..n]);
-        }
-
-        // Handle ses messages.
-        if (ses_fd_idx) |sidx| {
-            if (poll_fds[sidx].revents & posix.POLL.IN != 0) {
-                loop_ipc.handleSesMessage(state, &buffer);
-            }
-        }
-
-        // Handle IPC connections (for --notify).
-        if (ipc_fd_idx) |iidx| {
-            if (poll_fds[iidx].revents & posix.POLL.IN != 0) {
-                loop_ipc.handleIpcConnection(state, &buffer);
-            }
-        }
-
         // Handle PTY output.
+        // NOTE: we do this before handling stdin/actions that can mutate the
+        // layout, so pollfd indices remain consistent with the pane iteration.
         var idx: usize = 1;
         var dead_splits: std.ArrayList(u16) = .empty;
         defer dead_splits.deinit(allocator);
@@ -244,6 +225,27 @@ pub fn runMainLoop(state: *State) !void {
             }
         }
 
+        // Handle ses messages.
+        if (ses_fd_idx) |sidx| {
+            if (poll_fds[sidx].revents & posix.POLL.IN != 0) {
+                loop_ipc.handleSesMessage(state, &buffer);
+            }
+        }
+
+        // Handle IPC connections (for --notify / ad-hoc floats).
+        if (ipc_fd_idx) |iidx| {
+            if (poll_fds[iidx].revents & posix.POLL.IN != 0) {
+                loop_ipc.handleIpcConnection(state, &buffer);
+            }
+        }
+
+        // Handle stdin.
+        if (poll_fds[0].revents & posix.POLL.IN != 0) {
+            const n = posix.read(posix.STDIN_FILENO, &buffer) catch break;
+            if (n == 0) break;
+            loop_input.handleInput(state, buffer[0..n]);
+        }
+
         // Remove dead floats (in reverse order to preserve indices).
         var df_idx: usize = dead_floating.items.len;
         while (df_idx > 0) {
@@ -272,22 +274,19 @@ pub fn runMainLoop(state: *State) !void {
 
         // Remove dead splits (skip if just respawned a shell).
         if (!state.skip_dead_check) {
-            for (dead_splits.items) |_| {
+            for (dead_splits.items) |dead_id| {
                 if (state.currentLayout().splitCount() > 1) {
-                    // Multiple splits in tab - just close this one.
-                    _ = state.currentLayout().closeFocused();
-                    // Sync focus to new pane and update ses state.
+                    // Multiple splits in tab - close the specific dead pane.
+                    _ = state.currentLayout().closePane(dead_id);
                     if (state.currentLayout().getFocusedPane()) |new_pane| {
                         state.syncPaneFocus(new_pane, null);
                     }
                     state.syncStateToSes();
                     state.needs_render = true;
                 } else if (state.tabs.items.len > 1) {
-                    // Only 1 pane but multiple tabs - close this tab.
                     _ = state.closeCurrentTab();
                     state.needs_render = true;
                 } else {
-                    // Last pane in last tab - confirm before exit if enabled.
                     if (state.config.confirm_on_exit and state.pending_action == null) {
                         state.pending_action = .exit;
                         state.exit_from_shell_death = true;

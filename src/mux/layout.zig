@@ -448,6 +448,33 @@ pub const Layout = struct {
         return true;
     }
 
+    /// Close a specific pane by ID.
+    ///
+    /// This is used when the event loop detects a specific pane has died.
+    pub fn closePane(self: *Layout, id_to_close: u16) bool {
+        if (self.splits.count() <= 1) return false;
+        if (!self.splits.contains(id_to_close)) return false;
+
+        // If we're closing the focused pane, move focus first.
+        if (id_to_close == self.focused_split_id) {
+            self.focusNext();
+        }
+
+        if (self.splits.fetchRemove(id_to_close)) |kv| {
+            if (self.ses_client) |ses| {
+                ses.killPane(kv.value.uuid) catch {};
+            }
+            kv.value.deinit();
+            self.allocator.destroy(kv.value);
+        }
+
+        if (self.root) |root| {
+            self.removeFromTree(root, null, id_to_close);
+        }
+        self.recalculateLayout();
+        return true;
+    }
+
     fn removeFromTree(self: *Layout, node: *LayoutNode, parent: ?*LayoutNode, pane_id: u16) void {
         switch (node.*) {
             .pane => |id| {
