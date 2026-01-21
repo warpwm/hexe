@@ -445,9 +445,11 @@ pub const SesClient = struct {
         created_from: ?[32]u8,
         focused_from: ?[32]u8,
         cursor_pos: ?struct { x: u16, y: u16 },
+        size: ?struct { cols: u16, rows: u16 },
         cwd: ?[]const u8,
         fg_process: ?[]const u8,
         fg_pid: ?posix.pid_t,
+        layout_path: ?[]const u8,
     ) !void {
         const conn = &(self.conn orelse return error.NotConnected);
 
@@ -483,6 +485,10 @@ pub const SesClient = struct {
             try writer.print(",\"cursor_x\":{d},\"cursor_y\":{d}", .{ pos.x, pos.y });
         }
 
+        if (size) |s| {
+            try writer.print(",\"cols\":{d},\"rows\":{d}", .{ s.cols, s.rows });
+        }
+
         if (cwd) |c| {
             try writer.print(",\"cwd\":\"{s}\"", .{c});
         }
@@ -493,6 +499,10 @@ pub const SesClient = struct {
 
         if (fg_pid) |pid| {
             try writer.print(",\"fg_pid\":{d}", .{pid});
+        }
+
+        if (layout_path) |path| {
+            try writer.print(",\"layout_path\":\"{s}\"", .{path});
         }
 
         try writer.writeAll("}");

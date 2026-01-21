@@ -49,11 +49,16 @@ pub const Pane = struct {
     // Cursor position (synced from mux, screen coordinates)
     cursor_x: u16 = 0,
     cursor_y: u16 = 0,
+    // Pane window size (synced from mux)
+    cols: u16 = 0,
+    rows: u16 = 0,
     // Current working directory (synced from mux, owned)
     cwd: ?[]const u8 = null,
     // Foreground process info (synced from mux)
     fg_process: ?[]const u8 = null,
     fg_pid: ?i32 = null,
+    // Layout path (synced from mux, owned)
+    layout_path: ?[]const u8 = null,
 
     allocator: std.mem.Allocator,
 
@@ -68,12 +73,16 @@ pub const Pane = struct {
         if (self.fg_process) |p| {
             self.allocator.free(p);
         }
+        if (self.layout_path) |path| {
+            self.allocator.free(path);
+        }
     }
 
     // Static buffer for getProcCwd to avoid returning dangling pointer
     var proc_cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     var proc_comm_buf: [128]u8 = undefined;
     var proc_stat_buf: [512]u8 = undefined;
+    var proc_tty_buf: [std.fs.max_path_bytes]u8 = undefined;
 
     /// Get current working directory from /proc/<child_pid>/cwd
     /// This is the authoritative CWD from OS, not dependent on shell OSC 7
@@ -142,6 +151,16 @@ pub const Pane = struct {
         const fg_pid = self.getProcForegroundPid() orelse return null;
         const name = self.readProcComm(fg_pid) orelse return null;
         return .{ .name = name, .pid = fg_pid };
+    }
+
+    /// Get controlling TTY path from /proc/<child_pid>/fd/0.
+    pub fn getProcTty(self: *const Pane) ?[]const u8 {
+        if (self.child_pid == 0) return null;
+
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/fd/0", .{self.child_pid}) catch return null;
+        const link = posix.readlink(path, &proc_tty_buf) catch return null;
+        return link;
     }
 };
 

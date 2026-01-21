@@ -388,6 +388,8 @@ pub fn handlePaneInfo(
         try writer.print(",\"detached_session_id\":\"{s}\"", .{&hex_id});
     }
 
+    try writer.print(",\"socket_path\":\"{s}\"", .{pane.pod_socket_path});
+
     // Timestamps
     try writer.print(",\"created_at\":{d}", .{pane.created_at});
     if (pane.orphaned_at) |orphaned| {
@@ -402,11 +404,13 @@ pub fn handlePaneInfo(
         .float => "float",
     };
     try writer.print(",\"pane_type\":\"{s}\"", .{pane_type_str});
-    if (pane.created_from) |created_uuid| {
-        try writer.print(",\"created_from\":\"{s}\"", .{created_uuid});
-    }
+    const creator_uuid = pane.created_from orelse uuid;
+    try writer.print(",\"created_from\":\"{s}\"", .{creator_uuid});
     if (pane.focused_from) |focused_uuid| {
         try writer.print(",\"focused_from\":\"{s}\"", .{focused_uuid});
+    }
+    if (pane.layout_path) |path| {
+        try writer.print(",\"layout_path\":\"{s}\"", .{path});
     }
     // Get CWD: prefer /proc/<pid>/cwd (authoritative), fall back to synced cwd
     const cwd = pane.getProcCwd() orelse pane.cwd;
@@ -428,6 +432,12 @@ pub fn handlePaneInfo(
     }
     if (pane.fg_pid) |pid| {
         try writer.print(",\"fg_pid\":{d}", .{pid});
+    }
+    if (pane.cols > 0 and pane.rows > 0) {
+        try writer.print(",\"cols\":{d},\"rows\":{d}", .{ pane.cols, pane.rows });
+    }
+    if (pane.getProcTty()) |tty| {
+        try writer.print(",\"tty\":\"{s}\"", .{tty});
     }
     if (pane.getProcProcessName()) |proc| {
         try writer.print(",\"base_process\":\"{s}\"", .{proc});
@@ -536,6 +546,19 @@ pub fn handleUpdatePaneAux(
         }
     }
 
+    if (root.get("cols")) |v| {
+        switch (v) {
+            .integer => |i| pane.cols = @intCast(@max(0, i)),
+            else => {},
+        }
+    }
+    if (root.get("rows")) |v| {
+        switch (v) {
+            .integer => |i| pane.rows = @intCast(@max(0, i)),
+            else => {},
+        }
+    }
+
     // Update CWD (owned string)
     if (root.get("cwd")) |v| {
         switch (v) {
@@ -566,6 +589,18 @@ pub fn handleUpdatePaneAux(
     if (root.get("fg_pid")) |v| {
         switch (v) {
             .integer => |i| pane.fg_pid = @intCast(i),
+            else => {},
+        }
+    }
+
+    if (root.get("layout_path")) |v| {
+        switch (v) {
+            .string => |s| {
+                if (pane.layout_path) |old| {
+                    ses_state.allocator.free(old);
+                }
+                pane.layout_path = ses_state.allocator.dupe(u8, s) catch null;
+            },
             else => {},
         }
     }

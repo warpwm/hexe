@@ -934,6 +934,8 @@ const State = struct {
 
         const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
         const cursor = pane.getCursorPos();
+        const layout_path = getLayoutPath(self, pane) catch null;
+        defer if (layout_path) |path| self.allocator.free(path);
         // For new panes, focused_from = created_from (focus moved from parent to new pane)
         const focused_from = if (pane.focused) created_from else null;
         self.ses_client.updatePaneAux(
@@ -944,9 +946,11 @@ const State = struct {
             created_from,
             focused_from,
             .{ .x = cursor.x, .y = cursor.y },
+            .{ .cols = pane.width, .rows = pane.height },
             pane.getRealCwd(),
             pane.getFgProcess(),
             pane.getFgPid(),
+            layout_path,
         ) catch {
             // Silently ignore errors - pane might not exist in ses yet or anymore
         };
@@ -964,7 +968,22 @@ const State = struct {
                     p.*.focused = false;
                     const pane_type: SesClient.PaneType = if (p.*.floating) .float else .split;
                     const cursor = p.*.getCursorPos();
-                    self.ses_client.updatePaneAux(p.*.uuid, p.*.floating, false, pane_type, null, null, .{ .x = cursor.x, .y = cursor.y }, null, null, null) catch {};
+                    const layout_path = getLayoutPath(self, p.*) catch null;
+                    defer if (layout_path) |path| self.allocator.free(path);
+                    self.ses_client.updatePaneAux(
+                        p.*.uuid,
+                        p.*.floating,
+                        false,
+                        pane_type,
+                        null,
+                        null,
+                        .{ .x = cursor.x, .y = cursor.y },
+                        .{ .cols = p.*.width, .rows = p.*.height },
+                        null,
+                        null,
+                        null,
+                        layout_path,
+                    ) catch {};
                 }
             }
         }
@@ -974,7 +993,22 @@ const State = struct {
             if (fp.uuid[0] != 0) {
                 fp.focused = false;
                 const cursor = fp.getCursorPos();
-                self.ses_client.updatePaneAux(fp.uuid, fp.floating, false, .float, null, null, .{ .x = cursor.x, .y = cursor.y }, null, null, null) catch {};
+                const layout_path = getLayoutPath(self, fp) catch null;
+                defer if (layout_path) |path| self.allocator.free(path);
+                self.ses_client.updatePaneAux(
+                    fp.uuid,
+                    fp.floating,
+                    false,
+                    .float,
+                    null,
+                    null,
+                    .{ .x = cursor.x, .y = cursor.y },
+                    .{ .cols = fp.width, .rows = fp.height },
+                    null,
+                    null,
+                    null,
+                    layout_path,
+                ) catch {};
             }
         }
     }
@@ -992,6 +1026,8 @@ const State = struct {
         pane.focused = true;
         const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
         const cursor = pane.getCursorPos();
+        const layout_path = getLayoutPath(self, pane) catch null;
+        defer if (layout_path) |path| self.allocator.free(path);
         self.ses_client.updatePaneAux(
             pane.uuid,
             pane.floating,
@@ -1000,9 +1036,11 @@ const State = struct {
             null, // don't update created_from on focus change
             focused_from,
             .{ .x = cursor.x, .y = cursor.y },
+            .{ .cols = pane.width, .rows = pane.height },
             pane.getRealCwd(),
             pane.getFgProcess(),
             pane.getFgPid(),
+            layout_path,
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
@@ -1019,6 +1057,8 @@ const State = struct {
 
         const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
         const cursor = pane.getCursorPos();
+        const layout_path = getLayoutPath(self, pane) catch null;
+        defer if (layout_path) |path| self.allocator.free(path);
         self.ses_client.updatePaneAux(
             pane.uuid,
             pane.floating,
@@ -1027,9 +1067,11 @@ const State = struct {
             null,
             null,
             .{ .x = cursor.x, .y = cursor.y },
+            .{ .cols = pane.width, .rows = pane.height },
             pane.getRealCwd(),
             pane.getFgProcess(),
             pane.getFgPid(),
+            layout_path,
         ) catch {
             // Silently ignore errors - pane might not exist in ses
         };
@@ -1084,6 +1126,8 @@ const State = struct {
 
         const pane_type: SesClient.PaneType = if (p.floating) .float else .split;
         const cursor = p.getCursorPos();
+        const layout_path = getLayoutPath(self, p) catch null;
+        defer if (layout_path) |path| self.allocator.free(path);
         self.ses_client.updatePaneAux(
             p.uuid,
             p.floating,
@@ -1092,12 +1136,34 @@ const State = struct {
             null, // don't update created_from
             null, // don't update focused_from
             .{ .x = cursor.x, .y = cursor.y },
+            .{ .cols = p.width, .rows = p.height },
             p.getRealCwd(), // Use cached CWD after refresh
             null,
             null,
+            layout_path,
         ) catch {};
     }
 };
+
+fn getLayoutPath(state: *State, pane: *Pane) !?[]const u8 {
+    if (pane.floating) {
+        if (pane.parent_tab) |tab_idx| {
+            return try std.fmt.allocPrint(state.allocator, "tab:{d}/float:{d}", .{ tab_idx, pane.id });
+        }
+        return try std.fmt.allocPrint(state.allocator, "float:{d}", .{pane.id});
+    }
+
+    for (state.tabs.items, 0..) |*tab, ti| {
+        var pane_it = tab.layout.splitIterator();
+        while (pane_it.next()) |p| {
+            if (p.* == pane) {
+                return try std.fmt.allocPrint(state.allocator, "tab:{d}/split:{d}", .{ ti, pane.id });
+            }
+        }
+    }
+
+    return null;
+}
 
 /// Arguments for mux commands
 pub const MuxArgs = struct {
@@ -1749,6 +1815,8 @@ fn handleInput(state: *State, input_bytes: []const u8) void {
                                                         if (replaced) {
                                                             const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
                                                             const cursor = pane.getCursorPos();
+                                                            const layout_path = getLayoutPath(state, pane) catch null;
+                                                            defer if (layout_path) |path| state.allocator.free(path);
                                                             state.ses_client.updatePaneAux(
                                                                 pane.uuid,
                                                                 pane.floating,
@@ -1757,9 +1825,11 @@ fn handleInput(state: *State, input_bytes: []const u8) void {
                                                                 old_aux.created_from,
                                                                 old_aux.focused_from,
                                                                 .{ .x = cursor.x, .y = cursor.y },
+                                                                .{ .cols = pane.width, .rows = pane.height },
                                                                 pane.getPwd(),
                                                                 null,
                                                                 null,
+                                                                layout_path,
                                                             ) catch {};
                                                             state.skip_dead_check = true;
                                                         } else {
@@ -2725,6 +2795,8 @@ fn performDisown(state: *State) void {
                     // Sync inherited auxiliary info to the new pane
                     const pane_type: SesClient.PaneType = if (p.floating) .float else .split;
                     const cursor = p.getCursorPos();
+                    const layout_path = getLayoutPath(state, p) catch null;
+                    defer if (layout_path) |path| state.allocator.free(path);
                     state.ses_client.updatePaneAux(
                         p.uuid,
                         p.floating,
@@ -2733,9 +2805,11 @@ fn performDisown(state: *State) void {
                         old_aux.created_from, // Inherit creator
                         old_aux.focused_from, // Inherit last focus
                         .{ .x = cursor.x, .y = cursor.y },
+                        .{ .cols = p.width, .rows = p.height },
                         cwd,
                         null,
                         null,
+                        layout_path,
                     ) catch {};
 
                     state.notifications.show("Pane disowned (adopt with Alt+a)");

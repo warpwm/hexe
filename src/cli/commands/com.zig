@@ -264,6 +264,14 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
     if (root.get("cwd")) |cwd| {
         print("  CWD: {s}\n", .{cwd.string});
     }
+    if (root.get("tty")) |tty| {
+        print("  TTY: {s}\n", .{tty.string});
+    }
+    if (root.get("cols")) |cols| {
+        if (root.get("rows")) |rows| {
+            print("  Window: {d}x{d}\n", .{ cols.integer, rows.integer });
+        }
+    }
     if (root.get("session_name")) |sn| {
         print("  Session: {s}\n", .{sn.string});
     }
@@ -273,11 +281,22 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
     if (root.get("focused_from")) |ff| {
         print("  Last: {s}\n", .{ff.string[0..8]});
     }
+    if (root.get("layout_path")) |path| {
+        print("  Layout: {s}\n", .{path.string});
+    }
+    if (root.get("socket_path")) |path| {
+        print("  Socket: {s}\n", .{path.string});
+    }
     if (root.get("is_focused")) |f| {
         print("  Focused: {}\n", .{f.bool});
     }
     if (root.get("pane_type")) |pt| {
         print("  Type: {s}\n", .{pt.string});
+    }
+    if (root.get("cursor_x")) |cx| {
+        if (root.get("cursor_y")) |cy| {
+            print("  Cursor: {d},{d}\n", .{ cx.integer, cy.integer });
+        }
     }
 }
 
