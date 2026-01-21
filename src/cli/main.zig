@@ -88,7 +88,6 @@ pub fn main() !void {
     const mux_float_command = try mux_float.string("c", "command", null);
     const mux_float_pass_env = try mux_float.flag("", "pass-env", null);
     const mux_float_extra_env = try mux_float.string("", "extra-env", null);
-    const mux_float_report = try mux_float.string("", "report-back-to", null);
 
     // POP subcommands
     const shp_prompt = try shp_cmd.newCommand("prompt", "Render shell prompt");
@@ -183,7 +182,7 @@ pub fn main() !void {
         } else if (found_mux and found_attach) {
             print("Usage: hexe mux attach [OPTIONS] <name>\n\nAttach to existing session by name or UUID prefix\n\nOptions:\n  -d, --debug           Enable debug output\n  -L, --logfile <PATH>  Log debug output to PATH\n", .{});
         } else if (found_mux and found_float) {
-            print("Usage: hexe mux float [OPTIONS]\n\nSpawn a transient float pane\n\nOptions:\n  -u, --uuid <UUID>            Target mux UUID (optional if inside mux)\n  -c, --command <COMMAND>      Command to run in the float\n      --pass-env               Send current environment to the pod\n      --extra-env <KEY=VAL,..>  Extra environment variables (comma-separated)\n      --report-back-to <UUID>  Pane UUID to notify with created float UUID\n", .{});
+            print("Usage: hexe mux float [OPTIONS]\n\nSpawn a transient float pane (blocking)\n\nOptions:\n  -u, --uuid <UUID>            Target mux UUID (optional if inside mux)\n  -c, --command <COMMAND>      Command to run in the float\n      --pass-env               Send current environment to the pod\n      --extra-env <KEY=VAL,..>  Extra environment variables (comma-separated)\n", .{});
         } else if (found_shp and found_prompt) {
             print("Usage: hexe shp prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
         } else if (found_shp and found_init) {
@@ -289,7 +288,6 @@ pub fn main() !void {
                 mux_float_command.*,
                 mux_float_pass_env.*,
                 mux_float_extra_env.*,
-                mux_float_report.*,
             );
         }
     } else if (shp_cmd.happened) {
@@ -388,7 +386,6 @@ fn runMuxFloat(
     command: []const u8,
     pass_env: bool,
     extra_env: []const u8,
-    report_back_to: []const u8,
 ) !void {
     if (command.len == 0) {
         print("Error: --command is required\n", .{});
@@ -455,12 +452,10 @@ fn runMuxFloat(
         try extra_env_json.appendSlice(allocator, "]");
     }
 
-    const report_uuid = if (report_back_to.len > 0) report_back_to else (std.posix.getenv("HEXE_PANE_UUID") orelse "");
-
     var msg_buf: std.ArrayList(u8) = .empty;
     defer msg_buf.deinit(allocator);
     var writer = msg_buf.writer(allocator);
-    try writer.writeAll("{\"type\":\"float\"");
+    try writer.writeAll("{\"type\":\"float\",\"wait\":true");
     try writer.print(",\"command\":\"{s}\"", .{command});
     if (env_json.items.len > 0) {
         try writer.print(",\"env\":{s}", .{env_json.items});
@@ -468,15 +463,12 @@ fn runMuxFloat(
     if (extra_env_json.items.len > 0) {
         try writer.print(",\"extra_env\":{s}", .{extra_env_json.items});
     }
-    if (report_uuid.len == 32) {
-        try writer.print(",\"report_back_to\":\"{s}\"", .{report_uuid});
-    }
     try writer.writeAll("}");
 
     var conn = client.toConnection();
     try conn.sendLine(msg_buf.items);
 
-    var resp_buf: [4096]u8 = undefined;
+    var resp_buf: [65536]u8 = undefined;
     const response = conn.recvLine(&resp_buf) catch null;
     if (response == null) {
         print("No response from mux\n", .{});
@@ -491,11 +483,13 @@ fn runMuxFloat(
 
     const root = parsed.value.object;
     if (root.get("type")) |t| {
-        if (std.mem.eql(u8, t.string, "float_created")) {
-            if (root.get("uuid")) |u| {
-                print("{s}\n", .{u.string});
+        if (std.mem.eql(u8, t.string, "float_result")) {
+            const stdout = if (root.get("stdout")) |v| v.string else "";
+            if (stdout.len > 0) {
+                print("{s}", .{stdout});
             }
-            return;
+            const exit_code: u8 = if (root.get("exit_code")) |v| @intCast(@max(@as(i64, 0), v.integer)) else 0;
+            std.process.exit(exit_code);
         }
         if (std.mem.eql(u8, t.string, "error")) {
             if (root.get("message")) |m| {

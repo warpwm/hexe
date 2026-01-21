@@ -114,6 +114,8 @@ const State = struct {
     osc_reply_in_progress: bool,
     osc_reply_prev_esc: bool,
 
+    pending_float_requests: std.AutoHashMap([32]u8, posix.fd_t),
+
     fn init(allocator: std.mem.Allocator, width: u16, height: u16, debug: bool, log_file: ?[]const u8) !State {
         const cfg = core.Config.load(allocator);
         const pop_cfg = pop.PopConfig.load(allocator);
@@ -169,6 +171,8 @@ const State = struct {
             .osc_reply_buf = .empty,
             .osc_reply_in_progress = false,
             .osc_reply_prev_esc = false,
+
+            .pending_float_requests = std.AutoHashMap([32]u8, posix.fd_t).init(allocator),
         };
     }
 
@@ -227,6 +231,11 @@ const State = struct {
         self.ses_client.deinit();
         self.notifications.deinit();
         self.popups.deinit();
+        var req_it = self.pending_float_requests.iterator();
+        while (req_it.next()) |entry| {
+            _ = posix.close(entry.value_ptr.*);
+        }
+        self.pending_float_requests.deinit();
         if (self.ipc_server) |*srv| {
             srv.deinit();
         }
@@ -1165,6 +1174,47 @@ fn getLayoutPath(state: *State, pane: *Pane) !?[]const u8 {
     return null;
 }
 
+fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
+    for (value) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.writeByte(' ');
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
+}
+
+fn handleBlockingFloatCompletion(state: *State, pane: *Pane) void {
+    const entry = state.pending_float_requests.fetchRemove(pane.uuid) orelse return;
+    var conn = core.ipc.Connection{ .fd = entry.value };
+    defer conn.close();
+
+    const exit_code = pane.getExitCode();
+    const stdout = pane.captureOutput(state.allocator) catch null;
+    defer if (stdout) |out| state.allocator.free(out);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(state.allocator);
+    var writer = buf.writer(state.allocator);
+
+    writer.print("{{\"type\":\"float_result\",\"uuid\":\"{s}\",\"exit_code\":{d},\"stdout\":\"", .{ pane.uuid, exit_code }) catch return;
+    if (stdout) |out| {
+        writeJsonEscaped(writer, out) catch return;
+    }
+    writer.writeAll("\"}\n") catch return;
+
+    conn.send(buf.items) catch {};
+}
+
 /// Arguments for mux commands
 pub const MuxArgs = struct {
     name: ?[]const u8 = null,
@@ -1427,6 +1477,8 @@ fn runMainLoop(state: *State) !void {
                     const was_active = if (state.active_floating) |af| af == fi else false;
 
                     const pane = state.floats.orderedRemove(fi);
+
+                    handleBlockingFloatCompletion(state, pane);
 
                     // Kill in ses (dead panes don't need to be orphaned)
                     if (state.ses_client.isConnected()) {
@@ -2339,7 +2391,8 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
     if (conn_opt == null) return;
 
     var conn = conn_opt.?;
-    defer conn.close();
+    var keep_open = false;
+    defer if (!keep_open) conn.close();
 
     // Read message
     const line = conn.recvLine(buffer) catch return;
@@ -2403,14 +2456,7 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
         const env_items: ?[]const []const u8 = if (env_list.items.len > 0) env_list.items else null;
         const extra_env_items: ?[]const []const u8 = if (extra_env_list.items.len > 0) extra_env_list.items else null;
 
-        var report_uuid: ?[32]u8 = null;
-        if (root.get("report_back_to")) |rv| {
-            if (rv == .string and rv.string.len == 32) {
-                var uuid: [32]u8 = undefined;
-                @memcpy(&uuid, rv.string[0..32]);
-                report_uuid = uuid;
-            }
-        }
+        const wait_for_exit = if (root.get("wait")) |v| v.bool else false;
 
         const old_uuid = state.getCurrentFocusedUuid();
         const focused_pane = if (state.active_floating) |idx| blk: {
@@ -2427,7 +2473,7 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
             state.syncPaneUnfocus(tiled);
         }
 
-        const new_uuid = createAdhocFloat(state, command, spawn_cwd, env_items, extra_env_items) catch |err| {
+        const new_uuid = createAdhocFloat(state, command, spawn_cwd, env_items, extra_env_items, !wait_for_exit) catch |err| {
             const msg = std.fmt.allocPrint(state.allocator, "{{\"type\":\"error\",\"message\":\"{s}\"}}", .{@errorName(err)}) catch return;
             defer state.allocator.free(msg);
             conn.sendLine(msg) catch {};
@@ -2439,66 +2485,18 @@ fn handleIpcConnection(state: *State, buffer: []u8) void {
         }
         state.needs_render = true;
 
-        var resp_buf: [96]u8 = undefined;
-        const response = std.fmt.bufPrint(&resp_buf, "{{\"type\":\"float_created\",\"uuid\":\"{s}\"}}", .{new_uuid}) catch return;
-        conn.sendLine(response) catch {};
-
-        const target_uuid = report_uuid orelse old_uuid orelse state.getCurrentFocusedUuid();
-        if (target_uuid) |uuid| {
-            const msg = std.fmt.allocPrint(state.allocator, "Float spawned: {s}", .{new_uuid[0..8]}) catch return;
-            defer state.allocator.free(msg);
-            notifyPaneByUuid(state, uuid, msg);
+        if (wait_for_exit) {
+            state.pending_float_requests.put(new_uuid, conn.fd) catch {
+                conn.sendLine("{\"type\":\"error\",\"message\":\"float_wait_failed\"}") catch {};
+                return;
+            };
+            keep_open = true;
+        } else {
+            var resp_buf: [96]u8 = undefined;
+            const response = std.fmt.bufPrint(&resp_buf, "{{\"type\":\"float_created\",\"uuid\":\"{s}\"}}", .{new_uuid}) catch return;
+            conn.sendLine(response) catch {};
         }
     }
-}
-
-fn notifyPaneByUuid(state: *State, uuid: [32]u8, message: []const u8) void {
-    var found = false;
-
-    for (state.tabs.items) |*tab| {
-        var pane_it = tab.layout.splitIterator();
-        while (pane_it.next()) |pane| {
-            if (std.mem.eql(u8, &pane.*.uuid, &uuid)) {
-                const msg_copy = state.allocator.dupe(u8, message) catch return;
-                pane.*.notifications.showWithOptions(
-                    msg_copy,
-                    pane.*.notifications.default_duration_ms,
-                    pane.*.notifications.default_style,
-                    true,
-                );
-                found = true;
-                break;
-            }
-        }
-        if (found) break;
-    }
-
-    if (!found) {
-        for (state.floats.items) |pane| {
-            if (std.mem.eql(u8, &pane.uuid, &uuid)) {
-                const msg_copy = state.allocator.dupe(u8, message) catch return;
-                pane.notifications.showWithOptions(
-                    msg_copy,
-                    pane.notifications.default_duration_ms,
-                    pane.notifications.default_style,
-                    true,
-                );
-                found = true;
-                break;
-            }
-        }
-    }
-
-    if (!found) {
-        const msg_copy = state.allocator.dupe(u8, message) catch return;
-        state.notifications.showWithOptions(
-            msg_copy,
-            state.notifications.default_duration_ms,
-            state.notifications.default_style,
-            true,
-        );
-    }
-    state.needs_render = true;
 }
 
 /// Handle Alt+Arrow for directional pane navigation
@@ -2837,6 +2835,7 @@ fn performClose(state: *State) void {
         const old_uuid = state.getCurrentFocusedUuid();
         const pane = state.floats.orderedRemove(idx);
         state.syncPaneUnfocus(pane);
+        handleBlockingFloatCompletion(state, pane);
         // Kill in ses
         if (state.ses_client.isConnected()) {
             state.ses_client.killPane(pane.uuid) catch {};
@@ -3315,6 +3314,7 @@ fn createAdhocFloat(
     cwd: ?[]const u8,
     env: ?[]const []const u8,
     extra_env: ?[]const []const u8,
+    use_pod: bool,
 ) ![32]u8 {
     const pane = try state.allocator.create(Pane);
     errdefer state.allocator.destroy(pane);
@@ -3345,7 +3345,7 @@ fn createAdhocFloat(
 
     const id: u16 = @intCast(100 + state.floats.items.len);
 
-    if (state.ses_client.isConnected()) {
+    if (use_pod and state.ses_client.isConnected()) {
         if (state.ses_client.createPane(command, cwd, null, null, env, extra_env)) |result| {
             defer state.allocator.free(result.socket_path);
             try pane.initWithPod(state.allocator, id, content_x, content_y, content_w, content_h, result.socket_path, result.uuid);

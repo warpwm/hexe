@@ -76,6 +76,8 @@ pub const Pane = struct {
     sticky: bool = false,
     // Cached CWD from ses daemon (for pod panes where /proc access is in ses)
     ses_cwd: ?[]const u8 = null,
+    // Exit status for local panes (set when process exits)
+    exit_status: ?u32 = null,
     // For tab-bound floats: which tab owns this float
     // null = global float (special=true or pwd=true)
     parent_tab: ?usize = null,
@@ -604,9 +606,70 @@ pub const Pane = struct {
     /// Check if pane is alive.
     pub fn isAlive(self: *Pane) bool {
         return switch (self.backend) {
-            .local => |*pty| pty.pollStatus() == null,
+            .local => |*pty| blk: {
+                if (pty.pollStatus()) |status| {
+                    self.exit_status = status;
+                    break :blk false;
+                }
+                break :blk true;
+            },
             .pod => true,
         };
+    }
+
+    pub fn getExitCode(self: *Pane) u8 {
+        const status = self.exit_status orelse return 0;
+        if (posix.W.IFEXITED(status)) return posix.W.EXITSTATUS(status);
+        if (posix.W.IFSIGNALED(status)) return @intCast(128 + posix.W.TERMSIG(status));
+        return 0;
+    }
+
+    pub fn captureOutput(self: *Pane, allocator: std.mem.Allocator) ![]u8 {
+        const state = try self.getRenderState();
+        const row_slice = state.row_data.slice();
+        if (row_slice.len == 0 or state.cols == 0) {
+            return allocator.dupe(u8, "");
+        }
+
+        const row_cells = row_slice.items(.cells);
+        const rows = @min(@as(usize, state.rows), row_slice.len);
+
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(allocator);
+
+        var ri: usize = rows;
+        while (ri > 0) {
+            ri -= 1;
+            line_buf.clearRetainingCapacity();
+
+            const cells_slice = row_cells[ri].slice();
+            const raw_cells = cells_slice.items(.raw);
+            const cols = @min(@as(usize, state.cols), raw_cells.len);
+
+            for (0..cols) |ci| {
+                const raw = raw_cells[ci];
+                if (raw.wide == .spacer_tail) continue;
+
+                var codepoint = raw.codepoint();
+                if (codepoint == 0 or codepoint < 32 or codepoint == 127) {
+                    codepoint = ' ';
+                }
+
+                var utf8_buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch {
+                    line_buf.append(allocator, ' ') catch {};
+                    continue;
+                };
+                line_buf.appendSlice(allocator, utf8_buf[0..len]) catch {};
+            }
+
+            const trimmed = std.mem.trimRight(u8, line_buf.items, " ");
+            if (trimmed.len > 0) {
+                return allocator.dupe(u8, trimmed);
+            }
+        }
+
+        return allocator.dupe(u8, "");
     }
 
     /// Get the underlying ghostty terminal.
