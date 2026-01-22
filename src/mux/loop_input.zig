@@ -16,14 +16,100 @@ const TabFocusKind = @import("state.zig").TabFocusKind;
 const statusbar = @import("statusbar.zig");
 const keybinds = @import("keybinds.zig");
 
+fn mergeStdinTail(state: *State, input_bytes: []const u8, buf: *[4096 + 64]u8) []const u8 {
+    if (state.stdin_tail_len == 0) return input_bytes;
+
+    const tl: usize = @intCast(state.stdin_tail_len);
+    @memcpy(buf[0..tl], state.stdin_tail[0..tl]);
+    @memcpy(buf[tl .. tl + input_bytes.len], input_bytes);
+    state.stdin_tail_len = 0;
+    return buf[0 .. tl + input_bytes.len];
+}
+
+fn stashIncompleteEscapeTail(state: *State, inp: []const u8) []const u8 {
+    const ESC: u8 = 0x1b;
+    const BEL: u8 = 0x07;
+
+    // Find the last ESC in the buffer.
+    var last_esc: ?usize = null;
+    var i: usize = inp.len;
+    while (i > 0) {
+        i -= 1;
+        if (inp[i] == ESC) {
+            last_esc = i;
+            break;
+        }
+    }
+    if (last_esc == null) return inp;
+    const esc_i = last_esc.?;
+
+    // If ESC is the last byte, it's definitely incomplete.
+    if (esc_i + 1 >= inp.len) {
+        return stashFromIndex(state, inp, esc_i);
+    }
+
+    const next = inp[esc_i + 1];
+    // CSI: ESC [ ... <final>
+    if (next == '[') {
+        var j: usize = esc_i + 2;
+        while (j < inp.len) : (j += 1) {
+            const b = inp[j];
+            // CSI final byte is 0x40..0x7E
+            if (b >= 0x40 and b <= 0x7e) return inp;
+        }
+        return stashFromIndex(state, inp, esc_i);
+    }
+
+    // SS3: ESC O <final>
+    if (next == 'O') {
+        if (esc_i + 2 >= inp.len) return stashFromIndex(state, inp, esc_i);
+        return inp;
+    }
+
+    // OSC: ESC ] ... (BEL or ESC \\)
+    if (next == ']') {
+        var j: usize = esc_i + 2;
+        while (j < inp.len) : (j += 1) {
+            const b = inp[j];
+            if (b == BEL) return inp;
+            if (b == ESC and j + 1 < inp.len and inp[j + 1] == '\\') return inp;
+        }
+        return stashFromIndex(state, inp, esc_i);
+    }
+
+    // Alt/meta: ESC <byte>
+    // If we have the byte, it's complete.
+    return inp;
+}
+
+fn stashFromIndex(state: *State, inp: []const u8, start: usize) []const u8 {
+    const tail = inp[start..];
+    if (tail.len == 0) return inp;
+    if (tail.len > state.stdin_tail.len) {
+        // Too large to stash; don't block input.
+        return inp;
+    }
+    @memcpy(state.stdin_tail[0..tail.len], tail);
+    state.stdin_tail_len = @intCast(tail.len);
+    return inp[0..start];
+}
+
 pub fn handleInput(state: *State, input_bytes: []const u8) void {
     if (input_bytes.len == 0) return;
 
-    const slice = consumeOscReplyFromTerminal(state, input_bytes);
+    // Stdin reads can split escape sequences. Merge with any pending tail first.
+    var merged_buf: [4096 + 64]u8 = undefined;
+    const merged = mergeStdinTail(state, input_bytes, &merged_buf);
+
+    const slice = consumeOscReplyFromTerminal(state, merged);
     if (slice.len == 0) return;
 
+    // Don't process (or forward) partial escape sequences.
+    const stable = stashIncompleteEscapeTail(state, slice);
+    if (stable.len == 0) return;
+
     {
-        const inp = slice;
+        const inp = stable;
 
         // ==========================================================================
         // LEVEL 1: MUX-level popup blocks EVERYTHING

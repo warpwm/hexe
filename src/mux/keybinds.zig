@@ -9,6 +9,7 @@ const Pane = @import("pane.zig").Pane;
 const input = @import("input.zig");
 const loop_ipc = @import("loop_ipc.zig");
 const actions = @import("loop_actions.zig");
+const focus_nav = @import("focus_nav.zig");
 
 pub const BindWhen = core.Config.BindWhen;
 pub const BindKey = core.Config.BindKey;
@@ -825,7 +826,7 @@ fn dispatchAction(state: *State, action: BindAction) bool {
                     }
                     break :blk @as(?layout_mod.CursorPos, null);
                 };
-                if (focusDirectionAny(state, d, cursor)) |target| {
+                if (focus_nav.focusDirectionAny(state, d, cursor)) |target| {
                     if (target.kind == .float) {
                         state.active_floating = target.float_index;
                     } else {
@@ -888,97 +889,4 @@ fn nudgeFloat(state: *State, pane: *Pane, dir: layout_mod.Layout.Direction, step
     }
 
     state.resizeFloatingPanes();
-}
-
-// ---- Focus navigation helpers (moved out of loop_input.zig)
-
-pub const FocusTargetKind = enum { split, float };
-
-pub const FocusTarget = struct {
-    kind: FocusTargetKind,
-    pane: *Pane,
-    float_index: ?usize,
-};
-
-fn isFloatRenderableOnTab(pane: *Pane, tab_idx: usize) bool {
-    if (!pane.isVisibleOnTab(tab_idx)) return false;
-    if (pane.parent_tab) |parent| {
-        return parent == tab_idx;
-    }
-    return true;
-}
-
-pub fn focusDirectionAny(state: *State, dir: layout_mod.Layout.Direction, cursor: ?layout_mod.CursorPos) ?FocusTarget {
-    // Prefer floats when a float is focused.
-    if (state.active_floating) |fi| {
-        if (fi < state.floats.items.len) {
-            const fp = state.floats.items[fi];
-            if (isFloatRenderableOnTab(fp, state.active_tab)) {
-                if (focusDirectionFromPane(state, fp, .float, fi, dir, cursor)) |t| return t;
-            }
-        }
-    }
-    if (state.currentLayout().getFocusedPane()) |p| {
-        if (focusDirectionFromPane(state, p, .split, null, dir, cursor)) |t| return t;
-    }
-    return null;
-}
-
-fn focusDirectionFromPane(state: *State, from: *Pane, from_kind: FocusTargetKind, from_float_index: ?usize, dir: layout_mod.Layout.Direction, cursor: ?layout_mod.CursorPos) ?FocusTarget {
-    _ = from_float_index;
-
-    // Cursor-based target point.
-    const cx: u16 = if (cursor) |c| c.x else from.border_x + from.border_w / 2;
-    const cy: u16 = if (cursor) |c| c.y else from.border_y + from.border_h / 2;
-
-    // Find best candidate among floats and splits.
-    var best: ?FocusTarget = null;
-    var best_dist: i64 = std.math.maxInt(i64);
-
-    // Floats.
-    for (state.floats.items, 0..) |fp, fi| {
-        if (!isFloatRenderableOnTab(fp, state.active_tab)) continue;
-        // Skip the current pane.
-        if (from_kind == .float and std.mem.eql(u8, &fp.uuid, &from.uuid)) continue;
-        const tx = fp.border_x + fp.border_w / 2;
-        const ty = fp.border_y + fp.border_h / 2;
-        if (!directionMatch(cx, cy, tx, ty, dir)) continue;
-        const dist = manhattan(cx, cy, tx, ty);
-        if (dist < best_dist) {
-            best_dist = dist;
-            best = .{ .kind = .float, .pane = fp, .float_index = fi };
-        }
-    }
-
-    // Splits.
-    var it = state.currentLayout().splitIterator();
-    while (it.next()) |sp| {
-        const p = sp.*;
-        if (from_kind == .split and p.id == from.id) continue;
-        const tx = p.border_x + p.border_w / 2;
-        const ty = p.border_y + p.border_h / 2;
-        if (!directionMatch(cx, cy, tx, ty, dir)) continue;
-        const dist = manhattan(cx, cy, tx, ty);
-        if (dist < best_dist) {
-            best_dist = dist;
-            best = .{ .kind = .split, .pane = p, .float_index = null };
-        }
-    }
-
-    return best;
-}
-
-fn directionMatch(cx: u16, cy: u16, tx: u16, ty: u16, dir: layout_mod.Layout.Direction) bool {
-    return switch (dir) {
-        .left => tx < cx,
-        .right => tx > cx,
-        .up => ty < cy,
-        .down => ty > cy,
-    };
-}
-
-fn manhattan(x1: u16, y1: u16, x2: u16, y2: u16) i64 {
-    const dx: i64 = @as(i64, @intCast(@max(x1, x2))) - @as(i64, @intCast(@min(x1, x2)));
-    const dy: i64 = @as(i64, @intCast(@max(y1, y2))) - @as(i64, @intCast(@min(y1, y2)));
-    return dx + dy;
 }

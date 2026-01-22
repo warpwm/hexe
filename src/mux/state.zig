@@ -99,6 +99,12 @@ pub const State = struct {
     osc_reply_in_progress: bool,
     osc_reply_prev_esc: bool,
 
+    // Stdin input can arrive split across reads. When using escape-sequence based
+    // encodings (CSI-u, mouse events, etc) we must not forward partial sequences
+    // into the focused pane. Keep a small tail buffer to stitch reads.
+    stdin_tail: [64]u8 = undefined,
+    stdin_tail_len: u8 = 0,
+
     pending_float_requests: std.AutoHashMap([32]u8, PendingFloatRequest),
 
     /// Shell-provided metadata (last command, status, duration) keyed by pane UUID.
