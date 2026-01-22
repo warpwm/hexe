@@ -168,6 +168,16 @@ pub fn main() !void {
     const shp_shell_event_duration = try shp_shell_event.int("", "duration", null);
     const shp_shell_event_cwd = try shp_shell_event.string("", "cwd", null);
     const shp_shell_event_jobs = try shp_shell_event.int("", "jobs", null);
+    const shp_shell_event_phase = try shp_shell_event.string("", "phase", null);
+    const shp_shell_event_running = try shp_shell_event.flag("", "running", null);
+    const shp_shell_event_started_at = try shp_shell_event.int("", "started-at", null);
+
+    const shp_spinner = try shp_cmd.newCommand("spinner", "Render a spinner/animation frame");
+    const shp_spinner_name = try shp_spinner.stringPositional(null);
+    const shp_spinner_width = try shp_spinner.int("w", "width", null);
+    const shp_spinner_interval = try shp_spinner.int("i", "interval", null);
+    const shp_spinner_hold = try shp_spinner.int("H", "hold", null);
+    const shp_spinner_loop = try shp_spinner.flag("l", "loop", null);
 
     // POP subcommands
     const pop_notify = try pop_cmd.newCommand("notify", "Show notification");
@@ -209,6 +219,7 @@ pub fn main() !void {
     var found_focus = false;
     var found_exit_intent = false;
     var found_shell_event = false;
+    var found_spinner = false;
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) has_help = true;
@@ -234,6 +245,7 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "focus")) found_focus = true;
         if (std.mem.eql(u8, arg, "exit-intent")) found_exit_intent = true;
         if (std.mem.eql(u8, arg, "shell-event")) found_shell_event = true;
+        if (std.mem.eql(u8, arg, "spinner")) found_spinner = true;
     }
 
         if (has_help) {
@@ -257,7 +269,10 @@ pub fn main() !void {
         } else if (found_shp and found_exit_intent) {
             print("Usage: hexe shp exit-intent\n\nAsk the current mux session whether the shell should be allowed to exit.\nIntended for shell keybindings (exit/Ctrl+D) to avoid last-pane death.\n\nExit codes: 0=allow, 1=deny\n", .{});
         } else if (found_shp and found_shell_event) {
-            print("Usage: hexe shp shell-event [--cmd <TEXT>] [--status <N>] [--duration <MS>] [--cwd <PATH>] [--jobs <N>]\n\nSend shell command metadata to the current mux session.\nUsed by shell integration to power statusbar + `hexe mux info`.\n\nNotes:\n  - No-op outside a mux session\n  - If mux is unreachable, exits 0\n", .{});
+            print(
+                "Usage: hexe shp shell-event [--cmd <TEXT>] [--cwd <PATH>] [--jobs <N>] [--phase <start|end>] [--running] [--started-at <MS>] [--status <N>] [--duration <MS>]\n\nSend shell command metadata to the current mux session.\nUsed by shell integration to power statusbar + `hexe mux info`.\n\nNotes:\n  - No-op outside a mux session\n  - If mux is unreachable, exits 0\n",
+                .{},
+            );
         } else if (found_ses and found_daemon) {
             print("Usage: hexe ses daemon [OPTIONS]\n\nStart the session daemon\n\nOptions:\n  -f, --foreground        Run in foreground (don't daemonize)\n  -d, --debug             Enable debug output\n  -L, --logfile <PATH>    Log debug output to PATH\n  -I, --instance <NAME>   Run under instance namespace\n  -T, --test-only         Mark as test-only (requires instance)\n", .{});
         } else if (found_pod and found_daemon) {
@@ -272,6 +287,11 @@ pub fn main() !void {
             print("Usage: hexe shp prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
         } else if (found_shp and found_init) {
             print("Usage: hexe shp init <shell> [--no-comms]\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n\nOptions:\n      --no-comms  Disable shell->mux communication hooks\n", .{});
+        } else if (found_shp and found_spinner) {
+            print(
+                "Usage: hexe shp spinner <name> [OPTIONS]\n\nRender a spinner frame (or animate it in-place).\n\nOptions:\n  -w, --width <N>       Frame width (default: 8)\n  -i, --interval <MS>   Frame step in ms (default: 75)\n  -H, --hold <N>        Hold frames at each end (default: 9)\n  -l, --loop            Animate continuously until Ctrl+C\n\nAvailable spinners:\n  knight_rider\n",
+                .{},
+            );
         } else if (found_pop and found_notify) {
             print("Usage: hexe pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Duration in milliseconds (default: 3000)\n", .{});
         } else if (found_pop and found_confirm) {
@@ -287,7 +307,7 @@ pub fn main() !void {
         } else if (found_mux) {
             print("Usage: hexe mux <command>\n\nTerminal multiplexer\n\nCommands:\n  new     Create new multiplexer session\n  attach  Attach to existing session\n  float   Spawn a transient float pane\n  notify  Send notification\n  send    Send keystrokes to pane\n  info    Show pane info\n", .{});
         } else if (found_shp) {
-            print("Usage: hexe shp <command>\n\nShell prompt renderer\n\nCommands:\n  prompt       Render shell prompt\n  init         Print shell initialization script\n  exit-intent  Ask mux permission before shell exits\n  shell-event  Send shell metadata to mux\n", .{});
+            print("Usage: hexe shp <command>\n\nShell prompt renderer\n\nCommands:\n  prompt       Render shell prompt\n  init         Print shell initialization script\n  exit-intent  Ask mux permission before shell exits\n  shell-event  Send shell metadata to mux\n  spinner      Render/animate a spinner\n", .{});
         } else {
             print("Usage: hexe <command>\n\nHexe terminal multiplexer\n\nCommands:\n  ses  Session daemon management\n  pod  Per-pane PTY daemon (internal)\n  mux  Terminal multiplexer\n  shp  Shell prompt renderer\n  pop  Popup overlays\n", .{});
         }
@@ -430,7 +450,12 @@ pub fn main() !void {
                 shp_shell_event_duration.*,
                 shp_shell_event_cwd.*,
                 shp_shell_event_jobs.*,
+                shp_shell_event_phase.*,
+                shp_shell_event_running.*,
+                shp_shell_event_started_at.*,
             );
+        } else if (shp_spinner.happened) {
+            try runShpSpinner(shp_spinner_name.*, shp_spinner_width.*, shp_spinner_interval.*, shp_spinner_hold.*, shp_spinner_loop.*);
         }
     } else if (pop_cmd.happened) {
         if (pop_notify.happened) {
@@ -735,6 +760,44 @@ fn runShpInit(shell: []const u8, no_comms: bool) !void {
     } else {
         print("Error: shell name required (bash, zsh, fish)\n", .{});
     }
+}
+
+fn runShpSpinner(name: []const u8, width_i: i64, interval_i: i64, hold_i: i64, loop: bool) !void {
+    const stdout = std.fs.File.stdout();
+
+    if (name.len == 0) {
+        print("Error: spinner name required\n", .{});
+        return;
+    }
+
+    const width: u8 = if (width_i > 0 and width_i <= 64) @intCast(width_i) else 8;
+    const interval_ms: u64 = if (interval_i > 0 and interval_i <= 10_000) @intCast(interval_i) else 75;
+    const hold_frames: u8 = if (hold_i >= 0 and hold_i <= 60) @intCast(hold_i) else 9;
+
+    const start_ms: u64 = @intCast(std.time.milliTimestamp());
+
+    if (!loop) {
+        const now_ms: u64 = start_ms;
+        const frame = shp.animations.renderAnsiWithOptions(name, now_ms, start_ms, width, interval_ms, hold_frames);
+        try stdout.writeAll(frame);
+        try stdout.writeAll("\n");
+        return;
+    }
+
+    while (true) {
+        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const frame = shp.animations.renderAnsiWithOptions(name, now_ms, start_ms, width, interval_ms, hold_frames);
+
+        // NOTE: frame includes ANSI escapes; do not truncate/pad by bytes.
+        // Use EL (erase to end of line) so variable-length frames don't leave artifacts.
+        stdout.writeAll("\r") catch break;
+        stdout.writeAll(frame) catch break;
+        stdout.writeAll("\x1b[0K") catch break;
+        std.Thread.sleep(interval_ms * std.time.ns_per_ms);
+    }
+
+    // Clear line on exit.
+    stdout.writeAll("\r\n") catch {};
 }
 
 // ============================================================================

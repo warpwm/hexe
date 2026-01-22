@@ -46,14 +46,11 @@ pub fn printInit(stdout: std.fs.File, no_comms: bool) !void {
         \\    esac
         \\    __hexe_last_cmd="$cmd"
         \\    __hexe_start=$(date +%s%3N)
+        \\    hexe shp shell-event --phase=start --running --started-at=$__hexe_start --cmd="$__hexe_last_cmd" --cwd="$PWD" --jobs=$(jobs -p 2>/dev/null | wc -l) >/dev/null 2>/dev/null
         \\}
         \\
         \\__hexe_precmd() {
         \\    local exit_status=$?
-        \\    local duration=0
-        \\    if [[ -n "$__hexe_start" ]]; then
-        \\        duration=$(( $(date +%s%3N) - __hexe_start ))
-        \\    fi
         \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || { unset __hexe_start; unset __hexe_last_cmd; return 0; }
         \\
         \\    # OSC 7 cwd sync
@@ -70,7 +67,7 @@ pub fn printInit(stdout: std.fs.File, no_comms: bool) !void {
         \\    fi
         \\
         \\    local jobs_count=$(jobs -p 2>/dev/null | wc -l)
-        \\    hexe shp shell-event --cmd="$cmd" --status=$exit_status --duration=$duration --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
+        \\    hexe shp shell-event --phase=end --cmd="$cmd" --status=$exit_status --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
         \\    unset __hexe_start
         \\    unset __hexe_last_cmd
         \\}

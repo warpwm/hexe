@@ -139,8 +139,23 @@ pub fn draw(
             if (info.jobs) |j| {
                 ctx.jobs = j;
             }
+
+            ctx.shell_running = info.running;
+            if (info.cmd) |c| ctx.shell_running_cmd = c;
+            ctx.shell_started_at_ms = info.started_at_ms;
         }
     }
+
+    // Provide pane state for animation policy.
+    if (state.active_floating) |idx| {
+        if (idx < state.floats.items.len) {
+            ctx.alt_screen = state.floats.items[idx].vt.inAltScreen();
+        }
+    } else if (state.currentLayout().getFocusedPane()) |pane| {
+        ctx.alt_screen = pane.vt.inAltScreen();
+    }
+
+    ctx.now_ms = @intCast(std.time.milliTimestamp());
 
     // Find the tabs module to check tab_title setting
     var use_basename = true;
@@ -427,33 +442,31 @@ fn measureTabsWidth(tab_names: []const []const u8, separator: []const u8, left_a
 pub fn drawModule(renderer: *Renderer, ctx: *shp.Context, mod: core.config.StatusModule, start_x: u16, y: u16) u16 {
     var x = start_x;
 
-    var output_text: []const u8 = "";
-
-    if (std.mem.eql(u8, mod.name, "session")) {
-        output_text = ctx.session_name;
-    } else {
-        if (ctx.renderSegment(mod.name)) |segs| {
-            if (segs.len > 0) {
-                output_text = segs[0].text;
-            }
-        }
-    }
-
     for (mod.outputs) |out| {
         const style = shp.Style.parse(out.style);
-        x = drawFormatted(renderer, x, y, out.format, output_text, style);
+        ctx.module_default_style = style;
+
+        const output_segs: ?[]const shp.Segment = if (std.mem.eql(u8, mod.name, "session")) null else ctx.renderSegment(mod.name);
+        const output_text: []const u8 = if (std.mem.eql(u8, mod.name, "session")) ctx.session_name else "";
+        x = drawFormatted(renderer, x, y, out.format, output_text, output_segs, style);
     }
 
     return x;
 }
 
-pub fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const u8, output: []const u8, style: shp.Style) u16 {
+pub fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const u8, output: []const u8, output_segs: ?[]const shp.Segment, style: shp.Style) u16 {
     var x = start_x;
     var i: usize = 0;
 
     while (i < format.len) {
         if (i + 7 <= format.len and std.mem.eql(u8, format[i..][0..7], "$output")) {
-            x = drawStyledText(renderer, x, y, output, style);
+            if (output_segs) |segs| {
+                for (segs) |seg| {
+                    x = drawSegment(renderer, x, y, seg, style);
+                }
+            } else {
+                x = drawStyledText(renderer, x, y, output, style);
+            }
             i += 7;
         } else {
             const len = std.unicode.utf8ByteSequenceLength(format[i]) catch 1;
@@ -468,20 +481,13 @@ pub fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const 
 pub fn calcModuleWidth(ctx: *shp.Context, mod: core.config.StatusModule) u16 {
     var width: u16 = 0;
 
-    var output_text: []const u8 = "";
-
-    if (std.mem.eql(u8, mod.name, "session")) {
-        output_text = ctx.session_name;
-    } else {
-        if (ctx.renderSegment(mod.name)) |segs| {
-            if (segs.len > 0) {
-                output_text = segs[0].text;
-            }
-        }
-    }
-
     for (mod.outputs) |out| {
-        width += calcFormattedWidth(out.format, output_text);
+        const style = shp.Style.parse(out.style);
+        ctx.module_default_style = style;
+
+        const output_segs: ?[]const shp.Segment = if (std.mem.eql(u8, mod.name, "session")) null else ctx.renderSegment(mod.name);
+        const output_text: []const u8 = if (std.mem.eql(u8, mod.name, "session")) ctx.session_name else "";
+        width += calcFormattedWidth(out.format, output_text, output_segs);
     }
 
     return width;
@@ -504,17 +510,18 @@ pub fn measureText(text: []const u8) u16 {
     return width;
 }
 
-pub fn calcFormattedWidth(format: []const u8, output: []const u8) u16 {
+pub fn calcFormattedWidth(format: []const u8, output: []const u8, output_segs: ?[]const shp.Segment) u16 {
     var width: u16 = 0;
     var i: usize = 0;
 
     while (i < format.len) {
         if (i + 7 <= format.len and std.mem.eql(u8, format[i..][0..7], "$output")) {
-            var j: usize = 0;
-            while (j < output.len) {
-                const len = std.unicode.utf8ByteSequenceLength(output[j]) catch 1;
-                j += len;
-                width += 1;
+            if (output_segs) |segs| {
+                for (segs) |seg| {
+                    width += measureText(seg.text);
+                }
+            } else {
+                width += measureText(output);
             }
             i += 7;
         } else {
@@ -526,8 +533,19 @@ pub fn calcFormattedWidth(format: []const u8, output: []const u8) u16 {
     return width;
 }
 
+fn mergeStyle(base: shp.Style, override: shp.Style) shp.Style {
+    var out = base;
+    if (override.fg != .none) out.fg = override.fg;
+    if (override.bg != .none) out.bg = override.bg;
+    if (override.bold) out.bold = true;
+    if (override.italic) out.italic = true;
+    if (override.underline) out.underline = true;
+    if (override.dim) out.dim = true;
+    return out;
+}
+
 pub fn drawSegment(renderer: *Renderer, x: u16, y: u16, seg: shp.Segment, default_style: shp.Style) u16 {
-    const style = if (seg.style.isEmpty()) default_style else seg.style;
+    const style = if (seg.style.isEmpty()) default_style else mergeStyle(default_style, seg.style);
     return drawStyledText(renderer, x, y, seg.text, style);
 }
 

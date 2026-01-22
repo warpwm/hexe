@@ -41,6 +41,11 @@ pub const PopArgs = struct {
     right: bool = false,
     shell: ?[]const u8 = null,
     jobs: i64 = 0,
+
+    // shell-event extended fields
+    shell_phase: ?[]const u8 = null,
+    shell_running: bool = false,
+    shell_started_at: i64 = 0,
 };
 
 /// Entry point for shp - can be called directly from unified CLI

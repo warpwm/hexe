@@ -24,8 +24,8 @@ pub fn runMainLoop(state: *State) !void {
     // Some terminals will start emitting CSI-u sequences when they see unknown
     // keyboard mode requests, and any parsing mismatch can leak garbage into the
     // underlying shell (e.g. "3u" fragments).
-    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1006h");
-    defer stdout.writeAll("\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
+    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    defer stdout.writeAll("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
 
     // Build poll fds.
     var poll_fds: [17]posix.pollfd = undefined; // stdin + up to 16 panes
@@ -35,7 +35,10 @@ pub fn runMainLoop(state: *State) !void {
     var last_render: i64 = std.time.milliTimestamp();
     var last_status_update: i64 = last_render;
     var last_pane_sync: i64 = last_render;
-    const status_update_interval: i64 = 250; // Update status bar every 250ms
+    // Update status bar periodically.
+    // This is also used to drive lightweight animations.
+    const status_update_interval_base: i64 = 250;
+    const status_update_interval_anim: i64 = 75;
     const pane_sync_interval: i64 = 1000; // Sync pane info (CWD, process) every 1s
 
     // Main loop.
@@ -158,6 +161,19 @@ pub fn runMainLoop(state: *State) !void {
         const now = std.time.milliTimestamp();
         const since_render = now - last_render;
         const since_status = now - last_status_update;
+        const want_anim = blk: {
+            const uuid = state.getCurrentFocusedUuid() orelse break :blk false;
+            const info = state.getPaneShell(uuid) orelse break :blk false;
+            if (!info.running) break :blk false;
+            // suppress while alt-screen is active
+            if (state.active_floating) |idx| {
+                if (idx < state.floats.items.len and state.floats.items[idx].vt.inAltScreen()) break :blk false;
+            } else if (state.currentLayout().getFocusedPane()) |pane| {
+                if (pane.vt.inAltScreen()) break :blk false;
+            }
+            break :blk true;
+        };
+        const status_update_interval: i64 = if (want_anim) status_update_interval_anim else status_update_interval_base;
         const until_status: i64 = @max(0, status_update_interval - since_status);
         const until_key_timer: i64 = blk: {
             if (state.nextKeyTimerDeadlineMs(now)) |deadline| {

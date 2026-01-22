@@ -31,6 +31,7 @@ const FocusContext = core.Config.FocusContext;
 const state_tabs = @import("state_tabs.zig");
 const state_serialize = @import("state_serialize.zig");
 const state_sync = @import("state_sync.zig");
+const mouse_selection = @import("mouse_selection.zig");
 
 pub const TabFocusKind = enum { split, float };
 
@@ -40,6 +41,10 @@ pub const PaneShellInfo = struct {
     status: ?i32 = null,
     duration_ms: ?u64 = null,
     jobs: ?u16 = null,
+
+    // Running command telemetry (best-effort, sourced from shell integration).
+    running: bool = false,
+    started_at_ms: ?u64 = null,
 
     pub fn deinit(self: *PaneShellInfo, allocator: std.mem.Allocator) void {
         if (self.cmd) |c| allocator.free(c);
@@ -117,6 +122,8 @@ pub const State = struct {
 
     pending_float_requests: std.AutoHashMap([32]u8, PendingFloatRequest),
 
+    mouse_selection: mouse_selection.MouseSelection,
+
     /// Shell-provided metadata (last command, status, duration) keyed by pane UUID.
     pane_shell: std.AutoHashMap([32]u8, PaneShellInfo),
 
@@ -189,6 +196,8 @@ pub const State = struct {
             .osc_reply_prev_esc = false,
 
             .pending_float_requests = std.AutoHashMap([32]u8, PendingFloatRequest).init(allocator),
+
+            .mouse_selection = .{},
 
             .pane_shell = std.AutoHashMap([32]u8, PaneShellInfo).init(allocator),
 
@@ -434,6 +443,27 @@ pub const State = struct {
             }
             if (status) |s| info.status = s;
             if (duration_ms) |d| info.duration_ms = d;
+            if (jobs) |j| info.jobs = j;
+        }
+    }
+
+    pub fn setPaneShellRunning(self: *State, uuid: [32]u8, running: bool, started_at_ms: ?u64, cmd: ?[]const u8, cwd: ?[]const u8, jobs: ?u16) void {
+        var entry = self.pane_shell.getPtr(uuid);
+        if (entry == null) {
+            self.pane_shell.put(uuid, .{}) catch return;
+            entry = self.pane_shell.getPtr(uuid);
+        }
+        if (entry) |info| {
+            info.running = running;
+            if (started_at_ms) |t| info.started_at_ms = t;
+            if (cmd) |c| {
+                if (info.cmd) |old| self.allocator.free(old);
+                info.cmd = self.allocator.dupe(u8, c) catch info.cmd;
+            }
+            if (cwd) |c| {
+                if (info.cwd) |old| self.allocator.free(old);
+                info.cwd = self.allocator.dupe(u8, c) catch info.cwd;
+            }
             if (jobs) |j| info.jobs = j;
         }
     }

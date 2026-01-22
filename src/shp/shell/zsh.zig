@@ -41,18 +41,15 @@ pub fn printInit(stdout: std.fs.File, no_comms: bool) !void {
         \\__hexe_preexec_capture() {
         \\    __hexe_last_cmd="$1"
         \\    __hexe_start=$(date +%s%3N)
+        \\    hexe shp shell-event --phase=start --running --started-at=$__hexe_start --cmd="$__hexe_last_cmd" --cwd="$PWD" --jobs=${(M)#jobstates} >/dev/null 2>/dev/null
         \\}
         \\
         \\__hexe_precmd_send() {
         \\    local exit_status=$?
-        \\    local duration=0
-        \\    if [[ -n "$__hexe_start" ]]; then
-        \\        duration=$(( $(date +%s%3N) - __hexe_start ))
-        \\    fi
         \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || { unset __hexe_start; return 0; }
         \\    # OSC 7 cwd sync
         \\    printf '\033]7;file://%s%s\007' "${HOST:-localhost}" "$PWD" 2>/dev/null
-        \\    hexe shp shell-event --cmd="$__hexe_last_cmd" --status=$exit_status --duration=$duration --cwd="$PWD" --jobs=${(M)#jobstates} >/dev/null 2>/dev/null
+        \\    hexe shp shell-event --phase=end --cmd="$__hexe_last_cmd" --status=$exit_status --cwd="$PWD" --jobs=${(M)#jobstates} >/dev/null 2>/dev/null
         \\    unset __hexe_start
         \\}
         \\

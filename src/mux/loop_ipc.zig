@@ -563,6 +563,21 @@ pub fn handleIpcConnection(state: *State, buffer: []u8) void {
             else => null,
         } else null;
 
+        const phase = if (root.get("phase")) |v|
+            if (v == .string) v.string else "end"
+        else
+            "end";
+
+        const running = if (root.get("running")) |v| switch (v) {
+            .bool => |b| b,
+            else => null,
+        } else null;
+
+        const started_at_opt: ?u64 = if (root.get("started_at_ms")) |v| switch (v) {
+            .integer => |i| @intCast(@max(@as(i64, 0), i)),
+            else => null,
+        } else null;
+
         // Job count delta notifications (only on 0<->nonzero transitions).
         const old_jobs: ?u16 = if (state.pane_shell.get(uuid)) |info| info.jobs else null;
         if (jobs_opt) |new_jobs| {
@@ -581,9 +596,30 @@ pub fn handleIpcConnection(state: *State, buffer: []u8) void {
             }
         }
 
-        state.setPaneShell(uuid, cmd, cwd, status_opt, dur_opt, jobs_opt);
+        // Start/end semantics:
+        // - phase=start: mark running and store started_at (shell may provide it; otherwise use mux time)
+        // - phase=end (default): clear running and update last status/duration
+        if (std.mem.eql(u8, phase, "start")) {
+            const now_ms: u64 = @intCast(std.time.milliTimestamp());
+            state.setPaneShellRunning(uuid, running orelse true, started_at_opt orelse now_ms, cmd, cwd, jobs_opt);
+        } else {
+            const now_ms: u64 = @intCast(std.time.milliTimestamp());
+            var computed_dur: ?u64 = dur_opt;
+            if (state.pane_shell.get(uuid)) |info| {
+                if (info.started_at_ms) |t0| {
+                    if (now_ms >= t0) computed_dur = now_ms - t0;
+                }
+            }
+            state.setPaneShellRunning(uuid, running orelse false, null, null, null, null);
+            state.setPaneShell(uuid, cmd, cwd, status_opt, computed_dur, jobs_opt);
+            // Clear started_at after the command ends.
+            if (state.pane_shell.getPtr(uuid)) |info_ptr| {
+                info_ptr.started_at_ms = null;
+            }
+        }
 
         // Forward to ses so `hexe mux info` can show it.
+        // (running fields are not yet persisted; still useful locally for mux animations)
         state.ses_client.updatePaneShell(uuid, cmd, cwd, status_opt, dur_opt, jobs_opt) catch {};
 
         // Shell events often arrive with no pane output; force a re-render so

@@ -180,6 +180,15 @@ pub const Renderer = struct {
         self.next.clear();
     }
 
+    /// Invert a cell in the next-frame buffer.
+    ///
+    /// This is used for mux-side selection highlighting overlays.
+    pub fn invertCell(self: *Renderer, x: u16, y: u16) void {
+        if (x >= self.next.width or y >= self.next.height) return;
+        const cell = self.next.get(x, y);
+        cell.inverse = !cell.inverse;
+    }
+
     /// Set a cell in the next frame buffer
     pub fn setCell(self: *Renderer, x: u16, y: u16, cell: Cell) void {
         // Strict bounds checking - prevent any out-of-bounds writes

@@ -27,6 +27,23 @@ pub const Context = struct {
     // Shell metadata (for mux status bar mode)
     last_command: ?[]const u8 = null,
 
+    // Shell activity telemetry (for mux status bar mode)
+    shell_running: bool = false,
+    shell_running_cmd: ?[]const u8 = null,
+    shell_started_at_ms: ?u64 = null,
+
+    // Mux pane state (for mux status bar mode)
+    alt_screen: bool = false,
+
+    // Clock (ms since epoch) for animations/time-based segments
+    now_ms: u64 = 0,
+
+    // Default style provided by the caller (mux statusbar) for the currently
+    // rendered module output.
+    //
+    // Some segments (e.g. running_anim) derive color ramps from this.
+    module_default_style: Style = .{},
+
     // Mux state (for status bar mode)
     session_name: []const u8 = "",
     tab_names: []const []const u8 = &.{},
@@ -64,11 +81,20 @@ pub const Context = struct {
         // since they need fresh values each render
         const dynamic_segments = [_][]const u8{ "cpu", "mem", "memory", "netspeed", "time", "battery", "uptime", "last_command" };
         var is_dynamic = false;
+        if (std.mem.eql(u8, name, "running_anim") or std.mem.startsWith(u8, name, "running_anim/")) {
+            is_dynamic = true;
+        }
         for (dynamic_segments) |dyn| {
             if (std.mem.eql(u8, name, dyn)) {
                 is_dynamic = true;
                 break;
             }
+        }
+
+        // Parameterized running animation segment: running_anim/<spinner>?width=8&step=75&hold=9
+        if (std.mem.eql(u8, name, "running_anim") or std.mem.startsWith(u8, name, "running_anim/")) {
+            const segments_mod = @import("segments/mod.zig");
+            return segments_mod.running_anim.renderNamed(self, name);
         }
 
         // Check cache first (only for non-dynamic segments)

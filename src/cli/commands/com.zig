@@ -855,7 +855,17 @@ pub fn runExitIntent(allocator: std.mem.Allocator) !void {
     std.process.exit(0);
 }
 
-pub fn runShellEvent(allocator: std.mem.Allocator, cmd: []const u8, status: i64, duration_ms: i64, cwd: []const u8, jobs: i64) !void {
+pub fn runShellEvent(
+    allocator: std.mem.Allocator,
+    cmd: []const u8,
+    status: i64,
+    duration_ms: i64,
+    cwd: []const u8,
+    jobs: i64,
+    phase: []const u8,
+    running: bool,
+    started_at_ms: i64,
+) !void {
     _ = allocator;
 
     const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
@@ -892,6 +902,19 @@ pub fn runShellEvent(allocator: std.mem.Allocator, cmd: []const u8, status: i64,
         try writeJsonEscaped(w, cwd);
         try w.writeAll("\"");
     }
+    if (phase.len > 0) {
+        try w.writeAll(",\"phase\":\"");
+        try writeJsonEscaped(w, phase);
+        try w.writeAll("\"");
+    }
+    if (running) {
+        try w.writeAll(",\"running\":true");
+    }
+    if (started_at_ms > 0) {
+        try w.print(",\"started_at_ms\":{d}", .{started_at_ms});
+    }
+
+    // End-of-command metadata
     try w.print(",\"status\":{d}", .{status});
     try w.print(",\"duration_ms\":{d}", .{duration_ms});
     try w.print(",\"jobs\":{d}", .{jobs});

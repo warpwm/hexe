@@ -16,6 +16,30 @@ const TabFocusKind = @import("state.zig").TabFocusKind;
 const statusbar = @import("statusbar.zig");
 const keybinds = @import("keybinds.zig");
 const input_csi_u = @import("input_csi_u.zig");
+const mouse_selection = @import("mouse_selection.zig");
+const clipboard = @import("clipboard.zig");
+
+fn mouseModsMask(btn: u16) u8 {
+    // SGR mouse modifier bits:
+    // - shift: 4
+    // - alt: 8
+    // - ctrl: 16
+    // Map to hexe mod mask:
+    // - alt: 1
+    // - ctrl: 2
+    // - shift: 4
+    var mods: u8 = 0;
+    if ((btn & 8) != 0) mods |= 1;
+    if ((btn & 16) != 0) mods |= 2;
+    if ((btn & 4) != 0) mods |= 4;
+    return mods;
+}
+
+fn toLocalClamped(pane: *Pane, abs_x: u16, abs_y: u16) mouse_selection.Pos {
+    const lx = if (abs_x > pane.x) abs_x - pane.x else 0;
+    const ly = if (abs_y > pane.y) abs_y - pane.y else 0;
+    return mouse_selection.clampLocalToPane(lx, ly, pane.width, pane.height);
+}
 
 fn forwardSanitizedToFocusedPane(state: *State, bytes: []const u8) void {
     input_csi_u.forwardSanitizedToFocusedPane(state, bytes);
@@ -306,6 +330,64 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
             if (input.parseMouseEvent(inp[i..])) |ev| {
                 const raw = inp[i .. i + ev.consumed];
 
+                const mouse_mods = mouseModsMask(ev.btn);
+                const sel_override = state.config.mouse.selection_override_mods;
+                const override_active = sel_override != 0 and (mouse_mods & sel_override) == sel_override;
+
+                const is_motion = (ev.btn & 32) != 0;
+                const is_wheel = (!ev.is_release) and (ev.btn & 64) != 0;
+                const is_left_btn = (ev.btn & 3) == 0;
+
+                // If a mux selection is currently active, consume drag/release
+                // regardless of where the pointer is.
+                if (state.mouse_selection.active) {
+                    if (state.mouse_selection.pane_uuid) |uuid| {
+                        if (state.mouse_selection.tab) |tab_idx| {
+                            if (tab_idx == state.active_tab) {
+                                if (state.findPaneByUuid(uuid)) |sel_pane| {
+                                    const local = toLocalClamped(sel_pane, ev.x, ev.y);
+
+                                    if (!ev.is_release and is_motion and is_left_btn and !is_wheel) {
+                                        state.mouse_selection.update(local.x, local.y);
+                                        state.needs_render = true;
+                                        i += ev.consumed;
+                                        continue;
+                                    }
+
+                                    // SGR mouse reports release as button code 3 with the 'm' terminator.
+                                    // Don't require is_left_btn here.
+                                    if (ev.is_release) {
+                                        state.mouse_selection.update(local.x, local.y);
+                                        state.mouse_selection.finish();
+                                        if (state.mouse_selection.rangeForPane(state.active_tab, sel_pane.uuid)) |range| {
+                                            const bytes = mouse_selection.extractText(state.allocator, sel_pane, sel_pane.width, sel_pane.height, range) catch {
+                                                state.notifications.showFor("Copy failed", 1200);
+                                                state.needs_render = true;
+                                                i += ev.consumed;
+                                                continue;
+                                            };
+                                            defer state.allocator.free(bytes);
+                                            clipboard.copyToClipboard(state.allocator, bytes);
+                                            if (bytes.len == 0) {
+                                                state.notifications.showFor("Copied empty selection", 1200);
+                                            } else {
+                                                state.notifications.showFor("Copied selection", 1200);
+                                            }
+                                        }
+                                        state.needs_render = true;
+                                        i += ev.consumed;
+                                        continue;
+                                    }
+                                } else {
+                                    state.mouse_selection.clear();
+                                }
+                            } else {
+                                state.mouse_selection.clear();
+                            }
+                        }
+                    }
+                }
+
                 // Status bar tab switching (only on press).
                 if (!ev.is_release and state.config.tabs.status.enabled and ev.y == state.term_height - 1) {
                     if (statusbar.hitTestTab(state.allocator, &state.config, state.term_width, state.term_height, state.tabs, state.active_tab, state.session_name, ev.x, ev.y)) |ti| {
@@ -322,19 +404,22 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                 const target = findFocusableAt(state, ev.x, ev.y);
                 const forward_to_app = if (target) |t| t.pane.vt.inAltScreen() else false;
 
-                // Wheel scroll (64/65):
+                // Wheel scroll:
                 // - In alt screen: forward to the app (btop, cmatrix, etc)
                 // - Otherwise: use mux scrollback
-                if (!ev.is_release and (ev.btn == 64 or ev.btn == 65)) {
+                if (is_wheel) {
+                    const wheel_dir = ev.btn & 3;
                     if (target) |t| {
                         if (forward_to_app) {
                             // Forward to app.
                             t.pane.write(raw) catch {};
                         } else {
-                            if (ev.btn == 64) {
+                            if (wheel_dir == 0) {
                                 t.pane.scrollUp(3);
-                            } else {
+                            } else if (wheel_dir == 1) {
                                 t.pane.scrollDown(3);
+                            } else {
+                                // Unexpected wheel code.
                             }
                             state.needs_render = true;
                         }
@@ -352,12 +437,21 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                     continue;
                 }
 
-                // Left button press always focuses.
-                // Only forward the click to the app if the target is in alt-screen.
-                if (!ev.is_release and (ev.btn & 3) == 0) {
+                // Left button press: focus + optional mux selection.
+                // Only forward to the app if the target is in alt-screen and we are
+                // not doing mux selection.
+                if (!ev.is_release and !is_motion and is_left_btn) {
                     if (target) |t| {
                         focusTarget(state, t);
-                        if (forward_to_app) {
+
+                        const in_content = ev.x >= t.pane.x and ev.x < t.pane.x + t.pane.width and ev.y >= t.pane.y and ev.y < t.pane.y + t.pane.height;
+                        const use_mux_selection = in_content and (override_active or !t.pane.vt.inAltScreen());
+
+                        if (use_mux_selection) {
+                            const local = toLocalClamped(t.pane, ev.x, ev.y);
+                            state.mouse_selection.begin(state.active_tab, t.pane.uuid, local.x, local.y);
+                            state.needs_render = true;
+                        } else if (forward_to_app) {
                             t.pane.write(raw) catch {};
                         }
                     } else {
@@ -679,6 +773,9 @@ fn restoreTabFocus(state: *State, old_uuid: ?[32]u8) void {
 fn switchToTab(state: *State, new_tab: usize) void {
     if (new_tab >= state.tabs.items.len) return;
     const old_uuid = state.getCurrentFocusedUuid();
+
+    // Clear any pending/active selection on tab change.
+    state.mouse_selection.clear();
 
     if (state.active_floating) |idx| {
         if (idx < state.floats.items.len) {

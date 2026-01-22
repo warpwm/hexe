@@ -2,6 +2,12 @@ local hx = require("hexe")
 
 return {
   mux = {
+    mouse = {
+      -- When held during a mouse drag, force mux-side selection even for
+      -- alt-screen apps (btop, vim, etc).
+      selection_override_mods = { hx.mod.ctrl, hx.mod.alt },
+    },
+
     input = {
       timing = { hold_ms = 400, double_tap_ms = 250 },
       binds = {

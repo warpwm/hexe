@@ -5,6 +5,7 @@ const State = @import("state.zig").State;
 const statusbar = @import("statusbar.zig");
 const popup_render = @import("popup_render.zig");
 const borders = @import("borders.zig");
+const mouse_selection = @import("mouse_selection.zig");
 
 pub fn renderTo(state: *State, stdout: std.fs.File) !void {
     const renderer = &state.renderer;
@@ -17,6 +18,10 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
     while (pane_it.next()) |pane| {
         const render_state = pane.*.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
+
+        if (state.mouse_selection.rangeForPane(state.active_tab, pane.*.uuid)) |range| {
+            mouse_selection.applyOverlay(renderer, pane.*.x, pane.*.y, pane.*.width, pane.*.height, range);
+        }
 
         const is_scrolled = pane.*.isScrolled();
 
@@ -52,6 +57,10 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
         const render_state = pane.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
 
+        if (state.mouse_selection.rangeForPane(state.active_tab, pane.uuid)) |range| {
+            mouse_selection.applyOverlay(renderer, pane.x, pane.y, pane.width, pane.height, range);
+        }
+
         if (pane.isScrolled()) {
             borders.drawScrollIndicator(renderer, pane.x, pane.y, pane.width);
         }
@@ -75,6 +84,10 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
 
             if (pane.getRenderState()) |render_state| {
                 renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
+
+                if (state.mouse_selection.rangeForPane(state.active_tab, pane.uuid)) |range| {
+                    mouse_selection.applyOverlay(renderer, pane.x, pane.y, pane.width, pane.height, range);
+                }
             } else |_| {}
 
             if (pane.isScrolled()) {

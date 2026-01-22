@@ -315,11 +315,23 @@ pub const Config = struct {
         double_tap_ms: i64 = 250,
     };
 
+    pub const MouseConfig = struct {
+        /// Modifier chord required to override the default mouse routing.
+        ///
+        /// When this chord is held during mouse drag, the mux will perform
+        /// pane-local selection even when the target pane is in alt-screen.
+        ///
+        /// Bitmask uses hx.mod values (alt=1, ctrl=2, shift=4, super=8).
+        selection_override_mods: u8 = 1 | 2, // default: Ctrl+Alt
+    };
+
     // Config status for notifications
     status: lua_runtime.ConfigStatus = .loaded,
     status_message: ?[]const u8 = null,
 
     input: InputConfig = .{},
+
+    mouse: MouseConfig = .{},
 
     // Confirmation popups
     confirm_on_exit: bool = false, // When Alt+q or last shell exits
@@ -435,6 +447,12 @@ fn parseConfig(runtime: *LuaRuntime, config: *Config, allocator: std.mem.Allocat
         runtime.pop();
     }
 
+    // Parse mouse section
+    if (runtime.pushTable(-1, "mouse")) {
+        parseMouseConfig(runtime, config);
+        runtime.pop();
+    }
+
     // Confirmation settings
     if (runtime.getBool(-1, "confirm_on_exit")) |v| config.confirm_on_exit = v;
     if (runtime.getBool(-1, "confirm_on_detach")) |v| config.confirm_on_detach = v;
@@ -463,6 +481,31 @@ fn parseConfig(runtime: *LuaRuntime, config: *Config, allocator: std.mem.Allocat
     if (runtime.pushTable(-1, "notifications")) {
         parseNotifications(runtime, config, allocator);
         runtime.pop();
+    }
+}
+
+fn parseMouseConfig(runtime: *LuaRuntime, config: *Config) void {
+    // Accept either:
+    // - selection_override_mods = <number>
+    // - selection_override_mods = { hx.mod.ctrl, hx.mod.alt }
+    if (runtime.pushTable(-1, "selection_override_mods")) {
+        defer runtime.pop();
+        var mask: u8 = 0;
+        const len = runtime.getArrayLen(-1);
+        for (1..len + 1) |i| {
+            if (runtime.pushArrayElement(-1, i)) {
+                if (runtime.toIntAt(u8, -1)) |m| {
+                    mask |= m;
+                }
+                runtime.pop();
+            }
+        }
+        config.mouse.selection_override_mods = mask;
+        return;
+    }
+
+    if (runtime.getInt(u8, -1, "selection_override_mods")) |m| {
+        config.mouse.selection_override_mods = m;
     }
 }
 

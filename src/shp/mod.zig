@@ -5,6 +5,7 @@ pub const style = @import("style.zig");
 pub const format = @import("format.zig");
 pub const segment = @import("segment.zig");
 pub const segments = @import("segments/mod.zig");
+pub const animations = @import("animations/mod.zig");
 pub const entry = @import("main.zig");
 
 pub const Style = style.Style;

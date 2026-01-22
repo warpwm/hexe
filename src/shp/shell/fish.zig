@@ -63,6 +63,9 @@ pub fn printInit(stdout: std.fs.File, no_comms: bool) !void {
         \\
         \\function __hexe_fish_preexec --on-event fish_preexec
         \\    set -g __hexe_last_cmd (string join " " -- $argv)
+        \\    set -g __hexe_start (date +%s%3N)
+        \\    set -l jobs_count (count (jobs -p))
+        \\    hexe shp shell-event --phase=start --running --started-at=$__hexe_start --cmd="$__hexe_last_cmd" --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
         \\end
         \\
         \\function __hexe_fish_postexec --on-event fish_postexec
@@ -82,7 +85,7 @@ pub fn printInit(stdout: std.fs.File, no_comms: bool) !void {
         \\    # OSC 7 cwd sync
         \\    printf '\033]7;file://%s%s\007' "$hostname" "$PWD" 2>/dev/null
         \\    set -l jobs_count (count (jobs -p))
-        \\    hexe shp shell-event --cmd="$cmdline" --status=$status --duration=$CMD_DURATION --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
+        \\    hexe shp shell-event --phase=end --cmd="$cmdline" --status=$status --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
         \\end
         \\
     );
