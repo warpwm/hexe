@@ -14,15 +14,114 @@ const actions = @import("loop_actions.zig");
 const loop_ipc = @import("loop_ipc.zig");
 const TabFocusKind = @import("state.zig").TabFocusKind;
 const statusbar = @import("statusbar.zig");
+const keybinds = @import("keybinds.zig");
+const input_csi_u = @import("input_csi_u.zig");
+
+fn forwardSanitizedToFocusedPane(state: *State, bytes: []const u8) void {
+    input_csi_u.forwardSanitizedToFocusedPane(state, bytes);
+}
+
+fn mergeStdinTail(state: *State, input_bytes: []const u8) struct { merged: []const u8, owned: ?[]u8 } {
+    if (state.stdin_tail_len == 0) return .{ .merged = input_bytes, .owned = null };
+
+    const tl: usize = @intCast(state.stdin_tail_len);
+    const total = tl + input_bytes.len;
+    var tmp = state.allocator.alloc(u8, total) catch {
+        // Allocation failure: drop tail rather than corrupt memory.
+        state.stdin_tail_len = 0;
+        return .{ .merged = input_bytes, .owned = null };
+    };
+    @memcpy(tmp[0..tl], state.stdin_tail[0..tl]);
+    @memcpy(tmp[tl..total], input_bytes);
+    state.stdin_tail_len = 0;
+    return .{ .merged = tmp, .owned = tmp };
+}
+
+
+fn stashIncompleteEscapeTail(state: *State, inp: []const u8) []const u8 {
+    const ESC: u8 = 0x1b;
+    const BEL: u8 = 0x07;
+
+    // Find the last ESC in the buffer.
+    var last_esc: ?usize = null;
+    var i: usize = inp.len;
+    while (i > 0) {
+        i -= 1;
+        if (inp[i] == ESC) {
+            last_esc = i;
+            break;
+        }
+    }
+    if (last_esc == null) return inp;
+    const esc_i = last_esc.?;
+
+    // If ESC is the last byte, it's definitely incomplete.
+    if (esc_i + 1 >= inp.len) {
+        return stashFromIndex(state, inp, esc_i);
+    }
+
+    const next = inp[esc_i + 1];
+    // CSI: ESC [ ... <final>
+    if (next == '[') {
+        var j: usize = esc_i + 2;
+        while (j < inp.len) : (j += 1) {
+            const b = inp[j];
+            // CSI final byte is 0x40..0x7E
+            if (b >= 0x40 and b <= 0x7e) return inp;
+        }
+        return stashFromIndex(state, inp, esc_i);
+    }
+
+    // SS3: ESC O <final>
+    if (next == 'O') {
+        if (esc_i + 2 >= inp.len) return stashFromIndex(state, inp, esc_i);
+        return inp;
+    }
+
+    // OSC: ESC ] ... (BEL or ESC \\)
+    if (next == ']') {
+        var j: usize = esc_i + 2;
+        while (j < inp.len) : (j += 1) {
+            const b = inp[j];
+            if (b == BEL) return inp;
+            if (b == ESC and j + 1 < inp.len and inp[j + 1] == '\\') return inp;
+        }
+        return stashFromIndex(state, inp, esc_i);
+    }
+
+    // Alt/meta: ESC <byte>
+    // If we have the byte, it's complete.
+    return inp;
+}
+
+fn stashFromIndex(state: *State, inp: []const u8, start: usize) []const u8 {
+    const tail = inp[start..];
+    if (tail.len == 0) return inp;
+    if (tail.len > state.stdin_tail.len) {
+        // Too large to stash; don't block input.
+        return inp;
+    }
+    @memcpy(state.stdin_tail[0..tail.len], tail);
+    state.stdin_tail_len = @intCast(tail.len);
+    return inp[0..start];
+}
 
 pub fn handleInput(state: *State, input_bytes: []const u8) void {
     if (input_bytes.len == 0) return;
 
-    const slice = consumeOscReplyFromTerminal(state, input_bytes);
+    // Stdin reads can split escape sequences. Merge with any pending tail first.
+    const merged_res = mergeStdinTail(state, input_bytes);
+    defer if (merged_res.owned) |m| state.allocator.free(m);
+
+    const slice = consumeOscReplyFromTerminal(state, merged_res.merged);
     if (slice.len == 0) return;
 
+    // Don't process (or forward) partial escape sequences.
+    const stable = stashIncompleteEscapeTail(state, slice);
+    if (stable.len == 0) return;
+
     {
-        const inp = slice;
+        const inp = stable;
 
         // ==========================================================================
         // LEVEL 1: MUX-level popup blocks EVERYTHING
@@ -170,16 +269,10 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
         // ==========================================================================
         const current_tab = &state.tabs.items[state.active_tab];
         if (current_tab.popups.isBlocked()) {
-            // Allow tab switching (Alt+N, Alt+P) - also support fallback keys for Alt+>/<'
+            // Allow only tab switching while a tab popup is open.
             if (inp.len >= 2 and inp[0] == 0x1b and inp[1] != '[' and inp[1] != 'O') {
-                const cfg = &state.config;
-                const is_next = inp[1] == cfg.tabs.key_next or (cfg.tabs.key_next == '>' and inp[1] == '.');
-                const is_prev = inp[1] == cfg.tabs.key_prev or (cfg.tabs.key_prev == '<' and inp[1] == ',');
-                if (is_next or is_prev) {
-                    // Allow tab switch.
-                    if (handleAltKey(state, inp[1])) {
-                        return;
-                    }
+                if (keybinds.handleKeyEvent(state, 1, .{ .char = inp[1] }, .press, true, false)) {
+                    return;
                 }
             }
             // Block everything else - handle popup input.
@@ -192,6 +285,23 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
 
         var i: usize = 0;
         while (i < inp.len) {
+            // If some external layer injects CSI-u key events, translate them to
+            // mux binds / legacy bytes so Alt bindings keep working and no garbage
+            // is forwarded into the shell.
+            if (input_csi_u.parse(inp[i..])) |ev| {
+                if (ev.event_type != 3) {
+                    if (keybinds.handleKeyEvent(state, ev.mods, ev.key, .press, false, false)) {
+                        i += ev.consumed;
+                        continue;
+                    }
+                    var out: [8]u8 = undefined;
+                    if (input_csi_u.translateToLegacy(&out, ev)) |out_len| {
+                        keybinds.forwardInputToFocusedPane(state, out[0..out_len]);
+                    }
+                }
+                i += ev.consumed;
+                continue;
+            }
             // Mouse events (SGR): click-to-focus and status-bar tab switching.
             if (input.parseMouseEvent(inp[i..])) |ev| {
                 const raw = inp[i .. i + ev.consumed];
@@ -290,11 +400,24 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                 continue;
             }
 
-            // Check for Alt+key (ESC followed by key).
+            // No kitty keyboard protocol support.
             if (inp[i] == 0x1b and i + 1 < inp.len) {
                 const next = inp[i + 1];
                 // Check for CSI sequences (ESC [).
                 if (next == '[' and i + 2 < inp.len) {
+                    // If this looks like a kitty CSI-u key event and parsing didn't
+                    // handle it above, swallow it so it never leaks into the shell.
+                    // This is intentionally conservative: we only swallow sequences
+                    // that start like a CSI numeric parameter and end in 'u'.
+                    if (inp[i + 2] >= '0' and inp[i + 2] <= '9') {
+                        var j: usize = i + 2;
+                        const end = @min(inp.len, i + 64);
+                        while (j < end and inp[j] != 'u') : (j += 1) {}
+                        if (j < end and inp[j] == 'u') {
+                            i = j + 1;
+                            continue;
+                        }
+                    }
                     // Handle Alt+Arrow for directional navigation: ESC [ 1 ; 3 <dir>
                     if (handleAltArrow(state, inp[i..])) |consumed| {
                         i += consumed;
@@ -308,7 +431,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                 }
                 // Make sure it's not an actual escape sequence (like arrow keys).
                 if (next != '[' and next != 'O') {
-                    if (handleAltKey(state, next)) {
+                    if (keybinds.handleKeyEvent(state, 1, .{ .char = next }, .press, false, false)) {
                         i += 2;
                         continue;
                     }
@@ -345,7 +468,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                         fpane.scrollToBottom();
                         state.needs_render = true;
                     }
-                    fpane.write(inp[i..]) catch {};
+                    forwardSanitizedToFocusedPane(state, inp[i..]);
                 } else {
                     // Can't input to tab-bound float on wrong tab, forward to tiled pane.
                     if (state.currentLayout().getFocusedPane()) |pane| {
@@ -361,7 +484,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                             pane.scrollToBottom();
                             state.needs_render = true;
                         }
-                        pane.write(inp[i..]) catch {};
+                        forwardSanitizedToFocusedPane(state, inp[i..]);
                     }
                 }
             } else if (state.currentLayout().getFocusedPane()) |pane| {
@@ -377,7 +500,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                     pane.scrollToBottom();
                     state.needs_render = true;
                 }
-                pane.write(inp[i..]) catch {};
+                forwardSanitizedToFocusedPane(state, inp[i..]);
             }
             return;
         }
@@ -645,7 +768,7 @@ fn handleAltArrow(state: *State, inp: []const u8) ?usize {
     if (inp.len >= 6 and inp[0] == 0x1b and inp[1] == '[' and
         inp[2] == '1' and inp[3] == ';' and inp[4] == '3')
     {
-        const dir: ?layout_mod.Layout.Direction = switch (inp[5]) {
+        const key: ?core.Config.BindKey = switch (inp[5]) {
             'A' => .up,
             'B' => .down,
             'C' => .right,
@@ -653,39 +776,8 @@ fn handleAltArrow(state: *State, inp: []const u8) ?usize {
             else => null,
         };
 
-        if (dir) |d| {
-            const old_uuid = state.getCurrentFocusedUuid();
-
-            // Get cursor position from current pane for smarter direction targeting.
-            var cursor_x: u16 = 0;
-            var cursor_y: u16 = 0;
-            var have_cursor = false;
-            if (state.active_floating) |idx| {
-                const pos = state.floats.items[idx].getCursorPos();
-                cursor_x = pos.x;
-                cursor_y = pos.y;
-                have_cursor = true;
-            } else if (state.currentLayout().getFocusedPane()) |pane| {
-                const pos = pane.getCursorPos();
-                cursor_x = pos.x;
-                cursor_y = pos.y;
-                have_cursor = true;
-            }
-
-            const cursor: ?layout_mod.CursorPos = if (have_cursor) .{ .x = cursor_x, .y = cursor_y } else null;
-            if (focusDirectionAny(state, d, cursor)) |target| {
-                // Update focus to the selected target.
-                if (target.kind == .float) {
-                    state.active_floating = target.float_index;
-                } else {
-                    state.active_floating = null;
-                }
-                state.syncPaneFocus(target.pane, old_uuid);
-                state.renderer.invalidate();
-                state.force_full_render = true;
-            }
-
-            state.needs_render = true;
+        if (key) |k| {
+            _ = keybinds.handleKeyEvent(state, 1, k, .press, false, false);
             return 6;
         }
     }
@@ -760,241 +852,4 @@ fn handleScrollKeys(state: *State, inp: []const u8) ?usize {
     }
 
     return null;
-}
-
-fn handleAltKey(state: *State, key: u8) bool {
-    const cfg = &state.config;
-
-    if (key == cfg.key_quit) {
-        if (cfg.confirm_on_exit) {
-            state.pending_action = .exit;
-            state.popups.showConfirm("Exit mux?", .{}) catch {};
-            state.needs_render = true;
-        } else {
-            state.running = false;
-        }
-        return true;
-    }
-
-    // Disown pane - orphans current pane in ses, spawns new shell in same place.
-    if (key == cfg.key_disown) {
-        // Get the current pane (float or tiled).
-        const current_pane: ?*Pane = if (state.active_floating) |idx|
-            state.floats.items[idx]
-        else
-            state.currentLayout().getFocusedPane();
-
-        // Block disown for sticky floats only.
-        if (current_pane) |p| {
-            if (p.sticky) {
-                state.notifications.show("Cannot disown sticky float");
-                state.needs_render = true;
-                return true;
-            }
-        }
-
-        if (cfg.confirm_on_disown) {
-            state.pending_action = .disown;
-            state.popups.showConfirm("Disown pane?", .{}) catch {};
-            state.needs_render = true;
-        } else {
-            actions.performDisown(state);
-        }
-        return true;
-    }
-
-    // Adopt orphaned pane - interactive flow with picker and confirm.
-    if (key == cfg.key_adopt) {
-        actions.startAdoptFlow(state);
-        return true;
-    }
-
-    // Split keys.
-    const split_h_key = cfg.splits.key_split_h;
-    const split_v_key = cfg.splits.key_split_v;
-
-    if (key == split_h_key) {
-        const parent_uuid = state.getCurrentFocusedUuid();
-        // Refresh CWD from ses for pod panes before splitting.
-        const cwd = if (state.currentLayout().getFocusedPane()) |p| state.refreshPaneCwd(p) else null;
-        if (state.currentLayout().splitFocused(.horizontal, cwd) catch null) |new_pane| {
-            state.syncPaneAux(new_pane, parent_uuid);
-        }
-        state.needs_render = true;
-        state.syncStateToSes();
-        return true;
-    }
-
-    if (key == split_v_key) {
-        const parent_uuid = state.getCurrentFocusedUuid();
-        // Refresh CWD from ses for pod panes before splitting.
-        const cwd = if (state.currentLayout().getFocusedPane()) |p| state.refreshPaneCwd(p) else null;
-        if (state.currentLayout().splitFocused(.vertical, cwd) catch null) |new_pane| {
-            state.syncPaneAux(new_pane, parent_uuid);
-        }
-        state.needs_render = true;
-        state.syncStateToSes();
-        return true;
-    }
-
-    // Alt+t = new tab.
-    if (key == cfg.tabs.key_new) {
-        state.active_floating = null;
-        state.createTab() catch {};
-        state.needs_render = true;
-        return true;
-    }
-
-    // Alt+n = next tab (also support Alt+. as fallback for Alt+>).
-    if (key == cfg.tabs.key_next or (cfg.tabs.key_next == '>' and key == '.')) {
-        const old_uuid = state.getCurrentFocusedUuid();
-        if (state.active_floating) |idx| {
-            if (idx < state.floats.items.len) {
-                const fp = state.floats.items[idx];
-                // Always clear float focus when switching tabs.
-                state.syncPaneUnfocus(fp);
-                state.active_floating = null;
-            }
-        } else if (state.currentLayout().getFocusedPane()) |old_pane| {
-            state.syncPaneUnfocus(old_pane);
-        }
-        state.nextTab();
-
-        // Restore last focused float for this tab if the tab's last focus was a float.
-        if (state.tab_last_focus_kind.items.len > state.active_tab and state.tab_last_focus_kind.items[state.active_tab] == .float) {
-            if (state.tab_last_floating_uuid.items.len > state.active_tab) {
-                if (state.tab_last_floating_uuid.items[state.active_tab]) |uuid| {
-                    for (state.floats.items, 0..) |pane, fi| {
-                        if (!std.mem.eql(u8, &pane.uuid, &uuid)) continue;
-                        if (!pane.isVisibleOnTab(state.active_tab)) continue;
-                        if (pane.parent_tab) |parent| {
-                            if (parent != state.active_tab) continue;
-                        }
-                        state.active_floating = fi;
-                        state.syncPaneFocus(pane, old_uuid);
-                        state.needs_render = true;
-                        return true;
-                    }
-                }
-            }
-        }
-
-        if (state.currentLayout().getFocusedPane()) |new_pane| {
-            state.syncPaneFocus(new_pane, old_uuid);
-        }
-        state.needs_render = true;
-        return true;
-    }
-
-    // Alt+p = previous tab (also support Alt+, as fallback for Alt+<).
-    if (key == cfg.tabs.key_prev or (cfg.tabs.key_prev == '<' and key == ',')) {
-        const old_uuid = state.getCurrentFocusedUuid();
-        if (state.active_floating) |idx| {
-            if (idx < state.floats.items.len) {
-                const fp = state.floats.items[idx];
-                // Always clear float focus when switching tabs.
-                state.syncPaneUnfocus(fp);
-                state.active_floating = null;
-            }
-        } else if (state.currentLayout().getFocusedPane()) |old_pane| {
-            state.syncPaneUnfocus(old_pane);
-        }
-        state.prevTab();
-
-        // Restore last focused float for this tab if the tab's last focus was a float.
-        if (state.tab_last_focus_kind.items.len > state.active_tab and state.tab_last_focus_kind.items[state.active_tab] == .float) {
-            if (state.tab_last_floating_uuid.items.len > state.active_tab) {
-                if (state.tab_last_floating_uuid.items[state.active_tab]) |uuid| {
-                    for (state.floats.items, 0..) |pane, fi| {
-                        if (!std.mem.eql(u8, &pane.uuid, &uuid)) continue;
-                        if (!pane.isVisibleOnTab(state.active_tab)) continue;
-                        if (pane.parent_tab) |parent| {
-                            if (parent != state.active_tab) continue;
-                        }
-                        state.active_floating = fi;
-                        state.syncPaneFocus(pane, old_uuid);
-                        state.needs_render = true;
-                        return true;
-                    }
-                }
-            }
-        }
-
-        if (state.currentLayout().getFocusedPane()) |new_pane| {
-            state.syncPaneFocus(new_pane, old_uuid);
-        }
-        state.needs_render = true;
-        return true;
-    }
-
-    // Alt+x (configurable) = close current float/tab (or quit if last tab).
-    if (key == cfg.tabs.key_close) {
-        if (cfg.confirm_on_close) {
-            state.pending_action = .close;
-            const msg = if (state.active_floating != null) "Close float?" else "Close tab?";
-            state.popups.showConfirm(msg, .{}) catch {};
-            state.needs_render = true;
-        } else {
-            actions.performClose(state);
-        }
-        return true;
-    }
-
-    // Alt+d = detach whole mux - keeps all panes alive in ses for --attach.
-    if (key == cfg.tabs.key_detach) {
-        if (cfg.confirm_on_detach) {
-            state.pending_action = .detach;
-            state.popups.showConfirm("Detach session?", .{}) catch {};
-            state.needs_render = true;
-            return true;
-        }
-        actions.performDetach(state);
-        return true;
-    }
-
-    // Alt+space - toggle floating focus (always space).
-    if (key == ' ') {
-        if (state.floats.items.len > 0) {
-            const old_uuid = state.getCurrentFocusedUuid();
-            if (state.active_floating) |idx| {
-                if (idx < state.floats.items.len) {
-                    state.syncPaneUnfocus(state.floats.items[idx]);
-                }
-                state.active_floating = null;
-                if (state.currentLayout().getFocusedPane()) |new_pane| {
-                    state.syncPaneFocus(new_pane, old_uuid);
-                }
-            } else {
-                // Find first float valid for current tab.
-                var first_valid: ?usize = null;
-                for (state.floats.items, 0..) |fp, fi| {
-                    // Skip tab-bound floats on wrong tab.
-                    if (fp.parent_tab) |parent| {
-                        if (parent != state.active_tab) continue;
-                    }
-                    first_valid = fi;
-                    break;
-                }
-
-                if (first_valid) |valid_idx| {
-                    if (state.currentLayout().getFocusedPane()) |old_pane| {
-                        state.syncPaneUnfocus(old_pane);
-                    }
-                    state.active_floating = valid_idx;
-                    state.syncPaneFocus(state.floats.items[valid_idx], old_uuid);
-                }
-            }
-            state.needs_render = true;
-        }
-        return true;
-    }
-
-    // Check for named float keys from config.
-    if (cfg.getFloatByKey(key)) |float_def| {
-        actions.toggleNamedFloat(state, float_def);
-        state.needs_render = true;
-        return true;
-    }
-
-    return false;
 }

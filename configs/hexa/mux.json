@@ -1,8 +1,33 @@
 {
-  "keys": {
-    "quit": "q",
-    "disown": "z",
-    "adopt": "a"
+  "input": {
+    "timing": { "hold_ms": 400, "double_tap_ms": 250 },
+    "binds": [
+      { "mods": ["alt"], "key": "q", "context": {"focus": "any"}, "action": {"type": "mux.quit"} },
+      { "mods": ["alt", "shift"], "key": "d", "context": {"focus": "any"}, "action": {"type": "mux.detach"} },
+
+      { "mods": ["alt"], "key": "z", "context": {"focus": "any"}, "action": {"type": "pane.disown"} },
+      { "mods": ["alt"], "key": "a", "context": {"focus": "any"}, "action": {"type": "pane.adopt"} },
+
+      { "mods": ["alt"], "key": "h", "context": {"focus": "split"}, "action": {"type": "split.h"} },
+      { "mods": ["alt"], "key": "v", "context": {"focus": "split"}, "action": {"type": "split.v"} },
+
+      { "mods": ["alt"], "key": "t", "context": {"focus": "any"}, "action": {"type": "tab.new"} },
+      { "mods": ["alt"], "key": ".", "context": {"focus": "any"}, "action": {"type": "tab.next"} },
+      { "mods": ["alt"], "key": ",", "context": {"focus": "any"}, "action": {"type": "tab.prev"} },
+      { "mods": ["alt"], "key": "x", "context": {"focus": "any"}, "action": {"type": "tab.close"} },
+
+      { "mods": ["alt"], "key": "up", "context": {"focus": "any"}, "action": {"type": "focus.move", "dir": "up"} },
+      { "mods": ["alt"], "key": "down", "context": {"focus": "any"}, "action": {"type": "focus.move", "dir": "down"} },
+      { "mods": ["alt"], "key": "left", "context": {"focus": "any"}, "action": {"type": "focus.move", "dir": "left"} },
+      { "mods": ["alt"], "key": "right", "context": {"focus": "any"}, "action": {"type": "focus.move", "dir": "right"} },
+
+      { "mods": ["alt", "shift"], "key": "k", "context": {"focus": "float"}, "action": {"type": "float.nudge", "dir": "up"} },
+      { "mods": ["alt", "shift"], "key": "j", "context": {"focus": "float"}, "action": {"type": "float.nudge", "dir": "down"} },
+      { "mods": ["alt", "shift"], "key": "h", "context": {"focus": "float"}, "action": {"type": "float.nudge", "dir": "left"} },
+      { "mods": ["alt", "shift"], "key": "l", "context": {"focus": "float"}, "action": {"type": "float.nudge", "dir": "right"} },
+
+      { "mods": ["alt"], "key": "space", "context": {"focus": "any"}, "action": {"type": "float.toggle", "float": "0"} }
+    ]
   },
 
   "confirm_on_exit": true,
@@ -12,11 +37,17 @@
 
   "floats": [
     {
-      "padding_x": 2,
-      "padding_y": 1,
-      "color": {
-        "active": 1,
-        "passive": 237
+      "padding": {
+        "x": 2,
+        "y": 1
+      },
+      "style": {
+        "border": {
+          "color": {
+            "active": 1,
+            "passive": 237
+          }
+        }
       }
     },
     {
@@ -31,12 +62,9 @@
     },
     {
       "key": "3",
-      "pos_x": 100,
-      "pos_y": 0,
-      "width": 40,
-      "height": 50,
-      "padding_x": 0,
-      "padding_y": 0,
+      "position": { "x": 100, "y": 0 },
+      "size": { "width": 40, "height": 50 },
+      "padding": { "x": 0, "y": 0 },
       "attributes": {
         "global": false
       }
@@ -50,26 +78,24 @@
     {
       "key": "f",
       "command": "btop",
+      "title": "btop",
       "attributes": {
         "exclusive": true
       },
       "style": {
-        "position": "topright",
-        "name": "time",
-        "outputs": [
-          { "style": "bg:0 fg:1", "format": "[" },
-          { "style": "bg:237 fg:250", "format": " $output " },
-          { "style": "bg:0 fg:1", "format": "]" }
-        ]
+        "title": {
+          "position": "topright",
+          "outputs": [
+            { "style": "bg:0 fg:1", "format": "[" },
+            { "style": "bg:237 fg:250", "format": " $output " },
+            { "style": "bg:0 fg:1", "format": "]" }
+          ]
+        }
       }
     }
   ],
 
   "splits": {
-    "keys": {
-      "split_h": "h",
-      "split_v": "v"
-    },
     "color": {
       "active": 1,
       "passive": 237
@@ -79,13 +105,6 @@
   },
 
   "tabs": {
-    "keys": {
-      "new": "t",
-      "next": ".",
-      "prev": ",",
-      "close": "x",
-      "detach": "d"
-    },
     "status": {
       "enabled": true,
 

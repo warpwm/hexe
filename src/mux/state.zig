@@ -24,6 +24,10 @@ const NotificationManager = notification.NotificationManager;
 
 const Pane = @import("pane.zig").Pane;
 
+const BindKey = core.Config.BindKey;
+const BindAction = core.Config.BindAction;
+const FocusContext = core.Config.FocusContext;
+
 const state_tabs = @import("state_tabs.zig");
 const state_serialize = @import("state_serialize.zig");
 const state_sync = @import("state_sync.zig");
@@ -95,10 +99,20 @@ pub const State = struct {
     osc_reply_in_progress: bool,
     osc_reply_prev_esc: bool,
 
+    // Stdin input can arrive split across reads. When using escape-sequence based
+    // encodings (CSI-u, mouse events, etc) we must not forward partial sequences
+    // into the focused pane. Keep a small tail buffer to stitch reads.
+    stdin_tail: [256]u8 = undefined,
+    stdin_tail_len: u8 = 0,
+
     pending_float_requests: std.AutoHashMap([32]u8, PendingFloatRequest),
 
     /// Shell-provided metadata (last command, status, duration) keyed by pane UUID.
     pane_shell: std.AutoHashMap([32]u8, PaneShellInfo),
+
+    // Keybinding timers (hold/double-tap delayed press)
+    key_timers: std.ArrayList(PendingKeyTimer),
+
 
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16, debug: bool, log_file: ?[]const u8) !State {
         const cfg = core.Config.load(allocator);
@@ -161,6 +175,8 @@ pub const State = struct {
             .pending_float_requests = std.AutoHashMap([32]u8, PendingFloatRequest).init(allocator),
 
             .pane_shell = std.AutoHashMap([32]u8, PaneShellInfo).init(allocator),
+
+            .key_timers = .empty,
         };
     }
 
@@ -191,6 +207,8 @@ pub const State = struct {
             }
             self.pane_shell.deinit();
         }
+
+        self.key_timers.deinit(self.allocator);
 
         // Deinit floats.
         for (self.floats.items) |pane| {
@@ -246,6 +264,30 @@ pub const State = struct {
         if (self.session_name_owned) |owned| {
             self.allocator.free(owned);
         }
+    }
+
+    pub const PendingKeyTimerKind = enum { delayed_press, tap_pending, hold, hold_fired, repeat_wait, repeat_active, double_tap_wait };
+
+    pub const PendingKeyTimer = struct {
+        kind: PendingKeyTimerKind,
+        deadline_ms: i64,
+        mods: u8,
+        key: BindKey,
+        action: BindAction,
+        focus_ctx: FocusContext,
+    };
+
+    pub fn nextKeyTimerDeadlineMs(self: *const State, now_ms: i64) ?i64 {
+        var next: ?i64 = null;
+        for (self.key_timers.items) |t| {
+            if (t.kind == .hold_fired) continue;
+            if (t.kind == .repeat_wait or t.kind == .repeat_active) continue;
+            if (t.kind == .tap_pending) continue;
+            if (t.deadline_ms <= now_ms) return now_ms;
+            const d = t.deadline_ms;
+            if (next == null or d < next.?) next = d;
+        }
+        return next;
     }
 
     pub fn currentLayout(self: *State) *Layout {

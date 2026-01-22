@@ -200,6 +200,42 @@ pub fn drawFloatingBorder(
     border_color: core.BorderColor,
     style: ?*const core.FloatStyle,
 ) void {
+    // Optional shadow (draw first so border overlays it)
+    if (style) |s| {
+        if (s.shadow_color) |sc| {
+            const shadow_bg: render.Color = .{ .palette = sc };
+            const shadow_fg: render.Color = .{ .palette = sc };
+            const sx: u16 = x + w;
+            const sy: u16 = y + h;
+
+            // Right shadow: start 1 row below the top border, and stop 1 row
+            // above the bottom border so the corner is "owned" by the bottom
+            // shadow.
+            if (h > 2) {
+                var row: u16 = 1;
+                while (row < h - 1) : (row += 1) {
+                    renderer.setCell(sx, y + row, .{ .char = ' ', .bg = shadow_bg });
+                }
+            }
+
+            // Add a small "cap" next to the bottom border so there is no
+            // visible gap between the side shadow and the bottom shadow.
+            if (h > 1) {
+                renderer.setCell(sx, y + h - 1, .{ .char = ' ', .bg = shadow_bg });
+            }
+
+            // Bottom shadow: start 1 col after left border, and include the
+            // corner cell (so it extends one further than the right shadow).
+            var col: u16 = 1;
+            while (col <= w) : (col += 1) {
+                // Use upper-half block for bottom shadow so it feels visually
+                // closer in "weight" to the 1-col side shadow.
+                renderer.setCell(x + col, sy, .{ .char = 0x2580, .fg = shadow_fg });
+            }
+            // Corner is already drawn by the bottom shadow (col == w).
+        }
+    }
+
     const color = if (active) border_color.active else border_color.passive;
     const fg: render.Color = .{ .palette = color };
     // Do not rely on SGR bold for active borders.

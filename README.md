@@ -63,6 +63,12 @@ This is the foundation for:
   - Picker/choose dialogs
   - Pane-level and mux-level notifications
 
+### Keybindings
+
+Keybindings are configured in `mux.json`.
+
+See `docs/keybindings.md`.
+
 ### Floats
 
 Floats are overlay panes that appear on top of your splits. They are toggled via `Alt+<key>` bindings and support several powerful behaviors.
