@@ -285,6 +285,29 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
             }
 
             // Check for Alt+key (ESC followed by key).
+            // Kitty keyboard protocol may encode Alt+<key> as CSI ... u instead.
+            if (parseKittyKeyEvent(inp[i..])) |ke| {
+                // Ignore release events for now (consume, don't forward).
+                if (ke.event_type == 3) {
+                    i += ke.consumed;
+                    continue;
+                }
+
+                if (dispatchKey(state, ke.mods, ke.key, false)) {
+                    i += ke.consumed;
+                    continue;
+                }
+
+                // Not a mux bind: translate to legacy bytes and forward to focused pane.
+                var out: [8]u8 = undefined;
+                const out_len = translateKittyToLegacy(&out, ke) orelse 0;
+                if (out_len > 0) {
+                    forwardInputToFocusedPane(state, out[0..out_len]);
+                    i += ke.consumed;
+                    continue;
+                }
+                // If we can't translate, let it fall through (some apps may support CSI-u).
+            }
             if (inp[i] == 0x1b and i + 1 < inp.len) {
                 const next = inp[i + 1];
                 // Check for CSI sequences (ESC [).
@@ -965,5 +988,170 @@ fn dispatchAction(state: *State, action: core.Config.BindAction) bool {
             }
             return false;
         },
+    }
+}
+
+const KittyKeyEvent = struct {
+    consumed: usize,
+    mods: u8,
+    key: core.Config.BindKey,
+    event_type: u8,
+};
+
+// Parse kitty keyboard protocol (CSI ... u) key events.
+// We only use it for shortcuts, so we accept a small subset:
+// - key codepoint for ASCII keys
+// - modifiers encoded using xterm-style modifyOtherKeys mapping (mod-1 bitmask)
+// - optional event type (press/repeat/release); repeat treated as press, release ignored
+fn parseKittyKeyEvent(inp: []const u8) ?KittyKeyEvent {
+    if (inp.len < 4) return null;
+    if (inp[0] != 0x1b or inp[1] != '[') return null;
+
+    var idx: usize = 2;
+    var keycode: u32 = 0;
+    var have_digit = false;
+    while (idx < inp.len) : (idx += 1) {
+        const ch = inp[idx];
+        if (ch >= '0' and ch <= '9') {
+            have_digit = true;
+            keycode = keycode * 10 + @as(u32, ch - '0');
+            continue;
+        }
+        break;
+    }
+    if (!have_digit) return null;
+    if (idx >= inp.len) return null;
+
+    var mod_val: u32 = 1;
+    var event_type: u32 = 1;
+
+    if (inp[idx] == 'u') {
+        idx += 1;
+    } else if (inp[idx] == ';') {
+        idx += 1;
+
+        // Parse modifier and optional event type (mod[:event]).
+        var mv: u32 = 0;
+        var have_mv = false;
+        while (idx < inp.len) : (idx += 1) {
+            const ch = inp[idx];
+            if (ch >= '0' and ch <= '9') {
+                have_mv = true;
+                mv = mv * 10 + @as(u32, ch - '0');
+                continue;
+            }
+            break;
+        }
+        if (have_mv) mod_val = mv;
+
+        if (idx < inp.len and inp[idx] == ':') {
+            idx += 1;
+            var ev: u32 = 0;
+            var have_ev = false;
+            while (idx < inp.len) : (idx += 1) {
+                const ch = inp[idx];
+                if (ch >= '0' and ch <= '9') {
+                    have_ev = true;
+                    ev = ev * 10 + @as(u32, ch - '0');
+                    continue;
+                }
+                break;
+            }
+            if (have_ev) event_type = ev;
+        }
+
+        if (idx >= inp.len or inp[idx] != 'u') return null;
+        idx += 1;
+    } else {
+        return null;
+    }
+
+    const et: u8 = @intCast(@min(255, event_type));
+
+    // Map modifiers: xterm-style mask is (mod-1): shift=1, alt=2, ctrl=4, super=8
+    const xmask: u32 = if (mod_val > 0) mod_val - 1 else 0;
+    var mods: u8 = 0;
+    if ((xmask & 2) != 0) mods |= 1; // alt
+    if ((xmask & 4) != 0) mods |= 2; // ctrl
+    if ((xmask & 1) != 0) mods |= 4; // shift
+    if ((xmask & 8) != 0) mods |= 8; // super
+
+    const key: core.Config.BindKey = blk: {
+        if (keycode == 32) break :blk .space;
+        if (keycode <= 0x7f) break :blk .{ .char = @intCast(keycode) };
+        // Not supported in our v1 bind key model.
+        return null;
+    };
+
+    return .{ .consumed = idx, .mods = mods, .key = key, .event_type = et };
+}
+
+fn translateKittyToLegacy(out: *[8]u8, ev: KittyKeyEvent) ?usize {
+    // Only supports char + space for now.
+    var ch: u8 = switch (@as(core.Config.BindKeyKind, ev.key)) {
+        .space => ' ',
+        .char => ev.key.char,
+        else => return null,
+    };
+
+    // Apply shift for ASCII letters (best effort).
+    if ((ev.mods & 4) != 0) {
+        if (ch >= 'a' and ch <= 'z') ch = ch - 'a' + 'A';
+    }
+
+    // Apply ctrl mapping for ASCII letters.
+    if ((ev.mods & 2) != 0) {
+        if (ch >= 'a' and ch <= 'z') {
+            ch = ch - 'a' + 1;
+        } else if (ch >= 'A' and ch <= 'Z') {
+            ch = ch - 'A' + 1;
+        }
+    }
+
+    var n: usize = 0;
+    if ((ev.mods & 1) != 0) {
+        out[n] = 0x1b;
+        n += 1;
+    }
+    out[n] = ch;
+    n += 1;
+    return n;
+}
+
+fn forwardInputToFocusedPane(state: *State, bytes: []const u8) void {
+    // Mirror the forwarding logic in handleInput() for normal input.
+    if (state.active_floating) |idx| {
+        const fpane = state.floats.items[idx];
+        const can_interact = if (fpane.parent_tab) |parent| parent == state.active_tab else true;
+        if (fpane.isVisibleOnTab(state.active_tab) and can_interact) {
+            if (fpane.popups.isBlocked()) {
+                if (input.handlePopupInput(&fpane.popups, bytes)) {
+                    loop_ipc.sendPopResponse(state);
+                }
+                state.needs_render = true;
+                return;
+            }
+            if (fpane.isScrolled()) {
+                fpane.scrollToBottom();
+                state.needs_render = true;
+            }
+            fpane.write(bytes) catch {};
+            return;
+        }
+    }
+
+    if (state.currentLayout().getFocusedPane()) |pane| {
+        if (pane.popups.isBlocked()) {
+            if (input.handlePopupInput(&pane.popups, bytes)) {
+                loop_ipc.sendPopResponse(state);
+            }
+            state.needs_render = true;
+            return;
+        }
+        if (pane.isScrolled()) {
+            pane.scrollToBottom();
+            state.needs_render = true;
+        }
+        pane.write(bytes) catch {};
     }
 }

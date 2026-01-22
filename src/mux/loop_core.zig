@@ -19,8 +19,11 @@ pub fn runMainLoop(state: *State) !void {
 
     // Enter alternate screen and reset it.
     const stdout = std.fs.File.stdout();
-    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1006h");
-    defer stdout.writeAll("\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
+    // Enable kitty keyboard protocol (progressive enhancement flag 1) when supported.
+    // Terminals that don't support it will ignore this.
+    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[>1u");
+    // Disable kitty keyboard protocol on exit.
+    defer stdout.writeAll("\x1b[<u\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
 
     // Build poll fds.
     var poll_fds: [17]posix.pollfd = undefined; // stdin + up to 16 panes
