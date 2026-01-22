@@ -1,0 +1,984 @@
+const std = @import("std");
+const core = @import("core");
+
+const layout_mod = @import("layout.zig");
+
+const State = @import("state.zig").State;
+const Pane = @import("pane.zig").Pane;
+
+const input = @import("input.zig");
+const loop_ipc = @import("loop_ipc.zig");
+const actions = @import("loop_actions.zig");
+
+pub const BindWhen = core.Config.BindWhen;
+pub const BindKey = core.Config.BindKey;
+pub const BindKeyKind = core.Config.BindKeyKind;
+pub const BindAction = core.Config.BindAction;
+pub const FocusContext = core.Config.FocusContext;
+
+pub const KittyKeyEvent = struct {
+    consumed: usize,
+    mods: u8,
+    key: BindKey,
+    event_type: u8, // 1 press, 2 repeat, 3 release
+};
+
+pub fn bindWhenFromKittyEventType(et: u8) ?BindWhen {
+    return switch (et) {
+        1 => .press,
+        2 => .repeat,
+        3 => .release,
+        else => null,
+    };
+}
+
+// Parse kitty keyboard protocol legacy functional key encoding for arrow keys:
+//   ESC [ 1 ; <mod> [:<event>] <A|B|C|D>
+// Used by some terminals when the kitty protocol is enabled.
+pub fn parseKittyLegacyArrowEvent(inp: []const u8) ?KittyKeyEvent {
+    if (inp.len < 6) return null;
+    if (inp[0] != 0x1b or inp[1] != '[') return null;
+    if (inp[2] != '1' or inp[3] != ';') return null;
+
+    var idx: usize = 4;
+    var mod_val: u32 = 0;
+    var have_mod = false;
+    while (idx < inp.len) : (idx += 1) {
+        const ch = inp[idx];
+        if (ch >= '0' and ch <= '9') {
+            have_mod = true;
+            mod_val = mod_val * 10 + @as(u32, ch - '0');
+            continue;
+        }
+        break;
+    }
+    if (!have_mod) return null;
+    if (idx >= inp.len) return null;
+
+    var event_type: u32 = 1;
+    if (inp[idx] == ':') {
+        idx += 1;
+        var ev: u32 = 0;
+        var have_ev = false;
+        while (idx < inp.len) : (idx += 1) {
+            const ch = inp[idx];
+            if (ch >= '0' and ch <= '9') {
+                have_ev = true;
+                ev = ev * 10 + @as(u32, ch - '0');
+                continue;
+            }
+            break;
+        }
+        if (have_ev) event_type = ev;
+        if (idx >= inp.len) return null;
+    }
+
+    const final = inp[idx];
+    const key: BindKey = switch (final) {
+        'A' => .up,
+        'B' => .down,
+        'C' => .right,
+        'D' => .left,
+        else => return null,
+    };
+
+    // Map modifiers: xterm-style mask is (mod-1): shift=1, alt=2, ctrl=4, super=8
+    const xmask: u32 = if (mod_val > 0) mod_val - 1 else 0;
+    var mods: u8 = 0;
+    if ((xmask & 2) != 0) mods |= 1; // alt
+    if ((xmask & 4) != 0) mods |= 2; // ctrl
+    if ((xmask & 1) != 0) mods |= 4; // shift
+    if ((xmask & 8) != 0) mods |= 8; // super
+
+    return .{
+        .consumed = idx + 1,
+        .mods = mods,
+        .key = key,
+        .event_type = @intCast(@min(255, event_type)),
+    };
+}
+
+pub fn translateArrowToLegacy(out: *[16]u8, mods: u8, key: BindKey) ?usize {
+    const final: u8 = switch (@as(BindKeyKind, key)) {
+        .up => 'A',
+        .down => 'B',
+        .right => 'C',
+        .left => 'D',
+        else => return null,
+    };
+
+    var xmask: u8 = 0;
+    if ((mods & 4) != 0) xmask |= 1; // shift
+    if ((mods & 1) != 0) xmask |= 2; // alt
+    if ((mods & 2) != 0) xmask |= 4; // ctrl
+    if ((mods & 8) != 0) xmask |= 8; // super
+    const mod_val: u8 = xmask + 1;
+
+    var n: usize = 0;
+    out[n] = 0x1b;
+    n += 1;
+    out[n] = '[';
+    n += 1;
+
+    if (mod_val == 1) {
+        out[n] = final;
+        n += 1;
+        return n;
+    }
+
+    // ESC [ 1 ; <mod> <final>
+    out[n] = '1';
+    n += 1;
+    out[n] = ';';
+    n += 1;
+    // mod is 1..16, print as decimal
+    if (mod_val >= 10) {
+        out[n] = '1';
+        n += 1;
+        out[n] = '0' + (mod_val - 10);
+        n += 1;
+    } else {
+        out[n] = '0' + mod_val;
+        n += 1;
+    }
+    out[n] = final;
+    n += 1;
+    return n;
+}
+
+// Parse kitty keyboard protocol (CSI ... u) key events.
+// Minimal subset for Hexe:
+// - key codepoint (ASCII)
+// - modifier value (xterm style mod-1 mask)
+// - optional event type (:1 press, :2 repeat, :3 release)
+pub fn parseKittyKeyEvent(inp: []const u8) ?KittyKeyEvent {
+    if (inp.len < 4) return null;
+    if (inp[0] != 0x1b or inp[1] != '[') return null;
+
+    var idx: usize = 2;
+    var keycode: u32 = 0;
+    var have_digit = false;
+    while (idx < inp.len) : (idx += 1) {
+        const ch = inp[idx];
+        if (ch >= '0' and ch <= '9') {
+            have_digit = true;
+            keycode = keycode * 10 + @as(u32, ch - '0');
+            continue;
+        }
+        break;
+    }
+    if (!have_digit) return null;
+    if (idx >= inp.len) return null;
+
+    var mod_val: u32 = 1;
+    var event_type: u32 = 1;
+
+    if (inp[idx] == 'u') {
+        idx += 1;
+    } else if (inp[idx] == ';') {
+        idx += 1;
+
+        var mv: u32 = 0;
+        var have_mv = false;
+        while (idx < inp.len) : (idx += 1) {
+            const ch = inp[idx];
+            if (ch >= '0' and ch <= '9') {
+                have_mv = true;
+                mv = mv * 10 + @as(u32, ch - '0');
+                continue;
+            }
+            break;
+        }
+        if (have_mv) mod_val = mv;
+
+        if (idx < inp.len and inp[idx] == ':') {
+            idx += 1;
+            var ev: u32 = 0;
+            var have_ev = false;
+            while (idx < inp.len) : (idx += 1) {
+                const ch = inp[idx];
+                if (ch >= '0' and ch <= '9') {
+                    have_ev = true;
+                    ev = ev * 10 + @as(u32, ch - '0');
+                    continue;
+                }
+                break;
+            }
+            if (have_ev) event_type = ev;
+        }
+
+        if (idx >= inp.len or inp[idx] != 'u') return null;
+        idx += 1;
+    } else {
+        return null;
+    }
+
+    // Map modifiers: xterm-style mask is (mod-1): shift=1, alt=2, ctrl=4, super=8
+    const xmask: u32 = if (mod_val > 0) mod_val - 1 else 0;
+    var mods: u8 = 0;
+    if ((xmask & 2) != 0) mods |= 1; // alt
+    if ((xmask & 4) != 0) mods |= 2; // ctrl
+    if ((xmask & 1) != 0) mods |= 4; // shift
+    if ((xmask & 8) != 0) mods |= 8; // super
+
+    const key: BindKey = blk: {
+        if (keycode == 32) break :blk .space;
+        if (keycode <= 0x7f) break :blk .{ .char = @intCast(keycode) };
+        return null;
+    };
+
+    return .{ .consumed = idx, .mods = mods, .key = key, .event_type = @intCast(@min(255, event_type)) };
+}
+
+pub fn translateKittyToLegacy(out: *[8]u8, ev: KittyKeyEvent) ?usize {
+    // Only supports char + space for now.
+    var ch: u8 = switch (@as(BindKeyKind, ev.key)) {
+        .space => ' ',
+        .char => ev.key.char,
+        else => return null,
+    };
+
+    // Apply shift for ASCII letters (best effort).
+    if ((ev.mods & 4) != 0) {
+        if (ch >= 'a' and ch <= 'z') ch = ch - 'a' + 'A';
+    }
+
+    // Apply ctrl mapping for ASCII letters.
+    if ((ev.mods & 2) != 0) {
+        if (ch >= 'a' and ch <= 'z') {
+            ch = ch - 'a' + 1;
+        } else if (ch >= 'A' and ch <= 'Z') {
+            ch = ch - 'A' + 1;
+        }
+    }
+
+    var n: usize = 0;
+    if ((ev.mods & 1) != 0) {
+        out[n] = 0x1b;
+        n += 1;
+    }
+    out[n] = ch;
+    n += 1;
+    return n;
+}
+
+pub fn forwardInputToFocusedPane(state: *State, bytes: []const u8) void {
+    if (state.active_floating) |idx| {
+        const fpane = state.floats.items[idx];
+        const can_interact = if (fpane.parent_tab) |parent| parent == state.active_tab else true;
+        if (fpane.isVisibleOnTab(state.active_tab) and can_interact) {
+            if (fpane.popups.isBlocked()) {
+                if (input.handlePopupInput(&fpane.popups, bytes)) {
+                    loop_ipc.sendPopResponse(state);
+                }
+                state.needs_render = true;
+                return;
+            }
+            if (fpane.isScrolled()) {
+                fpane.scrollToBottom();
+                state.needs_render = true;
+            }
+            fpane.write(bytes) catch {};
+            return;
+        }
+    }
+
+    if (state.currentLayout().getFocusedPane()) |pane| {
+        if (pane.popups.isBlocked()) {
+            if (input.handlePopupInput(&pane.popups, bytes)) {
+                loop_ipc.sendPopResponse(state);
+            }
+            state.needs_render = true;
+            return;
+        }
+        if (pane.isScrolled()) {
+            pane.scrollToBottom();
+            state.needs_render = true;
+        }
+        pane.write(bytes) catch {};
+    }
+}
+
+fn currentFocusContext(state: *State) FocusContext {
+    return if (state.active_floating != null) .float else .split;
+}
+
+fn keyEq(a: BindKey, b: BindKey) bool {
+    if (@as(BindKeyKind, a) != @as(BindKeyKind, b)) return false;
+    if (@as(BindKeyKind, a) == .char) return a.char == b.char;
+    return true;
+}
+
+fn findBestBind(state: *State, mods: u8, key: BindKey, when: BindWhen, allow_only_tabs: bool, focus_ctx: FocusContext) ?core.Config.Bind {
+    const cfg = &state.config;
+
+    var best: ?core.Config.Bind = null;
+    var best_score: u8 = 0;
+
+    for (cfg.input.binds) |b| {
+        if (b.when != when) continue;
+        if (b.mods != mods) continue;
+        if (!keyEq(b.key, key)) continue;
+        if (b.context.focus != .any and b.context.focus != focus_ctx) continue;
+
+        if (allow_only_tabs) {
+            if (b.action != .tab_next and b.action != .tab_prev) continue;
+        }
+
+        var score: u8 = 0;
+        if (b.context.focus != .any) score += 1;
+        if (b.hold_ms != null) score += 1;
+        if (b.double_tap_ms != null) score += 1;
+
+        if (best == null or score > best_score or score == best_score) {
+            best = b;
+            best_score = score;
+        }
+    }
+
+    return best;
+}
+
+fn hasBind(state: *State, mods: u8, key: BindKey, when: BindWhen, focus_ctx: FocusContext) bool {
+    const cfg = &state.config;
+    for (cfg.input.binds) |b| {
+        if (b.when != when) continue;
+        if (b.mods != mods) continue;
+        if (!keyEq(b.key, key)) continue;
+        if (b.context.focus != .any and b.context.focus != focus_ctx) continue;
+        return true;
+    }
+    return false;
+}
+
+fn cancelTimer(state: *State, kind: State.PendingKeyTimerKind, mods: u8, key: BindKey) void {
+    var i: usize = 0;
+    while (i < state.key_timers.items.len) {
+        const t = state.key_timers.items[i];
+        if (t.kind == kind and t.mods == mods and keyEq(t.key, key)) {
+            _ = state.key_timers.orderedRemove(i);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn forwardKeyAsLegacy(state: *State, mods: u8, key: BindKey) void {
+    const ev: KittyKeyEvent = .{ .consumed = 0, .mods = mods, .key = key, .event_type = 3 };
+    var out: [8]u8 = undefined;
+    if (translateKittyToLegacy(&out, ev)) |n| {
+        forwardInputToFocusedPane(state, out[0..n]);
+    }
+}
+
+fn scheduleTimer(state: *State, kind: State.PendingKeyTimerKind, deadline_ms: i64, mods: u8, key: BindKey, action: BindAction, focus_ctx: FocusContext) void {
+    state.key_timers.append(state.allocator, .{
+        .kind = kind,
+        .deadline_ms = deadline_ms,
+        .mods = mods,
+        .key = key,
+        .action = action,
+        .focus_ctx = focus_ctx,
+    }) catch {};
+}
+
+pub fn processKeyTimers(state: *State, now_ms: i64) void {
+    var i: usize = 0;
+    while (i < state.key_timers.items.len) {
+        const t = state.key_timers.items[i];
+        if (t.kind == .hold_fired or t.kind == .repeat_wait or t.kind == .repeat_active) {
+            i += 1;
+            continue;
+        }
+        if (t.deadline_ms > now_ms) {
+            i += 1;
+            continue;
+        }
+
+        // Hold timers need to survive until release so we can decide whether to
+        // forward the key to the pane.
+        if (t.kind == .hold) {
+            // Enforce context at fire time.
+            if (t.focus_ctx == currentFocusContext(state)) {
+                _ = dispatchAction(state, t.action);
+            }
+            state.key_timers.items[i].kind = .hold_fired;
+            state.key_timers.items[i].deadline_ms = std.math.maxInt(i64);
+            i += 1;
+            continue;
+        }
+
+        _ = state.key_timers.orderedRemove(i);
+
+        // Enforce context at fire time.
+        if (t.focus_ctx != currentFocusContext(state)) {
+            continue;
+        }
+
+        switch (t.kind) {
+            .double_tap_wait => {},
+            .delayed_press => {
+                _ = dispatchAction(state, t.action);
+            },
+            .hold_fired => {},
+            .repeat_wait => {},
+            .repeat_active => {},
+            .hold => unreachable,
+        }
+    }
+}
+
+pub fn handleKeyEvent(state: *State, mods: u8, key: BindKey, when: BindWhen, allow_only_tabs: bool, defer_to_release: bool) bool {
+    const cfg = &state.config;
+    const focus_ctx = currentFocusContext(state);
+    const now_ms = std.time.milliTimestamp();
+
+    // Release cancels hold.
+    if (when == .release) {
+        // If a hold already fired, swallow the release and do not forward.
+        var had_hold_fired = false;
+        var i: usize = 0;
+        while (i < state.key_timers.items.len) {
+            const t = state.key_timers.items[i];
+            if (t.kind == .hold_fired and t.mods == mods and keyEq(t.key, key)) {
+                _ = state.key_timers.orderedRemove(i);
+                had_hold_fired = true;
+                continue;
+            }
+            i += 1;
+        }
+        if (had_hold_fired) return true;
+
+        // If a hold was pending but not fired yet, cancel and forward the key
+        // into the pane (short tap behavior).
+        var had_hold_pending = false;
+        i = 0;
+        while (i < state.key_timers.items.len) {
+            const t = state.key_timers.items[i];
+            if (t.kind == .hold and t.mods == mods and keyEq(t.key, key)) {
+                _ = state.key_timers.orderedRemove(i);
+                had_hold_pending = true;
+                continue;
+            }
+            i += 1;
+        }
+        if (had_hold_pending) {
+            // Only forward if the source supports a clean press/release cycle.
+            if (defer_to_release) {
+                forwardKeyAsLegacy(state, mods, key);
+            }
+            return true;
+        }
+
+        // Repeat deferral resolution.
+        var had_repeat_active = false;
+        var had_repeat_wait = false;
+        i = 0;
+        while (i < state.key_timers.items.len) {
+            const t = state.key_timers.items[i];
+            if (t.mods == mods and keyEq(t.key, key)) {
+                if (t.kind == .repeat_active) {
+                    _ = state.key_timers.orderedRemove(i);
+                    had_repeat_active = true;
+                    continue;
+                }
+                if (t.kind == .repeat_wait) {
+                    _ = state.key_timers.orderedRemove(i);
+                    had_repeat_wait = true;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if (had_repeat_active) return true;
+        if (had_repeat_wait) {
+            if (defer_to_release) {
+                forwardKeyAsLegacy(state, mods, key);
+            }
+            return true;
+        }
+
+        if (findBestBind(state, mods, key, .release, allow_only_tabs, focus_ctx)) |b| {
+            return dispatchAction(state, b.action);
+        }
+        // Always consume release events (they are mux-only).
+        return true;
+    }
+
+    // Repeat: only fire repeat binds, don't participate in double tap.
+    if (when == .repeat) {
+        // Mark chord as actively repeating so we never forward it to panes.
+        // Also cancel any pending hold for the same chord.
+        cancelTimer(state, .hold, mods, key);
+        cancelTimer(state, .hold_fired, mods, key);
+
+        var converted = false;
+        var i: usize = 0;
+        while (i < state.key_timers.items.len) {
+            if (state.key_timers.items[i].mods == mods and keyEq(state.key_timers.items[i].key, key)) {
+                if (state.key_timers.items[i].kind == .repeat_wait) {
+                    state.key_timers.items[i].kind = .repeat_active;
+                    converted = true;
+                    break;
+                }
+                if (state.key_timers.items[i].kind == .repeat_active) {
+                    converted = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        // converted is only used to ensure we have a repeat_active marker; ok if false.
+
+        if (findBestBind(state, mods, key, .repeat, allow_only_tabs, focus_ctx)) |b| {
+            return dispatchAction(state, b.action);
+        }
+        // If no repeat binding exists, treat as press (useful for repeated focus moves).
+        return handleKeyEvent(state, mods, key, .press, allow_only_tabs, defer_to_release);
+    }
+
+    // Hold scheduling (press only)
+    var hold_scheduled = false;
+    if (when == .press and defer_to_release) {
+        if (findBestBind(state, mods, key, .hold, false, focus_ctx)) |hb| {
+            const hold_ms = hb.hold_ms orelse cfg.input.hold_ms;
+            cancelTimer(state, .hold, mods, key);
+            // Clear any previous fired marker for the same chord.
+            cancelTimer(state, .hold_fired, mods, key);
+            scheduleTimer(state, .hold, now_ms + hold_ms, mods, key, hb.action, focus_ctx);
+            hold_scheduled = true;
+        }
+    }
+
+    // Repeat deferral (press only): if a repeat binding exists but this key
+    // doesn't match a press binding, we swallow the press and decide on release.
+    var repeat_deferred = false;
+    if (when == .press and defer_to_release) {
+        if (hasBind(state, mods, key, .repeat, focus_ctx)) {
+            if (findBestBind(state, mods, key, .press, allow_only_tabs, focus_ctx) == null) {
+                cancelTimer(state, .repeat_wait, mods, key);
+                cancelTimer(state, .repeat_active, mods, key);
+                // Store until release; if a repeat event arrives, it will flip to repeat_active.
+                scheduleTimer(state, .repeat_wait, std.math.maxInt(i64), mods, key, .mux_quit, focus_ctx);
+                repeat_deferred = true;
+            }
+        }
+    }
+
+    // Double tap handling (press only)
+    if (when == .press and hasBind(state, mods, key, .double_tap, focus_ctx)) {
+        const dt_bind = findBestBind(state, mods, key, .double_tap, allow_only_tabs, focus_ctx);
+        const dt_ms = if (dt_bind) |b| (b.double_tap_ms orelse cfg.input.double_tap_ms) else cfg.input.double_tap_ms;
+
+        // Second tap?
+        const had_wait = blk: {
+            for (state.key_timers.items) |t| {
+                if (t.kind == .double_tap_wait and t.mods == mods and keyEq(t.key, key) and t.deadline_ms > now_ms and t.focus_ctx == focus_ctx) {
+                    break :blk true;
+                }
+            }
+            break :blk false;
+        };
+
+        if (had_wait) {
+            cancelTimer(state, .double_tap_wait, mods, key);
+            cancelTimer(state, .delayed_press, mods, key);
+            if (dt_bind) |db| {
+                return dispatchAction(state, db.action);
+            }
+            return true;
+        }
+        scheduleTimer(state, .double_tap_wait, now_ms + dt_ms, mods, key, .mux_quit, focus_ctx); // action ignored
+
+        // If there's a press bind, delay it so it doesn't fire when user intends double.
+        if (findBestBind(state, mods, key, .press, allow_only_tabs, focus_ctx)) |pb| {
+            const delay = pb.double_tap_ms orelse cfg.input.double_tap_ms;
+            cancelTimer(state, .delayed_press, mods, key);
+            scheduleTimer(state, .delayed_press, now_ms + delay, mods, key, pb.action, focus_ctx);
+        }
+        return true;
+    }
+
+    // Normal press
+    if (when == .press) {
+        if (findBestBind(state, mods, key, .press, allow_only_tabs, focus_ctx)) |b| {
+            return dispatchAction(state, b.action);
+        }
+
+        // No press action matched, but hold is armed: consume now and decide on release.
+        if (hold_scheduled) return true;
+
+        if (repeat_deferred) return true;
+    }
+
+    return false;
+}
+
+fn dispatchAction(state: *State, action: BindAction) bool {
+    const cfg = &state.config;
+
+    switch (action) {
+        .mux_quit => {
+            if (cfg.confirm_on_exit) {
+                state.pending_action = .exit;
+                state.popups.showConfirm("Exit mux?", .{}) catch {};
+                state.needs_render = true;
+            } else {
+                state.running = false;
+            }
+            return true;
+        },
+        .pane_disown => {
+            const current_pane: ?*Pane = if (state.active_floating) |idx|
+                state.floats.items[idx]
+            else
+                state.currentLayout().getFocusedPane();
+
+            if (current_pane) |p| {
+                if (p.sticky) {
+                    state.notifications.show("Cannot disown sticky float");
+                    state.needs_render = true;
+                    return true;
+                }
+            }
+
+            if (cfg.confirm_on_disown) {
+                state.pending_action = .disown;
+                state.popups.showConfirm("Disown pane?", .{}) catch {};
+                state.needs_render = true;
+            } else {
+                actions.performDisown(state);
+            }
+            return true;
+        },
+        .pane_adopt => {
+            actions.startAdoptFlow(state);
+            return true;
+        },
+        .split_h => {
+            const parent_uuid = state.getCurrentFocusedUuid();
+            const cwd = if (state.currentLayout().getFocusedPane()) |p| state.refreshPaneCwd(p) else null;
+            if (state.currentLayout().splitFocused(.horizontal, cwd) catch null) |new_pane| {
+                state.syncPaneAux(new_pane, parent_uuid);
+            }
+            state.needs_render = true;
+            state.syncStateToSes();
+            return true;
+        },
+        .split_v => {
+            const parent_uuid = state.getCurrentFocusedUuid();
+            const cwd = if (state.currentLayout().getFocusedPane()) |p| state.refreshPaneCwd(p) else null;
+            if (state.currentLayout().splitFocused(.vertical, cwd) catch null) |new_pane| {
+                state.syncPaneAux(new_pane, parent_uuid);
+            }
+            state.needs_render = true;
+            state.syncStateToSes();
+            return true;
+        },
+        .tab_new => {
+            state.active_floating = null;
+            state.createTab() catch {};
+            state.needs_render = true;
+            return true;
+        },
+        .tab_next => {
+            const old_uuid = state.getCurrentFocusedUuid();
+            if (state.active_floating) |idx| {
+                if (idx < state.floats.items.len) {
+                    const fp = state.floats.items[idx];
+                    state.syncPaneUnfocus(fp);
+                    state.active_floating = null;
+                }
+            } else if (state.currentLayout().getFocusedPane()) |old_pane| {
+                state.syncPaneUnfocus(old_pane);
+            }
+            state.nextTab();
+
+            if (state.tab_last_focus_kind.items.len > state.active_tab and state.tab_last_focus_kind.items[state.active_tab] == .float) {
+                if (state.tab_last_floating_uuid.items.len > state.active_tab) {
+                    if (state.tab_last_floating_uuid.items[state.active_tab]) |uuid| {
+                        for (state.floats.items, 0..) |pane, fi| {
+                            if (!std.mem.eql(u8, &pane.uuid, &uuid)) continue;
+                            if (!pane.isVisibleOnTab(state.active_tab)) continue;
+                            if (pane.parent_tab) |parent| {
+                                if (parent != state.active_tab) continue;
+                            }
+                            state.active_floating = fi;
+                            state.syncPaneFocus(pane, old_uuid);
+                            state.needs_render = true;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            if (state.currentLayout().getFocusedPane()) |new_pane| {
+                state.syncPaneFocus(new_pane, old_uuid);
+            }
+            state.needs_render = true;
+            return true;
+        },
+        .tab_prev => {
+            const old_uuid = state.getCurrentFocusedUuid();
+            if (state.active_floating) |idx| {
+                if (idx < state.floats.items.len) {
+                    const fp = state.floats.items[idx];
+                    state.syncPaneUnfocus(fp);
+                    state.active_floating = null;
+                }
+            } else if (state.currentLayout().getFocusedPane()) |old_pane| {
+                state.syncPaneUnfocus(old_pane);
+            }
+            state.prevTab();
+
+            if (state.tab_last_focus_kind.items.len > state.active_tab and state.tab_last_focus_kind.items[state.active_tab] == .float) {
+                if (state.tab_last_floating_uuid.items.len > state.active_tab) {
+                    if (state.tab_last_floating_uuid.items[state.active_tab]) |uuid| {
+                        for (state.floats.items, 0..) |pane, fi| {
+                            if (!std.mem.eql(u8, &pane.uuid, &uuid)) continue;
+                            if (!pane.isVisibleOnTab(state.active_tab)) continue;
+                            if (pane.parent_tab) |parent| {
+                                if (parent != state.active_tab) continue;
+                            }
+                            state.active_floating = fi;
+                            state.syncPaneFocus(pane, old_uuid);
+                            state.needs_render = true;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            if (state.currentLayout().getFocusedPane()) |new_pane| {
+                state.syncPaneFocus(new_pane, old_uuid);
+            }
+            state.needs_render = true;
+            return true;
+        },
+        .tab_close => {
+            if (cfg.confirm_on_close) {
+                state.pending_action = .close;
+                const msg = if (state.active_floating != null) "Close float?" else "Close tab?";
+                state.popups.showConfirm(msg, .{}) catch {};
+                state.needs_render = true;
+            } else {
+                actions.performClose(state);
+            }
+            return true;
+        },
+        .mux_detach => {
+            if (cfg.confirm_on_detach) {
+                state.pending_action = .detach;
+                state.popups.showConfirm("Detach session?", .{}) catch {};
+                state.needs_render = true;
+                return true;
+            }
+            actions.performDetach(state);
+            return true;
+        },
+        .float_toggle => |fk| {
+            if (cfg.getFloatByKey(fk)) |float_def| {
+                actions.toggleNamedFloat(state, float_def);
+                state.needs_render = true;
+                return true;
+            }
+            return false;
+        },
+        .float_nudge => |dir_kind| {
+            const dir: ?layout_mod.Layout.Direction = switch (dir_kind) {
+                .up => .up,
+                .down => .down,
+                .left => .left,
+                .right => .right,
+                else => null,
+            };
+            if (dir == null) return false;
+            const fi = state.active_floating orelse return false;
+            if (fi >= state.floats.items.len) return false;
+            const pane = state.floats.items[fi];
+            if (pane.parent_tab) |parent| {
+                if (parent != state.active_tab) return false;
+            }
+
+            nudgeFloat(state, pane, dir.?, 1);
+            state.needs_render = true;
+            return true;
+        },
+        .focus_move => |dir_kind| {
+            const dir: ?layout_mod.Layout.Direction = switch (dir_kind) {
+                .up => .up,
+                .down => .down,
+                .left => .left,
+                .right => .right,
+                else => null,
+            };
+            if (dir) |d| {
+                const old_uuid = state.getCurrentFocusedUuid();
+                const cursor = blk: {
+                    if (state.active_floating) |idx| {
+                        const pos = state.floats.items[idx].getCursorPos();
+                        break :blk @as(?layout_mod.CursorPos, .{ .x = pos.x, .y = pos.y });
+                    }
+                    if (state.currentLayout().getFocusedPane()) |pane| {
+                        const pos = pane.getCursorPos();
+                        break :blk @as(?layout_mod.CursorPos, .{ .x = pos.x, .y = pos.y });
+                    }
+                    break :blk @as(?layout_mod.CursorPos, null);
+                };
+                if (focusDirectionAny(state, d, cursor)) |target| {
+                    if (target.kind == .float) {
+                        state.active_floating = target.float_index;
+                    } else {
+                        state.active_floating = null;
+                    }
+                    state.syncPaneFocus(target.pane, old_uuid);
+                    state.renderer.invalidate();
+                    state.force_full_render = true;
+                }
+                state.needs_render = true;
+                return true;
+            }
+            return false;
+        },
+    }
+}
+
+fn nudgeFloat(state: *State, pane: *Pane, dir: layout_mod.Layout.Direction, step_cells: u16) void {
+    const avail_h: u16 = state.term_height - state.status_height;
+
+    const shadow_enabled = if (pane.float_style) |s| s.shadow_color != null else false;
+    const usable_w: u16 = if (shadow_enabled) (state.term_width -| 1) else state.term_width;
+    const usable_h: u16 = if (shadow_enabled and state.status_height == 0) (avail_h -| 1) else avail_h;
+
+    const outer_w: u16 = usable_w * pane.float_width_pct / 100;
+    const outer_h: u16 = usable_h * pane.float_height_pct / 100;
+
+    const max_x: u16 = usable_w -| outer_w;
+    const max_y: u16 = usable_h -| outer_h;
+
+    var outer_x: i32 = @intCast(pane.border_x);
+    var outer_y: i32 = @intCast(pane.border_y);
+    const dx: i32 = switch (dir) {
+        .left => -@as(i32, @intCast(step_cells)),
+        .right => @as(i32, @intCast(step_cells)),
+        else => 0,
+    };
+    const dy: i32 = switch (dir) {
+        .up => -@as(i32, @intCast(step_cells)),
+        .down => @as(i32, @intCast(step_cells)),
+        else => 0,
+    };
+
+    outer_x += dx;
+    outer_y += dy;
+
+    if (outer_x < 0) outer_x = 0;
+    if (outer_y < 0) outer_y = 0;
+    if (outer_x > @as(i32, @intCast(max_x))) outer_x = @as(i32, @intCast(max_x));
+    if (outer_y > @as(i32, @intCast(max_y))) outer_y = @as(i32, @intCast(max_y));
+
+    // Convert back to percentage (stable across resizes).
+    if (max_x > 0) {
+        const xp: u32 = (@as(u32, @intCast(outer_x)) * 100) / @as(u32, max_x);
+        pane.float_pos_x_pct = @intCast(@min(100, xp));
+    }
+    if (max_y > 0) {
+        const yp: u32 = (@as(u32, @intCast(outer_y)) * 100) / @as(u32, max_y);
+        pane.float_pos_y_pct = @intCast(@min(100, yp));
+    }
+
+    state.resizeFloatingPanes();
+}
+
+// ---- Focus navigation helpers (moved out of loop_input.zig)
+
+pub const FocusTargetKind = enum { split, float };
+
+pub const FocusTarget = struct {
+    kind: FocusTargetKind,
+    pane: *Pane,
+    float_index: ?usize,
+};
+
+fn isFloatRenderableOnTab(pane: *Pane, tab_idx: usize) bool {
+    if (!pane.isVisibleOnTab(tab_idx)) return false;
+    if (pane.parent_tab) |parent| {
+        return parent == tab_idx;
+    }
+    return true;
+}
+
+pub fn focusDirectionAny(state: *State, dir: layout_mod.Layout.Direction, cursor: ?layout_mod.CursorPos) ?FocusTarget {
+    // Prefer floats when a float is focused.
+    if (state.active_floating) |fi| {
+        if (fi < state.floats.items.len) {
+            const fp = state.floats.items[fi];
+            if (isFloatRenderableOnTab(fp, state.active_tab)) {
+                if (focusDirectionFromPane(state, fp, .float, fi, dir, cursor)) |t| return t;
+            }
+        }
+    }
+    if (state.currentLayout().getFocusedPane()) |p| {
+        if (focusDirectionFromPane(state, p, .split, null, dir, cursor)) |t| return t;
+    }
+    return null;
+}
+
+fn focusDirectionFromPane(state: *State, from: *Pane, from_kind: FocusTargetKind, from_float_index: ?usize, dir: layout_mod.Layout.Direction, cursor: ?layout_mod.CursorPos) ?FocusTarget {
+    _ = from_float_index;
+
+    // Cursor-based target point.
+    const cx: u16 = if (cursor) |c| c.x else from.border_x + from.border_w / 2;
+    const cy: u16 = if (cursor) |c| c.y else from.border_y + from.border_h / 2;
+
+    // Find best candidate among floats and splits.
+    var best: ?FocusTarget = null;
+    var best_dist: i64 = std.math.maxInt(i64);
+
+    // Floats.
+    for (state.floats.items, 0..) |fp, fi| {
+        if (!isFloatRenderableOnTab(fp, state.active_tab)) continue;
+        // Skip the current pane.
+        if (from_kind == .float and std.mem.eql(u8, &fp.uuid, &from.uuid)) continue;
+        const tx = fp.border_x + fp.border_w / 2;
+        const ty = fp.border_y + fp.border_h / 2;
+        if (!directionMatch(cx, cy, tx, ty, dir)) continue;
+        const dist = manhattan(cx, cy, tx, ty);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = .{ .kind = .float, .pane = fp, .float_index = fi };
+        }
+    }
+
+    // Splits.
+    var it = state.currentLayout().splitIterator();
+    while (it.next()) |sp| {
+        const p = sp.*;
+        if (from_kind == .split and p.id == from.id) continue;
+        const tx = p.border_x + p.border_w / 2;
+        const ty = p.border_y + p.border_h / 2;
+        if (!directionMatch(cx, cy, tx, ty, dir)) continue;
+        const dist = manhattan(cx, cy, tx, ty);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = .{ .kind = .split, .pane = p, .float_index = null };
+        }
+    }
+
+    return best;
+}
+
+fn directionMatch(cx: u16, cy: u16, tx: u16, ty: u16, dir: layout_mod.Layout.Direction) bool {
+    return switch (dir) {
+        .left => tx < cx,
+        .right => tx > cx,
+        .up => ty < cy,
+        .down => ty > cy,
+    };
+}
+
+fn manhattan(x1: u16, y1: u16, x2: u16, y2: u16) i64 {
+    const dx: i64 = @as(i64, @intCast(@max(x1, x2))) - @as(i64, @intCast(@min(x1, x2)));
+    const dy: i64 = @as(i64, @intCast(@max(y1, y2))) - @as(i64, @intCast(@min(y1, y2)));
+    return dx + dy;
+}

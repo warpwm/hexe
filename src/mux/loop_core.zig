@@ -9,6 +9,7 @@ const loop_input = @import("loop_input.zig");
 const loop_ipc = @import("loop_ipc.zig");
 const loop_render = @import("loop_render.zig");
 const float_completion = @import("float_completion.zig");
+const keybinds = @import("keybinds.zig");
 
 pub fn runMainLoop(state: *State) !void {
     const allocator = state.allocator;
@@ -19,9 +20,12 @@ pub fn runMainLoop(state: *State) !void {
 
     // Enter alternate screen and reset it.
     const stdout = std.fs.File.stdout();
-    // Enable kitty keyboard protocol (progressive enhancement flag 1) when supported.
+    // Enable kitty keyboard protocol (progressive enhancement flags 1|2) when supported.
     // Terminals that don't support it will ignore this.
-    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[>1u");
+    // Flags:
+    // - 1: Disambiguate escape codes
+    // - 2: Report event types (press/repeat/release)
+    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[>3u");
     // Disable kitty keyboard protocol on exit.
     defer stdout.writeAll("\x1b[<u\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
 
@@ -157,8 +161,14 @@ pub fn runMainLoop(state: *State) !void {
         const since_render = now - last_render;
         const since_status = now - last_status_update;
         const until_status: i64 = @max(0, status_update_interval - since_status);
+        const until_key_timer: i64 = blk: {
+            if (state.nextKeyTimerDeadlineMs(now)) |deadline| {
+                break :blk @max(0, deadline - now);
+            }
+            break :blk std.math.maxInt(i64);
+        };
         const frame_timeout: i32 = if (!state.needs_render) 100 else if (since_render >= 16) 0 else @intCast(16 - since_render);
-        const timeout: i32 = @intCast(@min(frame_timeout, until_status));
+        const timeout: i32 = @intCast(@min(@as(i64, frame_timeout), @min(until_status, until_key_timer)));
         _ = posix.poll(poll_fds[0..fd_count], timeout) catch continue;
 
         // Check if status bar needs periodic update.
@@ -375,6 +385,9 @@ pub fn runMainLoop(state: *State) !void {
                 }
             }
         }
+
+        // Process keybinding timers (hold / double-tap delayed press).
+        keybinds.processKeyTimers(state, now2);
 
         // Render with frame rate limiting (max 60fps).
         if (state.needs_render) {

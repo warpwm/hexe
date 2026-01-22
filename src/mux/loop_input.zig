@@ -14,6 +14,7 @@ const actions = @import("loop_actions.zig");
 const loop_ipc = @import("loop_ipc.zig");
 const TabFocusKind = @import("state.zig").TabFocusKind;
 const statusbar = @import("statusbar.zig");
+const keybinds = @import("keybinds.zig");
 
 pub fn handleInput(state: *State, input_bytes: []const u8) void {
     if (input_bytes.len == 0) return;
@@ -172,7 +173,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
         if (current_tab.popups.isBlocked()) {
             // Allow only tab switching while a tab popup is open.
             if (inp.len >= 2 and inp[0] == 0x1b and inp[1] != '[' and inp[1] != 'O') {
-                if (dispatchKey(state, 1, .{ .char = inp[1] }, true)) {
+                if (keybinds.handleKeyEvent(state, 1, .{ .char = inp[1] }, .press, true, false)) {
                     return;
                 }
             }
@@ -286,27 +287,54 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
 
             // Check for Alt+key (ESC followed by key).
             // Kitty keyboard protocol may encode Alt+<key> as CSI ... u instead.
-            if (parseKittyKeyEvent(inp[i..])) |ke| {
-                // Ignore release events for now (consume, don't forward).
-                if (ke.event_type == 3) {
-                    i += ke.consumed;
-                    continue;
-                }
+            if (keybinds.parseKittyKeyEvent(inp[i..])) |ke| {
+                if (keybinds.bindWhenFromKittyEventType(ke.event_type)) |when| {
+                    // Try mux binds first.
+                    if (keybinds.handleKeyEvent(state, ke.mods, ke.key, when, false, true)) {
+                        i += ke.consumed;
+                        continue;
+                    }
 
-                if (dispatchKey(state, ke.mods, ke.key, false)) {
-                    i += ke.consumed;
-                    continue;
+                    // Release events are mux-only for now.
+                    if (when == .release) {
+                        i += ke.consumed;
+                        continue;
+                    }
                 }
 
                 // Not a mux bind: translate to legacy bytes and forward to focused pane.
                 var out: [8]u8 = undefined;
-                const out_len = translateKittyToLegacy(&out, ke) orelse 0;
+                const out_len = keybinds.translateKittyToLegacy(&out, ke) orelse 0;
                 if (out_len > 0) {
-                    forwardInputToFocusedPane(state, out[0..out_len]);
+                    keybinds.forwardInputToFocusedPane(state, out[0..out_len]);
                     i += ke.consumed;
                     continue;
                 }
                 // If we can't translate, let it fall through (some apps may support CSI-u).
+            }
+
+            // Some terminals encode arrow keys using a kitty legacy form with event types:
+            // ESC [ 1 ; <mod> : <event> <A|B|C|D>
+            // Handle it here so it doesn't leak into the shell.
+            if (keybinds.parseKittyLegacyArrowEvent(inp[i..])) |ke| {
+                if (keybinds.bindWhenFromKittyEventType(ke.event_type)) |when| {
+                    if (keybinds.handleKeyEvent(state, ke.mods, ke.key, when, false, true)) {
+                        i += ke.consumed;
+                        continue;
+                    }
+                    if (when == .release) {
+                        i += ke.consumed;
+                        continue;
+                    }
+                }
+
+                // Not handled by mux: forward a normal arrow sequence.
+                var out: [16]u8 = undefined;
+                if (keybinds.translateArrowToLegacy(&out, ke.mods, ke.key)) |n| {
+                    keybinds.forwardInputToFocusedPane(state, out[0..n]);
+                    i += ke.consumed;
+                    continue;
+                }
             }
             if (inp[i] == 0x1b and i + 1 < inp.len) {
                 const next = inp[i + 1];
@@ -325,7 +353,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                 }
                 // Make sure it's not an actual escape sequence (like arrow keys).
                 if (next != '[' and next != 'O') {
-                    if (dispatchKey(state, 1, .{ .char = next }, false)) {
+                    if (keybinds.handleKeyEvent(state, 1, .{ .char = next }, .press, false, false)) {
                         i += 2;
                         continue;
                     }
@@ -671,7 +699,7 @@ fn handleAltArrow(state: *State, inp: []const u8) ?usize {
         };
 
         if (key) |k| {
-            _ = dispatchKey(state, 1, k, false);
+            _ = keybinds.handleKeyEvent(state, 1, k, .press, false, false);
             return 6;
         }
     }
@@ -746,412 +774,4 @@ fn handleScrollKeys(state: *State, inp: []const u8) ?usize {
     }
 
     return null;
-}
-
-fn dispatchKey(state: *State, mods: u8, key: core.Config.BindKey, allow_only_tabs: bool) bool {
-    const cfg = &state.config;
-
-    const focus_ctx: core.Config.FocusContext = if (state.active_floating != null) .float else .split;
-
-    var best: ?core.Config.Bind = null;
-    var best_score: u8 = 0;
-
-    for (cfg.input.binds) |b| {
-        if (b.when != .press) continue;
-        if (b.mods != mods) continue;
-        if (@as(core.Config.BindKeyKind, b.key) != @as(core.Config.BindKeyKind, key)) continue;
-        if (@as(core.Config.BindKeyKind, b.key) == .char) {
-            if (b.key.char != key.char) continue;
-        }
-        // context
-        if (b.context.focus != .any and b.context.focus != focus_ctx) continue;
-
-        var score: u8 = 0;
-        if (b.context.focus != .any) score += 1;
-        // Later binds override for equal score.
-        if (score > best_score or best == null) {
-            best = b;
-            best_score = score;
-        } else if (score == best_score) {
-            best = b;
-        }
-    }
-
-    if (best) |bind| {
-        if (allow_only_tabs) {
-            if (bind.action != .tab_next and bind.action != .tab_prev) return false;
-        }
-        return dispatchAction(state, bind.action);
-    }
-    return false;
-}
-
-fn dispatchAction(state: *State, action: core.Config.BindAction) bool {
-    const cfg = &state.config;
-
-    switch (action) {
-        .mux_quit => {
-            if (cfg.confirm_on_exit) {
-                state.pending_action = .exit;
-                state.popups.showConfirm("Exit mux?", .{}) catch {};
-                state.needs_render = true;
-            } else {
-                state.running = false;
-            }
-            return true;
-        },
-        .pane_disown => {
-            const current_pane: ?*Pane = if (state.active_floating) |idx|
-                state.floats.items[idx]
-            else
-                state.currentLayout().getFocusedPane();
-            if (current_pane) |p| {
-                if (p.sticky) {
-                    state.notifications.show("Cannot disown sticky float");
-                    state.needs_render = true;
-                    return true;
-                }
-            }
-            if (cfg.confirm_on_disown) {
-                state.pending_action = .disown;
-                state.popups.showConfirm("Disown pane?", .{}) catch {};
-                state.needs_render = true;
-            } else {
-                actions.performDisown(state);
-            }
-            return true;
-        },
-        .pane_adopt => {
-            actions.startAdoptFlow(state);
-            return true;
-        },
-        .split_h => {
-            const parent_uuid = state.getCurrentFocusedUuid();
-            const cwd = if (state.currentLayout().getFocusedPane()) |p| state.refreshPaneCwd(p) else null;
-            if (state.currentLayout().splitFocused(.horizontal, cwd) catch null) |new_pane| {
-                state.syncPaneAux(new_pane, parent_uuid);
-            }
-            state.needs_render = true;
-            state.syncStateToSes();
-            return true;
-        },
-        .split_v => {
-            const parent_uuid = state.getCurrentFocusedUuid();
-            const cwd = if (state.currentLayout().getFocusedPane()) |p| state.refreshPaneCwd(p) else null;
-            if (state.currentLayout().splitFocused(.vertical, cwd) catch null) |new_pane| {
-                state.syncPaneAux(new_pane, parent_uuid);
-            }
-            state.needs_render = true;
-            state.syncStateToSes();
-            return true;
-        },
-        .tab_new => {
-            state.active_floating = null;
-            state.createTab() catch {};
-            state.needs_render = true;
-            return true;
-        },
-        .tab_next => {
-            // Reuse existing code path by synthesizing Alt+next behavior.
-            // We still rely on state.nextTab + focus restoration.
-            const old_uuid = state.getCurrentFocusedUuid();
-            if (state.active_floating) |idx| {
-                if (idx < state.floats.items.len) {
-                    const fp = state.floats.items[idx];
-                    state.syncPaneUnfocus(fp);
-                    state.active_floating = null;
-                }
-            } else if (state.currentLayout().getFocusedPane()) |old_pane| {
-                state.syncPaneUnfocus(old_pane);
-            }
-            state.nextTab();
-            if (state.tab_last_focus_kind.items.len > state.active_tab and state.tab_last_focus_kind.items[state.active_tab] == .float) {
-                if (state.tab_last_floating_uuid.items.len > state.active_tab) {
-                    if (state.tab_last_floating_uuid.items[state.active_tab]) |uuid| {
-                        for (state.floats.items, 0..) |pane, fi| {
-                            if (!std.mem.eql(u8, &pane.uuid, &uuid)) continue;
-                            if (!pane.isVisibleOnTab(state.active_tab)) continue;
-                            if (pane.parent_tab) |parent| {
-                                if (parent != state.active_tab) continue;
-                            }
-                            state.active_floating = fi;
-                            state.syncPaneFocus(pane, old_uuid);
-                            state.needs_render = true;
-                            return true;
-                        }
-                    }
-                }
-            }
-            if (state.currentLayout().getFocusedPane()) |new_pane| {
-                state.syncPaneFocus(new_pane, old_uuid);
-            }
-            state.needs_render = true;
-            return true;
-        },
-        .tab_prev => {
-            const old_uuid = state.getCurrentFocusedUuid();
-            if (state.active_floating) |idx| {
-                if (idx < state.floats.items.len) {
-                    const fp = state.floats.items[idx];
-                    state.syncPaneUnfocus(fp);
-                    state.active_floating = null;
-                }
-            } else if (state.currentLayout().getFocusedPane()) |old_pane| {
-                state.syncPaneUnfocus(old_pane);
-            }
-            state.prevTab();
-            if (state.tab_last_focus_kind.items.len > state.active_tab and state.tab_last_focus_kind.items[state.active_tab] == .float) {
-                if (state.tab_last_floating_uuid.items.len > state.active_tab) {
-                    if (state.tab_last_floating_uuid.items[state.active_tab]) |uuid| {
-                        for (state.floats.items, 0..) |pane, fi| {
-                            if (!std.mem.eql(u8, &pane.uuid, &uuid)) continue;
-                            if (!pane.isVisibleOnTab(state.active_tab)) continue;
-                            if (pane.parent_tab) |parent| {
-                                if (parent != state.active_tab) continue;
-                            }
-                            state.active_floating = fi;
-                            state.syncPaneFocus(pane, old_uuid);
-                            state.needs_render = true;
-                            return true;
-                        }
-                    }
-                }
-            }
-            if (state.currentLayout().getFocusedPane()) |new_pane| {
-                state.syncPaneFocus(new_pane, old_uuid);
-            }
-            state.needs_render = true;
-            return true;
-        },
-        .tab_close => {
-            if (cfg.confirm_on_close) {
-                state.pending_action = .close;
-                const msg = if (state.active_floating != null) "Close float?" else "Close tab?";
-                state.popups.showConfirm(msg, .{}) catch {};
-                state.needs_render = true;
-            } else {
-                actions.performClose(state);
-            }
-            return true;
-        },
-        .mux_detach => {
-            if (cfg.confirm_on_detach) {
-                state.pending_action = .detach;
-                state.popups.showConfirm("Detach session?", .{}) catch {};
-                state.needs_render = true;
-                return true;
-            }
-            actions.performDetach(state);
-            return true;
-        },
-        .float_toggle => |fk| {
-            if (cfg.getFloatByKey(fk)) |float_def| {
-                actions.toggleNamedFloat(state, float_def);
-                state.needs_render = true;
-                return true;
-            }
-            return false;
-        },
-        .focus_move => |dir_kind| {
-            const dir: ?layout_mod.Layout.Direction = switch (dir_kind) {
-                .up => .up,
-                .down => .down,
-                .left => .left,
-                .right => .right,
-                else => null,
-            };
-            if (dir) |d| {
-                const old_uuid = state.getCurrentFocusedUuid();
-                const cursor = blk: {
-                    if (state.active_floating) |idx| {
-                        const pos = state.floats.items[idx].getCursorPos();
-                        break :blk @as(?layout_mod.CursorPos, .{ .x = pos.x, .y = pos.y });
-                    }
-                    if (state.currentLayout().getFocusedPane()) |pane| {
-                        const pos = pane.getCursorPos();
-                        break :blk @as(?layout_mod.CursorPos, .{ .x = pos.x, .y = pos.y });
-                    }
-                    break :blk @as(?layout_mod.CursorPos, null);
-                };
-                if (focusDirectionAny(state, d, cursor)) |target| {
-                    if (target.kind == .float) {
-                        state.active_floating = target.float_index;
-                    } else {
-                        state.active_floating = null;
-                    }
-                    state.syncPaneFocus(target.pane, old_uuid);
-                    state.renderer.invalidate();
-                    state.force_full_render = true;
-                }
-                state.needs_render = true;
-                return true;
-            }
-            return false;
-        },
-    }
-}
-
-const KittyKeyEvent = struct {
-    consumed: usize,
-    mods: u8,
-    key: core.Config.BindKey,
-    event_type: u8,
-};
-
-// Parse kitty keyboard protocol (CSI ... u) key events.
-// We only use it for shortcuts, so we accept a small subset:
-// - key codepoint for ASCII keys
-// - modifiers encoded using xterm-style modifyOtherKeys mapping (mod-1 bitmask)
-// - optional event type (press/repeat/release); repeat treated as press, release ignored
-fn parseKittyKeyEvent(inp: []const u8) ?KittyKeyEvent {
-    if (inp.len < 4) return null;
-    if (inp[0] != 0x1b or inp[1] != '[') return null;
-
-    var idx: usize = 2;
-    var keycode: u32 = 0;
-    var have_digit = false;
-    while (idx < inp.len) : (idx += 1) {
-        const ch = inp[idx];
-        if (ch >= '0' and ch <= '9') {
-            have_digit = true;
-            keycode = keycode * 10 + @as(u32, ch - '0');
-            continue;
-        }
-        break;
-    }
-    if (!have_digit) return null;
-    if (idx >= inp.len) return null;
-
-    var mod_val: u32 = 1;
-    var event_type: u32 = 1;
-
-    if (inp[idx] == 'u') {
-        idx += 1;
-    } else if (inp[idx] == ';') {
-        idx += 1;
-
-        // Parse modifier and optional event type (mod[:event]).
-        var mv: u32 = 0;
-        var have_mv = false;
-        while (idx < inp.len) : (idx += 1) {
-            const ch = inp[idx];
-            if (ch >= '0' and ch <= '9') {
-                have_mv = true;
-                mv = mv * 10 + @as(u32, ch - '0');
-                continue;
-            }
-            break;
-        }
-        if (have_mv) mod_val = mv;
-
-        if (idx < inp.len and inp[idx] == ':') {
-            idx += 1;
-            var ev: u32 = 0;
-            var have_ev = false;
-            while (idx < inp.len) : (idx += 1) {
-                const ch = inp[idx];
-                if (ch >= '0' and ch <= '9') {
-                    have_ev = true;
-                    ev = ev * 10 + @as(u32, ch - '0');
-                    continue;
-                }
-                break;
-            }
-            if (have_ev) event_type = ev;
-        }
-
-        if (idx >= inp.len or inp[idx] != 'u') return null;
-        idx += 1;
-    } else {
-        return null;
-    }
-
-    const et: u8 = @intCast(@min(255, event_type));
-
-    // Map modifiers: xterm-style mask is (mod-1): shift=1, alt=2, ctrl=4, super=8
-    const xmask: u32 = if (mod_val > 0) mod_val - 1 else 0;
-    var mods: u8 = 0;
-    if ((xmask & 2) != 0) mods |= 1; // alt
-    if ((xmask & 4) != 0) mods |= 2; // ctrl
-    if ((xmask & 1) != 0) mods |= 4; // shift
-    if ((xmask & 8) != 0) mods |= 8; // super
-
-    const key: core.Config.BindKey = blk: {
-        if (keycode == 32) break :blk .space;
-        if (keycode <= 0x7f) break :blk .{ .char = @intCast(keycode) };
-        // Not supported in our v1 bind key model.
-        return null;
-    };
-
-    return .{ .consumed = idx, .mods = mods, .key = key, .event_type = et };
-}
-
-fn translateKittyToLegacy(out: *[8]u8, ev: KittyKeyEvent) ?usize {
-    // Only supports char + space for now.
-    var ch: u8 = switch (@as(core.Config.BindKeyKind, ev.key)) {
-        .space => ' ',
-        .char => ev.key.char,
-        else => return null,
-    };
-
-    // Apply shift for ASCII letters (best effort).
-    if ((ev.mods & 4) != 0) {
-        if (ch >= 'a' and ch <= 'z') ch = ch - 'a' + 'A';
-    }
-
-    // Apply ctrl mapping for ASCII letters.
-    if ((ev.mods & 2) != 0) {
-        if (ch >= 'a' and ch <= 'z') {
-            ch = ch - 'a' + 1;
-        } else if (ch >= 'A' and ch <= 'Z') {
-            ch = ch - 'A' + 1;
-        }
-    }
-
-    var n: usize = 0;
-    if ((ev.mods & 1) != 0) {
-        out[n] = 0x1b;
-        n += 1;
-    }
-    out[n] = ch;
-    n += 1;
-    return n;
-}
-
-fn forwardInputToFocusedPane(state: *State, bytes: []const u8) void {
-    // Mirror the forwarding logic in handleInput() for normal input.
-    if (state.active_floating) |idx| {
-        const fpane = state.floats.items[idx];
-        const can_interact = if (fpane.parent_tab) |parent| parent == state.active_tab else true;
-        if (fpane.isVisibleOnTab(state.active_tab) and can_interact) {
-            if (fpane.popups.isBlocked()) {
-                if (input.handlePopupInput(&fpane.popups, bytes)) {
-                    loop_ipc.sendPopResponse(state);
-                }
-                state.needs_render = true;
-                return;
-            }
-            if (fpane.isScrolled()) {
-                fpane.scrollToBottom();
-                state.needs_render = true;
-            }
-            fpane.write(bytes) catch {};
-            return;
-        }
-    }
-
-    if (state.currentLayout().getFocusedPane()) |pane| {
-        if (pane.popups.isBlocked()) {
-            if (input.handlePopupInput(&pane.popups, bytes)) {
-                loop_ipc.sendPopResponse(state);
-            }
-            state.needs_render = true;
-            return;
-        }
-        if (pane.isScrolled()) {
-            pane.scrollToBottom();
-            state.needs_render = true;
-        }
-        pane.write(bytes) catch {};
-    }
 }

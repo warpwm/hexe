@@ -188,6 +188,10 @@ pub const Config = struct {
 
     pub const BindWhen = enum {
         press,
+        release,
+        repeat,
+        hold,
+        double_tap,
     };
 
     pub const BindKeyKind = enum {
@@ -220,6 +224,7 @@ pub const Config = struct {
         tab_prev,
         tab_close,
         float_toggle,
+        float_nudge,
         focus_move,
     };
 
@@ -235,6 +240,7 @@ pub const Config = struct {
         tab_prev,
         tab_close,
         float_toggle: u8, // float key (matches FloatDef.key)
+        float_nudge: BindKeyKind, // up/down/left/right
         focus_move: BindKeyKind, // up/down/left/right
     };
 
@@ -248,6 +254,10 @@ pub const Config = struct {
         key: BindKey,
         context: BindContext = .{},
         action: BindAction,
+
+        // Timing (used by hold/double_tap)
+        hold_ms: ?i64 = null,
+        double_tap_ms: ?i64 = null,
     };
 
     pub fn modsMaskFromStrings(mods: ?[]const []const u8) u8 {
@@ -265,6 +275,10 @@ pub const Config = struct {
 
     pub const InputConfig = struct {
         binds: []const Bind = &[_]Bind{},
+
+        // Default timings
+        hold_ms: i64 = 350,
+        double_tap_ms: i64 = 250,
     };
 
     input: InputConfig = .{},
@@ -319,6 +333,10 @@ pub const Config = struct {
 
         // Parse input binds (no legacy key config)
         if (json.input) |inp| {
+            if (inp.timing) |t| {
+                if (t.hold_ms) |v| config.input.hold_ms = v;
+                if (t.double_tap_ms) |v| config.input.double_tap_ms = v;
+            }
             if (inp.binds) |binds| {
                 config.input.binds = parseBinds(allocator, binds);
             }
@@ -611,6 +629,12 @@ pub const Config = struct {
                     if (fk.len != 1) continue;
                     break :blk .{ .float_toggle = fk[0] };
                 }
+                if (std.mem.eql(u8, t, "float.nudge")) {
+                    const dir = jb.action.dir orelse continue;
+                    const d = std.meta.stringToEnum(BindKeyKind, dir) orelse continue;
+                    if (d != .up and d != .down and d != .left and d != .right) continue;
+                    break :blk .{ .float_nudge = d };
+                }
                 if (std.mem.eql(u8, t, "focus.move")) {
                     const dir = jb.action.dir orelse continue;
                     const d = std.meta.stringToEnum(BindKeyKind, dir) orelse continue;
@@ -626,6 +650,8 @@ pub const Config = struct {
                 .key = key,
                 .context = ctx,
                 .action = action,
+                .hold_ms = jb.hold_ms,
+                .double_tap_ms = jb.double_tap_ms,
             }) catch continue;
         }
 
@@ -914,6 +940,10 @@ const JsonNotificationConfig = struct {
 
 const JsonConfig = struct {
     input: ?struct {
+        timing: ?struct {
+            hold_ms: ?i64 = null,
+            double_tap_ms: ?i64 = null,
+        } = null,
         binds: ?[]const JsonBind = null,
     } = null,
     confirm_on_exit: ?bool = null,
@@ -930,6 +960,8 @@ const JsonBind = struct {
     when: ?[]const u8 = null,
     mods: ?[]const []const u8 = null,
     key: []const u8,
+    hold_ms: ?i64 = null,
+    double_tap_ms: ?i64 = null,
     context: ?struct {
         focus: ?[]const u8 = null,
     } = null,
@@ -937,6 +969,8 @@ const JsonBind = struct {
         type: []const u8,
         // for float_toggle
         float: ?[]const u8 = null,
+        // for float_nudge
+        // for focus_move
         // for focus_move
         dir: ?[]const u8 = null,
     },
