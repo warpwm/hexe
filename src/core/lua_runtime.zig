@@ -230,6 +230,13 @@ pub const LuaRuntime = struct {
         return self.lua.typeOf(idx);
     }
 
+    /// Get the type of a field in a table.
+    pub fn fieldType(self: *Self, table_idx: i32, key: [:0]const u8) LuaType {
+        _ = self.lua.getField(table_idx, key);
+        defer self.lua.pop(1);
+        return self.lua.typeOf(-1);
+    }
+
     /// Convert stack top to string
     pub fn toStringAt(self: *Self, idx: i32) ?[]const u8 {
         return self.lua.toString(idx) catch null;

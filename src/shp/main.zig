@@ -22,7 +22,7 @@ const ModuleDef = struct {
     priority: i64,
     outputs: []const OutputDef,
     command: ?[]const u8,
-    when: ?[]const u8,
+    when: ?core.WhenDef,
 };
 
 const ShpConfig = struct {
@@ -207,7 +207,8 @@ fn renderPrompt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const is_zsh = std.mem.eql(u8, shell, "zsh");
 
     // Try to load config
-    const config = loadConfig(allocator);
+    var config = loadConfig(allocator);
+    defer deinitShpConfig(&config, allocator);
 
     if (config.has_config) {
         const modules = if (is_right) config.right else config.left;
@@ -219,6 +220,31 @@ fn renderPrompt(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Fallback to defaults if no config
     try renderDefaultPrompt(&ctx, is_right, stdout, is_zsh);
+}
+
+fn deinitShpConfig(config: *ShpConfig, allocator: std.mem.Allocator) void {
+    if (!config.has_config) return;
+    deinitModules(config.left, allocator);
+    deinitModules(config.right, allocator);
+    if (config.left.len > 0) allocator.free(config.left);
+    if (config.right.len > 0) allocator.free(config.right);
+    config.* = .{ .left = &[_]ModuleDef{}, .right = &[_]ModuleDef{}, .has_config = false };
+}
+
+fn deinitModules(mods: []const ModuleDef, allocator: std.mem.Allocator) void {
+    for (mods) |m| {
+        allocator.free(m.name);
+        if (m.command) |c| allocator.free(c);
+        if (m.when) |w| {
+            var ww = w;
+            ww.deinit(allocator);
+        }
+        for (m.outputs) |o| {
+            allocator.free(o.style);
+            allocator.free(o.format);
+        }
+        if (m.outputs.len > 0) allocator.free(m.outputs);
+    }
 }
 
 fn renderDefaultPrompt(ctx: *segment.Context, is_right: bool, stdout: std.fs.File, is_zsh: bool) !void {
@@ -247,6 +273,43 @@ fn writeSegment(stdout: std.fs.File, seg: segment.Segment, is_zsh: bool) !void {
         try stdout.writeAll("\x1b[0m");
         if (is_zsh) try stdout.writeAll("%}");
     }
+}
+
+fn evalLuaWhen(runtime: *LuaRuntime, ctx: *segment.Context, code: []const u8) bool {
+    // Provide ctx as a global table.
+    runtime.lua.createTable(0, 6);
+    _ = runtime.lua.pushString(ctx.cwd);
+    runtime.lua.setField(-2, "cwd");
+
+    if (ctx.exit_status) |st| {
+        runtime.lua.pushInteger(st);
+        runtime.lua.setField(-2, "exit_status");
+    }
+    if (ctx.cmd_duration_ms) |d| {
+        runtime.lua.pushInteger(@intCast(d));
+        runtime.lua.setField(-2, "cmd_duration_ms");
+    }
+    runtime.lua.pushInteger(ctx.jobs);
+    runtime.lua.setField(-2, "jobs");
+    runtime.lua.pushInteger(ctx.terminal_width);
+    runtime.lua.setField(-2, "terminal_width");
+    runtime.lua.setGlobal("ctx");
+
+    const code_z = runtime.allocator.dupeZ(u8, code) catch return false;
+    defer runtime.allocator.free(code_z);
+
+    // Load and execute chunk. Must return boolean.
+    runtime.lua.loadString(code_z) catch return false;
+    runtime.lua.protectedCall(.{ .args = 0, .results = 1 }) catch {
+        runtime.lua.pop(1);
+        return false;
+    };
+    defer runtime.lua.pop(1);
+
+    if (runtime.lua.typeOf(-1) == .boolean) {
+        return runtime.lua.toBoolean(-1);
+    }
+    return false;
 }
 
 fn loadConfig(allocator: std.mem.Allocator) ShpConfig {
@@ -326,13 +389,42 @@ fn parseModules(runtime: *LuaRuntime, allocator: std.mem.Allocator, key: [:0]con
 fn parseModule(runtime: *LuaRuntime, allocator: std.mem.Allocator) ?ModuleDef {
     const name = runtime.getStringAlloc(-1, "name") orelse return null;
 
+    const when_ty = runtime.fieldType(-1, "when");
+    if (when_ty != .nil and when_ty != .table) {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("shp: module 'when' must be a table\n") catch {};
+        allocator.free(name);
+        return null;
+    }
+
     return ModuleDef{
         .name = name,
         .priority = runtime.getInt(i64, -1, "priority") orelse 50,
         .outputs = parseOutputs(runtime, allocator),
         .command = runtime.getStringAlloc(-1, "command"),
-        .when = runtime.getStringAlloc(-1, "when"),
+        .when = parseWhenPrompt(runtime, allocator),
     };
+}
+
+fn parseWhenPrompt(runtime: *LuaRuntime, allocator: std.mem.Allocator) ?core.WhenDef {
+    const ty = runtime.fieldType(-1, "when");
+    if (ty == .nil) return null;
+    if (ty != .table) return null;
+
+    if (!runtime.pushTable(-1, "when")) return null;
+    defer runtime.pop();
+
+    // Strict: prompt does not allow hexe conditions.
+    if (runtime.fieldType(-1, "hexe") != .nil) {
+        return null;
+    }
+
+    var when: core.WhenDef = .{};
+    when.bash = runtime.getStringAlloc(-1, "bash");
+    when.lua = runtime.getStringAlloc(-1, "lua");
+    // hexe is not supported for prompt.
+    _ = allocator;
+    return when;
 }
 
 fn parseOutputs(runtime: *LuaRuntime, allocator: std.mem.Allocator) []const OutputDef {
@@ -346,10 +438,34 @@ fn parseOutputs(runtime: *LuaRuntime, allocator: std.mem.Allocator) []const Outp
 
     for (1..len + 1) |i| {
         if (runtime.pushArrayElement(-1, i)) {
-            list.append(allocator, .{
-                .style = runtime.getStringAlloc(-1, "style") orelse "",
-                .format = runtime.getStringAlloc(-1, "format") orelse "$output",
-            }) catch {};
+            const style = if (runtime.getString(-1, "style")) |s|
+                allocator.dupe(u8, s) catch {
+                    runtime.pop();
+                    continue;
+                }
+            else
+                allocator.dupe(u8, "") catch {
+                    runtime.pop();
+                    continue;
+                };
+
+            const format = if (runtime.getString(-1, "format")) |s|
+                allocator.dupe(u8, s) catch {
+                    allocator.free(style);
+                    runtime.pop();
+                    continue;
+                }
+            else
+                allocator.dupe(u8, "$output") catch {
+                    allocator.free(style);
+                    runtime.pop();
+                    continue;
+                };
+
+            list.append(allocator, .{ .style = style, .format = format }) catch {
+                allocator.free(style);
+                allocator.free(format);
+            };
             runtime.pop();
         }
     }
@@ -365,6 +481,7 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const ModuleDef, stdout
 
     const ModuleResult = struct {
         when_passed: bool = true,
+        when_lua_passed: bool = true,
         output: ?[]const u8 = null,
         width: u16 = 0,
         should_render: bool = true,
@@ -373,6 +490,28 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const ModuleDef, stdout
 
     var results: [32]ModuleResult = [_]ModuleResult{.{}} ** 32;
     const mod_count = @min(modules.len, 32);
+
+    // Evaluate Lua conditions on the main thread (Lua VM is not thread-safe).
+    var lua_rt: ?LuaRuntime = null;
+    defer if (lua_rt) |*rt| rt.deinit();
+
+    for (modules[0..mod_count], 0..) |mod, i| {
+        if (mod.when) |w| {
+            if (w.lua) |lua_code| {
+                if (lua_rt == null) {
+                    lua_rt = LuaRuntime.init(alloc) catch null;
+                }
+                if (lua_rt) |*rt| {
+                    results[i].when_lua_passed = evalLuaWhen(rt, ctx, lua_code);
+                    if (!results[i].when_lua_passed) {
+                        results[i].when_passed = false;
+                    }
+                } else {
+                    results[i].when_passed = false;
+                }
+            }
+        }
+    }
 
     // Thread function for running a module's commands
     const ThreadContext = struct {
@@ -383,22 +522,25 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const ModuleDef, stdout
 
     const thread_fn = struct {
         fn run(tctx: ThreadContext) void {
+            if (!tctx.result.when_passed) return;
             // Check 'when' condition
-            if (tctx.mod.when) |when_cmd| {
-                const when_result = std.process.Child.run(.{
-                    .allocator = tctx.alloc,
-                    .argv = &.{ "/bin/bash", "-c", when_cmd },
-                }) catch {
-                    tctx.result.when_passed = false;
-                    return;
-                };
-                tctx.alloc.free(when_result.stdout);
-                tctx.alloc.free(when_result.stderr);
-                tctx.result.when_passed = switch (when_result.term) {
-                    .Exited => |code| code == 0,
-                    else => false,
-                };
-                if (!tctx.result.when_passed) return;
+            if (tctx.mod.when) |w| {
+                if (w.bash) |when_cmd| {
+                    const when_result = std.process.Child.run(.{
+                        .allocator = tctx.alloc,
+                        .argv = &.{ "/bin/bash", "-lc", when_cmd },
+                    }) catch {
+                        tctx.result.when_passed = false;
+                        return;
+                    };
+                    tctx.alloc.free(when_result.stdout);
+                    tctx.alloc.free(when_result.stderr);
+                    tctx.result.when_passed = switch (when_result.term) {
+                        .Exited => |code| code == 0,
+                        else => false,
+                    };
+                    if (!tctx.result.when_passed) return;
+                }
             }
 
             // Run command

@@ -2,9 +2,155 @@ const std = @import("std");
 const core = @import("core");
 const shp = @import("shp");
 
+const LuaRuntime = core.LuaRuntime;
+
 const State = @import("state.zig").State;
 const render = @import("render.zig");
 const Pane = @import("pane.zig").Pane;
+
+const WhenCacheEntry = struct {
+    last_eval_ms: u64,
+    last_result: bool,
+};
+
+threadlocal var when_bash_cache: ?std.AutoHashMap(usize, WhenCacheEntry) = null;
+threadlocal var when_lua_cache: ?std.AutoHashMap(usize, WhenCacheEntry) = null;
+threadlocal var when_lua_rt: ?LuaRuntime = null;
+
+fn whenKey(s: []const u8) usize {
+    return (@intFromPtr(s.ptr) << 1) ^ s.len;
+}
+
+fn getWhenCache(map_ptr: *?std.AutoHashMap(usize, WhenCacheEntry)) *std.AutoHashMap(usize, WhenCacheEntry) {
+    if (map_ptr.* == null) {
+        map_ptr.* = std.AutoHashMap(usize, WhenCacheEntry).init(std.heap.page_allocator);
+    }
+    return &map_ptr.*.?;
+}
+
+fn hexeTokenPass(ctx: *shp.Context, tok: []const u8) bool {
+    if (std.mem.eql(u8, tok, "process_running")) return ctx.shell_running;
+    if (std.mem.eql(u8, tok, "not_process_running")) return !ctx.shell_running;
+    if (std.mem.eql(u8, tok, "alt_screen")) return ctx.alt_screen;
+    if (std.mem.eql(u8, tok, "not_alt_screen")) return !ctx.alt_screen;
+    if (std.mem.eql(u8, tok, "jobs_nonzero")) return ctx.jobs > 0;
+    if (std.mem.eql(u8, tok, "has_last_cmd")) return ctx.last_command != null and ctx.last_command.?.len > 0;
+    if (std.mem.eql(u8, tok, "last_status_nonzero")) return (ctx.exit_status orelse 0) != 0;
+    return false;
+}
+
+fn evalBashWhen(code: []const u8, ctx: *shp.Context, ttl_ms: u64) bool {
+    const now = ctx.now_ms;
+    const key = whenKey(code);
+    const map = getWhenCache(&when_bash_cache);
+    if (map.get(key)) |e| {
+        if (now - e.last_eval_ms < ttl_ms) return e.last_result;
+    }
+
+    // Export a few useful ctx vars.
+    var env_map = std.process.EnvMap.init(std.heap.page_allocator);
+    defer env_map.deinit();
+    env_map.put("HEXE_STATUS_PROCESS_RUNNING", if (ctx.shell_running) "1" else "0") catch {};
+    env_map.put("HEXE_STATUS_ALT_SCREEN", if (ctx.alt_screen) "1" else "0") catch {};
+    if (ctx.last_command) |c| env_map.put("HEXE_STATUS_LAST_CMD", c) catch {};
+    if (ctx.cwd.len > 0) env_map.put("HEXE_STATUS_CWD", ctx.cwd) catch {};
+
+    const res = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &.{ "/bin/bash", "-lc", code },
+        .env_map = &env_map,
+    }) catch {
+        map.put(key, .{ .last_eval_ms = now, .last_result = false }) catch {};
+        return false;
+    };
+    std.heap.page_allocator.free(res.stdout);
+    std.heap.page_allocator.free(res.stderr);
+    const ok = switch (res.term) {
+        .Exited => |ec| ec == 0,
+        else => false,
+    };
+    map.put(key, .{ .last_eval_ms = now, .last_result = ok }) catch {};
+    return ok;
+}
+
+fn evalLuaWhen(code: []const u8, ctx: *shp.Context, ttl_ms: u64) bool {
+    const now = ctx.now_ms;
+    const key = whenKey(code);
+    const map = getWhenCache(&when_lua_cache);
+    if (map.get(key)) |e| {
+        if (now - e.last_eval_ms < ttl_ms) return e.last_result;
+    }
+
+    if (when_lua_rt == null) {
+        when_lua_rt = LuaRuntime.init(std.heap.page_allocator) catch null;
+        if (when_lua_rt == null) {
+            map.put(key, .{ .last_eval_ms = now, .last_result = false }) catch {};
+            return false;
+        }
+    }
+    const rt = &when_lua_rt.?;
+
+    // ctx table
+    rt.lua.createTable(0, 8);
+    rt.lua.pushBoolean(ctx.shell_running);
+    rt.lua.setField(-2, "shell_running");
+    rt.lua.pushBoolean(ctx.alt_screen);
+    rt.lua.setField(-2, "alt_screen");
+    rt.lua.pushInteger(ctx.jobs);
+    rt.lua.setField(-2, "jobs");
+    if (ctx.exit_status) |st| {
+        rt.lua.pushInteger(st);
+        rt.lua.setField(-2, "last_status");
+    }
+    if (ctx.last_command) |c| {
+        _ = rt.lua.pushString(c);
+        rt.lua.setField(-2, "last_command");
+    }
+    _ = rt.lua.pushString(ctx.cwd);
+    rt.lua.setField(-2, "cwd");
+    rt.lua.pushInteger(@intCast(ctx.now_ms));
+    rt.lua.setField(-2, "now_ms");
+    rt.lua.setGlobal("ctx");
+
+    const code_z = rt.allocator.dupeZ(u8, code) catch {
+        map.put(key, .{ .last_eval_ms = now, .last_result = false }) catch {};
+        return false;
+    };
+    defer rt.allocator.free(code_z);
+
+    rt.lua.loadString(code_z) catch {
+        map.put(key, .{ .last_eval_ms = now, .last_result = false }) catch {};
+        return false;
+    };
+    rt.lua.protectedCall(.{ .args = 0, .results = 1 }) catch {
+        rt.lua.pop(1);
+        map.put(key, .{ .last_eval_ms = now, .last_result = false }) catch {};
+        return false;
+    };
+    const ok = if (rt.lua.typeOf(-1) == .boolean) rt.lua.toBoolean(-1) else false;
+    rt.lua.pop(1);
+    map.put(key, .{ .last_eval_ms = now, .last_result = ok }) catch {};
+    return ok;
+}
+
+fn passesWhen(ctx: *shp.Context, mod: core.config.StatusModule) bool {
+    if (mod.when == null) return true;
+    const w = mod.when.?;
+
+    if (w.hexe) |tokens| {
+        for (tokens) |t| {
+            if (!hexeTokenPass(ctx, t)) return false;
+        }
+    }
+    if (w.lua) |lua_code| {
+        if (!evalLuaWhen(lua_code, ctx, 250)) return false;
+    }
+    if (w.bash) |bash_code| {
+        if (!evalBashWhen(bash_code, ctx, 1000)) return false;
+    }
+
+    return true;
+}
 
 pub const Renderer = render.Renderer;
 
@@ -442,6 +588,8 @@ fn measureTabsWidth(tab_names: []const []const u8, separator: []const u8, left_a
 pub fn drawModule(renderer: *Renderer, ctx: *shp.Context, mod: core.config.StatusModule, start_x: u16, y: u16) u16 {
     var x = start_x;
 
+    if (!passesWhen(ctx, mod)) return x;
+
     for (mod.outputs) |out| {
         const style = shp.Style.parse(out.style);
         ctx.module_default_style = style;
@@ -479,6 +627,7 @@ pub fn drawFormatted(renderer: *Renderer, start_x: u16, y: u16, format: []const 
 }
 
 pub fn calcModuleWidth(ctx: *shp.Context, mod: core.config.StatusModule) u16 {
+    if (!passesWhen(ctx, mod)) return 0;
     var width: u16 = 0;
 
     for (mod.outputs) |out| {

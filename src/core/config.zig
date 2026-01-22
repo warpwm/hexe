@@ -3,10 +3,37 @@ const posix = std.posix;
 const lua_runtime = @import("lua_runtime.zig");
 const LuaRuntime = lua_runtime.LuaRuntime;
 
+threadlocal var PARSE_ERROR: ?[]const u8 = null;
+
+fn setParseError(allocator: std.mem.Allocator, msg: []const u8) void {
+    if (PARSE_ERROR != null) return;
+    PARSE_ERROR = allocator.dupe(u8, msg) catch null;
+}
+
 /// Output definition for status modules (style + format pair)
 pub const OutputDef = struct {
     style: []const u8 = "",
     format: []const u8 = "$output",
+};
+
+/// Provider-specific "when" condition for prompt/status modules.
+///
+/// No backwards compatibility: `when` must be a table in Lua configs.
+pub const WhenDef = struct {
+    bash: ?[]const u8 = null,
+    lua: ?[]const u8 = null,
+    // Only valid for mux statusbar modules.
+    hexe: ?[][]u8 = null,
+
+    pub fn deinit(self: *WhenDef, allocator: std.mem.Allocator) void {
+        if (self.bash) |s| allocator.free(s);
+        if (self.lua) |s| allocator.free(s);
+        if (self.hexe) |items| {
+            for (items) |s| allocator.free(s);
+            allocator.free(items);
+        }
+        self.* = .{};
+    }
 };
 
 /// Status bar module definition
@@ -18,7 +45,7 @@ pub const StatusModule = struct {
     outputs: []const OutputDef = &[_]OutputDef{},
     // Optional for custom modules
     command: ?[]const u8 = null,
-    when: ?[]const u8 = null,
+    when: ?WhenDef = null,
     // For tabs module
     active_style: []const u8 = "bg:1 fg:0",
     inactive_style: []const u8 = "bg:237 fg:250",
@@ -367,6 +394,8 @@ pub const Config = struct {
         var config = Config{};
         config._allocator = allocator;
 
+        PARSE_ERROR = null;
+
         const path = lua_runtime.getConfigPath(allocator, "config.lua") catch return config;
         defer allocator.free(path);
 
@@ -398,6 +427,14 @@ pub const Config = struct {
             runtime.pop();
         } else {
             config.status_message = allocator.dupe(u8, "no 'mux' section in config") catch null;
+        }
+
+        if (config.status != .@"error") {
+            if (PARSE_ERROR) |msg| {
+                config.status = .@"error";
+                config.status_message = msg;
+                PARSE_ERROR = null;
+            }
         }
 
         return config;
@@ -955,7 +992,7 @@ fn parseStatusModuleWithDefaultName(runtime: *LuaRuntime, allocator: std.mem.All
         .priority = lua_runtime.parseConstrainedInt(runtime, u8, -1, "priority", 1, 255, 50),
         .outputs = parseOutputs(runtime, allocator),
         .command = runtime.getStringAlloc(-1, "command"),
-        .when = runtime.getStringAlloc(-1, "when"),
+        .when = parseWhenTable(runtime, allocator, true),
         .active_style = runtime.getStringAlloc(-1, "active_style") orelse "bg:1 fg:0",
         .inactive_style = runtime.getStringAlloc(-1, "inactive_style") orelse "bg:237 fg:250",
         .separator = runtime.getStringAlloc(-1, "separator") orelse " | ",
@@ -1034,7 +1071,7 @@ fn parseStatusModule(runtime: *LuaRuntime, allocator: std.mem.Allocator) ?Status
         .priority = lua_runtime.parseConstrainedInt(runtime, u8, -1, "priority", 1, 255, 50),
         .outputs = parseOutputs(runtime, allocator),
         .command = runtime.getStringAlloc(-1, "command"),
-        .when = runtime.getStringAlloc(-1, "when"),
+        .when = parseWhenTable(runtime, allocator, true),
         .active_style = runtime.getStringAlloc(-1, "active_style") orelse "bg:1 fg:0",
         .inactive_style = runtime.getStringAlloc(-1, "inactive_style") orelse "bg:237 fg:250",
         .separator = runtime.getStringAlloc(-1, "separator") orelse " | ",
@@ -1043,6 +1080,51 @@ fn parseStatusModule(runtime: *LuaRuntime, allocator: std.mem.Allocator) ?Status
         .left_arrow = runtime.getStringAlloc(-1, "left_arrow") orelse "",
         .right_arrow = runtime.getStringAlloc(-1, "right_arrow") orelse "",
     };
+}
+
+fn parseWhenTable(runtime: *LuaRuntime, allocator: std.mem.Allocator, allow_hexe: bool) ?WhenDef {
+    const ty = runtime.fieldType(-1, "when");
+    if (ty == .nil) return null;
+
+    if (ty != .table) {
+        // No backwards compatibility: must be a table.
+        setParseError(allocator, "config: 'when' must be a table");
+        return null;
+    }
+
+    if (!runtime.pushTable(-1, "when")) return null;
+    defer runtime.pop();
+
+    var when: WhenDef = .{};
+    when.bash = runtime.getStringAlloc(-1, "bash");
+    when.lua = runtime.getStringAlloc(-1, "lua");
+
+    if (allow_hexe) {
+        const hexe_ty = runtime.fieldType(-1, "hexe");
+        if (hexe_ty != .nil and hexe_ty != .table) {
+            setParseError(allocator, "config: when.hexe must be an array table");
+        } else if (hexe_ty == .table and runtime.pushTable(-1, "hexe")) {
+            defer runtime.pop();
+            var list = std.ArrayList([]u8).empty;
+            const len = runtime.getArrayLen(-1);
+            for (1..len + 1) |i| {
+                if (runtime.pushArrayElement(-1, i)) {
+                    if (runtime.toStringAt(-1)) |s| {
+                        const dup = allocator.dupe(u8, s) catch null;
+                        if (dup) |d| {
+                            list.append(allocator, d) catch allocator.free(d);
+                        }
+                    }
+                    runtime.pop();
+                }
+            }
+            if (list.items.len > 0) {
+                when.hexe = list.toOwnedSlice(allocator) catch null;
+            }
+        }
+    }
+
+    return when;
 }
 
 fn parseOutputs(runtime: *LuaRuntime, allocator: std.mem.Allocator) []const OutputDef {
