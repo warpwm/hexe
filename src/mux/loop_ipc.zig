@@ -460,5 +460,101 @@ pub fn handleIpcConnection(state: *State, buffer: []u8) void {
             const response = std.fmt.bufPrint(&resp_buf, "{{\"type\":\"float_created\",\"uuid\":\"{s}\"}}", .{new_uuid}) catch return;
             conn.sendLine(response) catch {};
         }
+    } else if (std.mem.eql(u8, msg_type, "exit_intent")) {
+        // Shell asks mux permission before exiting.
+        // This avoids the "shell died -> respawn" hack for the last split.
+
+        // If this isn't a hexe mux session yet, or state is weird, just allow.
+        if (state.tabs.items.len == 0) {
+            conn.sendLine("{\"type\":\"exit_intent_result\",\"allow\":true}") catch {};
+            return;
+        }
+
+        const is_last_split = (state.currentLayout().splitCount() <= 1 and state.tabs.items.len <= 1);
+        if (!is_last_split or !state.config.confirm_on_exit) {
+            conn.sendLine("{\"type\":\"exit_intent_result\",\"allow\":true}") catch {};
+            return;
+        }
+
+        // Need confirmation. Only one pending request at a time.
+        if (state.pending_action != null or state.popups.isBlocked() or state.pending_exit_intent_fd != null) {
+            conn.sendLine("{\"type\":\"exit_intent_result\",\"allow\":false}") catch {};
+            return;
+        }
+
+        state.pending_action = .exit_intent;
+        state.pending_exit_intent_fd = conn.fd;
+        state.popups.showConfirm("Exit mux?", .{}) catch {
+            // If popup fails for any reason, default to allow.
+            state.pending_action = null;
+            state.pending_exit_intent_fd = null;
+            conn.sendLine("{\"type\":\"exit_intent_result\",\"allow\":true}") catch {};
+            return;
+        };
+        state.needs_render = true;
+        keep_open = true;
+    } else if (std.mem.eql(u8, msg_type, "shell_event")) {
+        const uuid_str = if (root.get("pane_uuid")) |v|
+            if (v == .string) v.string else ""
+        else
+            "";
+        if (uuid_str.len != 32) {
+            conn.sendLine("{\"type\":\"error\",\"message\":\"invalid_uuid\"}") catch {};
+            return;
+        }
+
+        var uuid: [32]u8 = undefined;
+        @memcpy(&uuid, uuid_str[0..32]);
+
+        const cmd = if (root.get("cmd")) |v|
+            if (v == .string) v.string else null
+        else
+            null;
+        const cwd = if (root.get("cwd")) |v|
+            if (v == .string) v.string else null
+        else
+            null;
+        const status_opt: ?i32 = if (root.get("status")) |v| switch (v) {
+            .integer => |i| @intCast(i),
+            else => null,
+        } else null;
+        const dur_opt: ?u64 = if (root.get("duration_ms")) |v| switch (v) {
+            .integer => |i| @intCast(@max(@as(i64, 0), i)),
+            else => null,
+        } else null;
+
+        const jobs_opt: ?u16 = if (root.get("jobs")) |v| switch (v) {
+            .integer => |i| @intCast(@max(@as(i64, 0), i)),
+            else => null,
+        } else null;
+
+        // Job count delta notifications (only on 0<->nonzero transitions).
+        const old_jobs: ?u16 = if (state.pane_shell.get(uuid)) |info| info.jobs else null;
+        if (jobs_opt) |new_jobs| {
+            if (old_jobs) |old| {
+                if (old == 0 and new_jobs > 0) {
+                    var msg_buf: [64]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&msg_buf, "Background jobs: {d}", .{new_jobs}) catch null;
+                    if (msg) |m| {
+                        state.notifications.show(m);
+                        state.needs_render = true;
+                    }
+                } else if (old > 0 and new_jobs == 0) {
+                    state.notifications.show("Background jobs finished");
+                    state.needs_render = true;
+                }
+            }
+        }
+
+        state.setPaneShell(uuid, cmd, cwd, status_opt, dur_opt, jobs_opt);
+
+        // Forward to ses so `hexe com info` can show it.
+        state.ses_client.updatePaneShell(uuid, cmd, cwd, status_opt, dur_opt, jobs_opt) catch {};
+
+        // Shell events often arrive with no pane output; force a re-render so
+        // statusbar modules (cmd/jobs/etc) update immediately.
+        state.needs_render = true;
+
+        conn.sendLine("{\"type\":\"ok\"}") catch {};
     }
 }

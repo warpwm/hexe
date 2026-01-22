@@ -528,6 +528,73 @@ pub const SesClient = struct {
         if (line == null) return error.ConnectionClosed;
     }
 
+    /// Update shell-provided pane metadata (last command, status, duration).
+    pub fn updatePaneShell(self: *SesClient, uuid: [32]u8, cmd: ?[]const u8, cwd: ?[]const u8, status: ?i32, duration_ms: ?u64, jobs: ?u16) !void {
+        const conn = &(self.conn orelse return error.NotConnected);
+
+        var buf: [2048]u8 = undefined;
+        var stream = std.io.fixedBufferStream(&buf);
+        var writer = stream.writer();
+
+        try writer.print("{{\"type\":\"update_pane_shell\",\"uuid\":\"{s}\"", .{uuid});
+        if (cmd) |c| {
+            try writer.writeAll(",\"cmd\":\"");
+            for (c) |ch| {
+                switch (ch) {
+                    '"' => try writer.writeAll("\\\""),
+                    '\\' => try writer.writeAll("\\\\"),
+                    '\n' => try writer.writeAll("\\n"),
+                    '\r' => try writer.writeAll("\\r"),
+                    '\t' => try writer.writeAll("\\t"),
+                    else => {
+                        if (ch < 0x20) {
+                            try writer.writeByte(' ');
+                        } else {
+                            try writer.writeByte(ch);
+                        }
+                    },
+                }
+            }
+            try writer.writeAll("\"");
+        }
+        if (cwd) |c| {
+            try writer.writeAll(",\"cwd\":\"");
+            for (c) |ch| {
+                switch (ch) {
+                    '"' => try writer.writeAll("\\\""),
+                    '\\' => try writer.writeAll("\\\\"),
+                    '\n' => try writer.writeAll("\\n"),
+                    '\r' => try writer.writeAll("\\r"),
+                    '\t' => try writer.writeAll("\\t"),
+                    else => {
+                        if (ch < 0x20) {
+                            try writer.writeByte(' ');
+                        } else {
+                            try writer.writeByte(ch);
+                        }
+                    },
+                }
+            }
+            try writer.writeAll("\"");
+        }
+        if (status) |s| {
+            try writer.print(",\"status\":{d}", .{s});
+        }
+        if (duration_ms) |d| {
+            try writer.print(",\"duration_ms\":{d}", .{d});
+        }
+        if (jobs) |j| {
+            try writer.print(",\"jobs\":{d}", .{j});
+        }
+        try writer.writeAll("}");
+
+        try conn.sendLine(stream.getWritten());
+
+        var resp_buf: [256]u8 = undefined;
+        const line = try conn.recvLine(&resp_buf);
+        if (line == null) return error.ConnectionClosed;
+    }
+
     /// Adopt an orphaned pane
     pub fn adoptPane(self: *SesClient, uuid: [32]u8) !struct { uuid: [32]u8, socket_path: []u8, pid: posix.pid_t } {
         const conn = &(self.conn orelse return error.NotConnected);

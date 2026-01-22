@@ -30,6 +30,20 @@ const state_sync = @import("state_sync.zig");
 
 pub const TabFocusKind = enum { split, float };
 
+pub const PaneShellInfo = struct {
+    cmd: ?[]u8 = null,
+    cwd: ?[]u8 = null,
+    status: ?i32 = null,
+    duration_ms: ?u64 = null,
+    jobs: ?u16 = null,
+
+    pub fn deinit(self: *PaneShellInfo, allocator: std.mem.Allocator) void {
+        if (self.cmd) |c| allocator.free(c);
+        if (self.cwd) |c| allocator.free(c);
+        self.* = .{};
+    }
+};
+
 pub const State = struct {
     allocator: std.mem.Allocator,
     config: core.Config,
@@ -58,6 +72,10 @@ pub const State = struct {
     popups: pop.PopupManager,
     pending_action: ?PendingAction,
     exit_from_shell_death: bool,
+    /// IPC client waiting for exit_intent decision (fd kept open)
+    pending_exit_intent_fd: ?posix.fd_t,
+    /// If non-zero and in the future, skip confirm_on_exit for the next last-pane death.
+    exit_intent_deadline_ms: i64,
     adopt_orphans: [32]OrphanedPaneInfo = undefined,
     adopt_orphan_count: usize = 0,
     adopt_selected_uuid: ?[32]u8 = null,
@@ -78,6 +96,9 @@ pub const State = struct {
     osc_reply_prev_esc: bool,
 
     pending_float_requests: std.AutoHashMap([32]u8, PendingFloatRequest),
+
+    /// Shell-provided metadata (last command, status, duration) keyed by pane UUID.
+    pane_shell: std.AutoHashMap([32]u8, PaneShellInfo),
 
     pub fn init(allocator: std.mem.Allocator, width: u16, height: u16, debug: bool, log_file: ?[]const u8) !State {
         const cfg = core.Config.load(allocator);
@@ -119,6 +140,8 @@ pub const State = struct {
             .popups = pop.PopupManager.init(allocator),
             .pending_action = null,
             .exit_from_shell_death = false,
+            .pending_exit_intent_fd = null,
+            .exit_intent_deadline_ms = 0,
             .skip_dead_check = false,
             .pending_pop_response = false,
             .pending_pop_scope = .mux,
@@ -136,6 +159,8 @@ pub const State = struct {
             .osc_reply_prev_esc = false,
 
             .pending_float_requests = std.AutoHashMap([32]u8, PendingFloatRequest).init(allocator),
+
+            .pane_shell = std.AutoHashMap([32]u8, PaneShellInfo).init(allocator),
         };
     }
 
@@ -156,6 +181,15 @@ pub const State = struct {
             // instead of treating the disconnect as a crash.
             self.ses_client.shutdown(true) catch {};
             ses_shutdown_done = true;
+        }
+
+        // Free shell metadata.
+        {
+            var it = self.pane_shell.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.pane_shell.deinit();
         }
 
         // Deinit floats.
@@ -312,5 +346,31 @@ pub const State = struct {
 
     pub fn resizeFloatingPanes(self: *State) void {
         return state_sync.resizeFloatingPanes(self);
+    }
+
+    pub fn setPaneShell(self: *State, uuid: [32]u8, cmd: ?[]const u8, cwd: ?[]const u8, status: ?i32, duration_ms: ?u64, jobs: ?u16) void {
+        var entry = self.pane_shell.getPtr(uuid);
+        if (entry == null) {
+            self.pane_shell.put(uuid, .{}) catch return;
+            entry = self.pane_shell.getPtr(uuid);
+        }
+        if (entry) |info| {
+            if (cmd) |c| {
+                if (info.cmd) |old| self.allocator.free(old);
+                info.cmd = self.allocator.dupe(u8, c) catch info.cmd;
+            }
+            if (cwd) |c| {
+                if (info.cwd) |old| self.allocator.free(old);
+                info.cwd = self.allocator.dupe(u8, c) catch info.cwd;
+            }
+            if (status) |s| info.status = s;
+            if (duration_ms) |d| info.duration_ms = d;
+            if (jobs) |j| info.jobs = j;
+        }
+    }
+
+    pub fn getPaneShell(self: *const State, uuid: [32]u8) ?PaneShellInfo {
+        if (self.pane_shell.get(uuid)) |v| return v;
+        return null;
     }
 };

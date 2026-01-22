@@ -49,7 +49,9 @@ pub fn createTab(self: anytype) !void {
         cwd = std.posix.getcwd(&cwd_buf) catch null;
     }
 
-    var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, "tab", self.pop_config.carrier.notification);
+    const base_name = core.ipc.generateTabName();
+    const name_owned = try self.allocator.dupe(u8, base_name);
+    var tab = Tab.initOwned(self.allocator, self.layout_width, self.layout_height, name_owned, self.pop_config.carrier.notification);
     // Set ses client if connected (for new tabs after startup).
     if (self.ses_client.isConnected()) {
         tab.layout.setSesClient(&self.ses_client);
@@ -353,8 +355,8 @@ pub fn reattachSession(self: anytype, session_id_prefix: []const u8) bool {
             const next_split_id: u16 = @intCast((tab_obj.get("next_split_id") orelse continue).integer);
 
             // Dupe the name since parsed JSON will be freed.
-            const name = self.allocator.dupe(u8, name_json) catch continue;
-            var tab = Tab.init(self.allocator, self.layout_width, self.layout_height, name, self.pop_config.carrier.notification);
+            const name_owned = self.allocator.dupe(u8, name_json) catch continue;
+            var tab = Tab.initOwned(self.allocator, self.layout_width, self.layout_height, name_owned, self.pop_config.carrier.notification);
 
             // Restore tab UUID if present.
             if (tab_obj.get("uuid")) |uuid_val| {

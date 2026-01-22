@@ -21,6 +21,7 @@ pub const PaneType = enum {
 /// Minimal pane structure - just what's needed to keep process alive
 pub const Pane = struct {
     uuid: [32]u8,
+    name: ?[]const u8 = null,
     pod_pid: posix.pid_t,
     pod_socket_path: []const u8,
     child_pid: posix.pid_t,
@@ -65,9 +66,18 @@ pub const Pane = struct {
     // Layout path (synced from mux, owned)
     layout_path: ?[]const u8 = null,
 
+    // Shell-provided metadata (owned)
+    last_cmd: ?[]const u8 = null,
+    last_status: ?i32 = null,
+    last_duration_ms: ?u64 = null,
+    last_jobs: ?u16 = null,
+
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Pane) void {
+        if (self.name) |n| {
+            self.allocator.free(n);
+        }
         self.allocator.free(self.pod_socket_path);
         if (self.sticky_pwd) |pwd| {
             self.allocator.free(pwd);
@@ -80,6 +90,9 @@ pub const Pane = struct {
         }
         if (self.layout_path) |path| {
             self.allocator.free(path);
+        }
+        if (self.last_cmd) |c| {
+            self.allocator.free(c);
         }
     }
 
@@ -604,9 +617,13 @@ pub const SesState = struct {
         extra_env: ?[]const []const u8,
     ) !*Pane {
         const uuid = ipc.generateUuid();
+        const base_name = ipc.generatePaneName();
+        const name = try self.generateUniquePaneName(base_name);
+        errdefer self.allocator.free(name);
         const pod_socket_path = try ipc.getPodSocketPath(self.allocator, &uuid);
+        errdefer self.allocator.free(pod_socket_path);
 
-        const spawn = try self.spawnPod(uuid, pod_socket_path, shell, cwd, env, extra_env);
+        const spawn = try self.spawnPod(uuid, name, pod_socket_path, shell, cwd, env, extra_env);
 
         // Copy sticky_pwd if provided
         const owned_pwd: ?[]const u8 = if (sticky_pwd) |pwd|
@@ -618,6 +635,7 @@ pub const SesState = struct {
 
         const pane = Pane{
             .uuid = uuid,
+            .name = name,
             .pod_pid = spawn.pod_pid,
             .pod_socket_path = pod_socket_path,
             .child_pid = spawn.child_pid,
@@ -642,9 +660,35 @@ pub const SesState = struct {
         return self.panes.getPtr(uuid).?;
     }
 
+    fn generateUniquePaneName(self: *SesState, base: []const u8) ![]const u8 {
+        // Names are per-ses daemon, so keep them unique among all panes we track.
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const candidate = if (attempt == 0)
+                try self.allocator.dupe(u8, base)
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}-{d}", .{ base, attempt + 1 });
+
+            var used = false;
+            var it = self.panes.valueIterator();
+            while (it.next()) |p| {
+                if (p.name) |n| {
+                    if (std.mem.eql(u8, n, candidate)) {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!used) return candidate;
+            self.allocator.free(candidate);
+        }
+    }
+
     fn spawnPod(
         self: *SesState,
         uuid: [32]u8,
+        name: []const u8,
         pod_socket_path: []const u8,
         shell: []const u8,
         cwd: ?[]const u8,
@@ -662,6 +706,8 @@ pub const SesState = struct {
         try args_list.append(self.allocator, "daemon");
         try args_list.append(self.allocator, "--uuid");
         try args_list.append(self.allocator, uuid[0..]);
+        try args_list.append(self.allocator, "--name");
+        try args_list.append(self.allocator, name);
         try args_list.append(self.allocator, "--socket");
         try args_list.append(self.allocator, pod_socket_path);
         try args_list.append(self.allocator, "--shell");

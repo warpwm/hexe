@@ -230,6 +230,9 @@ pub fn handleStatus(
                     uuid,
                     pane.child_pid,
                 });
+                if (pane.name) |n| {
+                    try writer.print(",\"name\":\"{s}\"", .{n});
+                }
                 if (pane.sticky_pwd) |pwd| {
                     try writer.print(",\"sticky_pwd\":\"{s}\"", .{pwd});
                 }
@@ -302,10 +305,11 @@ pub fn handleStatus(
         if (pane.state == .orphaned) {
             if (!first_orphan) try writer.writeAll(",");
             first_orphan = false;
-            try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d}}}", .{
-                entry.key_ptr.*,
-                pane.child_pid,
-            });
+            try writer.print("{{\"uuid\":\"{s}\",\"pid\":{d}", .{ entry.key_ptr.*, pane.child_pid });
+            if (pane.name) |n| {
+                try writer.print(",\"name\":\"{s}\"", .{n});
+            }
+            try writer.writeAll("}");
         }
     }
 
@@ -322,6 +326,9 @@ pub fn handleStatus(
                 entry.key_ptr.*,
                 pane.child_pid,
             });
+            if (pane.name) |n| {
+                try writer.print(",\"name\":\"{s}\"", .{n});
+            }
             if (pane.sticky_pwd) |pwd| {
                 try writer.print(",\"pwd\":\"{s}\"", .{pwd});
             }

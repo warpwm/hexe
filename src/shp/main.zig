@@ -30,6 +30,7 @@ const JsonConfig = struct {
 /// Arguments for shp commands
 pub const PopArgs = struct {
     init_shell: ?[]const u8 = null,
+    no_comms: bool = false,
     prompt: bool = false,
     status: i64 = 0,
     duration: i64 = 0,
@@ -45,7 +46,7 @@ pub fn run(args: PopArgs) !void {
     const allocator = gpa.allocator();
 
     if (args.init_shell) |shell| {
-        try printInit(shell);
+        try printInit(shell, args.no_comms);
     } else if (args.prompt) {
         // Build args array for renderPrompt
         var prompt_args: [6][]const u8 = undefined;
@@ -136,7 +137,7 @@ fn printUsage() !void {
     );
 }
 
-fn printInit(shell: []const u8) !void {
+fn printInit(shell: []const u8, no_comms: bool) !void {
     const stdout = std.fs.File.stdout();
 
     if (std.mem.eql(u8, shell, "bash")) {
@@ -160,6 +161,66 @@ fn printInit(shell: []const u8) !void {
             \\PROMPT_COMMAND="__shp_precmd"
             \\
         );
+
+        if (!no_comms) {
+            try stdout.writeAll(
+                \\# Hexe shell->mux communication hooks (Bash)
+                \\__hexe_exit_intent() {
+                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || return 0
+                \\    hexe com exit-intent >/dev/null 2>/dev/null
+                \\    return $?
+                \\}
+                \\
+                \\__hexe_preexec() {
+                \\    __hexe_start=$(date +%s%3N)
+                \\}
+                \\
+                \\__hexe_precmd() {
+                \\    local exit_status=$?
+                \\    local duration=0
+                \\    if [[ -n "$__hexe_start" ]]; then
+                \\        duration=$(( $(date +%s%3N) - __hexe_start ))
+                \\    fi
+                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || { unset __hexe_start; return 0; }
+                \\    # OSC 7 cwd sync
+                \\    printf '\\e]7;file://%s%s\\a' "${HOSTNAME:-localhost}" "$PWD" 2>/dev/null
+                \\    local hist="$(history 1 2>/dev/null)"
+                \\    local cmd="$hist"
+                \\    if [[ $hist =~ ^[[:space:]]*[0-9]+[[:space:]]*(.*)$ ]]; then
+                \\        cmd="${BASH_REMATCH[1]}"
+                \\    fi
+                \\    local jobs_count=$(jobs -p 2>/dev/null | wc -l)
+                \\    hexe com shell-event --cmd="$cmd" --status=$exit_status --duration=$duration --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
+                \\    unset __hexe_start
+                \\}
+                \\
+                \\exit() {
+                \\    case $- in *i*) ;; *) builtin exit "$@" ;; esac
+                \\    __hexe_exit_intent || return 0
+                \\    builtin exit "$@"
+                \\}
+                \\
+                \\logout() {
+                \\    case $- in *i*) ;; *) builtin logout "$@" ;; esac
+                \\    __hexe_exit_intent || return 0
+                \\    builtin logout "$@"
+                \\}
+                \\
+                \\__hexe_ctrl_d() {
+                \\    if [[ -z "$READLINE_LINE" ]]; then
+                \\        __hexe_exit_intent || { READLINE_LINE=""; READLINE_POINT=0; return; }
+                \\        builtin exit
+                \\    fi
+                \\}
+                \\
+                \\bind -x '"\C-d":__hexe_ctrl_d'
+                \\
+                \\# Extend existing timing hooks with comms.
+                \\PROMPT_COMMAND="__shp_precmd;__hexe_precmd"
+                \\trap '__shp_preexec;__hexe_preexec' DEBUG
+                \\
+            );
+        }
     } else if (std.mem.eql(u8, shell, "zsh")) {
         try stdout.writeAll(
             \\# Hexe prompt initialization for Zsh
@@ -184,6 +245,62 @@ fn printInit(shell: []const u8) !void {
             \\ZLE_RPROMPT_INDENT=0
             \\
         );
+
+        if (!no_comms) {
+            try stdout.writeAll(
+                \\# Hexe shell->mux communication hooks (Zsh)
+                \\__hexe_last_cmd=""
+                \\__hexe_start=""
+                \\
+                \\__hexe_exit_intent() {
+                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || return 0
+                \\    hexe com exit-intent >/dev/null 2>/dev/null
+                \\    return $?
+                \\}
+                \\
+                \\__hexe_preexec_capture() {
+                \\    __hexe_last_cmd="$1"
+                \\    __hexe_start=$(date +%s%3N)
+                \\}
+                \\
+                \\__hexe_precmd_send() {
+                \\    local exit_status=$?
+                \\    local duration=0
+                \\    if [[ -n "$__hexe_start" ]]; then
+                \\        duration=$(( $(date +%s%3N) - __hexe_start ))
+                \\    fi
+                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || { unset __hexe_start; return 0; }
+                \\    # OSC 7 cwd sync
+                \\    printf '\\e]7;file://%s%s\\a' "${HOST:-localhost}" "$PWD" 2>/dev/null
+                \\    hexe com shell-event --cmd="$__hexe_last_cmd" --status=$exit_status --duration=$duration --cwd="$PWD" --jobs=${(M)#jobstates} >/dev/null 2>/dev/null
+                \\    unset __hexe_start
+                \\}
+                \\
+                \\__hexe_accept_line() {
+                \\    if [[ "$BUFFER" == "exit" || "$BUFFER" == "logout" ]]; then
+                \\        __hexe_exit_intent || { BUFFER=""; zle reset-prompt; return 0; }
+                \\    fi
+                \\    zle .accept-line
+                \\}
+                \\zle -N accept-line __hexe_accept_line
+                \\
+                \\__hexe_ctrl_d() {
+                \\    if [[ -z "$BUFFER" ]]; then
+                \\        __hexe_exit_intent || { BUFFER=""; zle reset-prompt; return 0; }
+                \\        zle .send-eof
+                \\        return
+                \\    fi
+                \\    zle .delete-char
+                \\}
+                \\zle -N __hexe_ctrl_d
+                \\bindkey '^D' __hexe_ctrl_d
+                \\
+                \\autoload -Uz add-zsh-hook
+                \\add-zsh-hook preexec __hexe_preexec_capture
+                \\add-zsh-hook precmd __hexe_precmd_send
+                \\
+            );
+        }
     } else if (std.mem.eql(u8, shell, "fish")) {
         try stdout.writeAll(
             \\# Hexe prompt initialization for Fish
@@ -200,6 +317,66 @@ fn printInit(shell: []const u8) !void {
             \\end
             \\
         );
+
+        if (!no_comms) {
+            try stdout.writeAll(
+                \\# Hexe shell->mux communication hooks (Fish)
+                \\function __hexe_exit_intent
+                \\    if not status is-interactive
+                \\        return 0
+                \\    end
+                \\    if not set -q HEXE_MUX_SOCKET
+                \\        return 0
+                \\    end
+                \\    if not set -q HEXE_PANE_UUID
+                \\        return 0
+                \\    end
+                \\    hexe com exit-intent >/dev/null 2>/dev/null
+                \\    return $status
+                \\end
+                \\
+                \\function exit
+                \\    __hexe_exit_intent; or return 0
+                \\    builtin exit $argv
+                \\end
+                \\
+                \\function logout
+                \\    exit $argv
+                \\end
+                \\
+                \\function __hexe_ctrl_d
+                \\    set -l line (commandline)
+                \\    if test -z "$line"
+                \\        __hexe_exit_intent; or begin
+                \\            commandline ""
+                \\            commandline -f repaint
+                \\            return
+                \\        end
+                \\        exit
+                \\    end
+                \\    commandline -f delete-char
+                \\end
+                \\bind \cd __hexe_ctrl_d
+                \\
+                \\function __hexe_fish_postexec --on-event fish_postexec
+                \\    if not status is-interactive
+                \\        return
+                \\    end
+                \\    if not set -q HEXE_MUX_SOCKET
+                \\        return
+                \\    end
+                \\    if not set -q HEXE_PANE_UUID
+                \\        return
+                \\    end
+                \\    set -l cmdline (string join " " -- $argv)
+                \\    # OSC 7 cwd sync
+                \\    printf '\\e]7;file://%s%s\\a' "$hostname" "$PWD" 2>/dev/null
+                \\    set -l jobs_count (count (jobs -p))
+                \\    hexe com shell-event --cmd="$cmdline" --status=$status --duration=$CMD_DURATION --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
+                \\end
+                \\
+            );
+        }
     } else {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Unknown shell: {s}\nSupported shells: bash, zsh, fish\n", .{shell}) catch return;
@@ -704,4 +881,3 @@ fn checkCondition(cmd: []const u8) bool {
         else => false,
     };
 }
-

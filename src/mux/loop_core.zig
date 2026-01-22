@@ -287,7 +287,13 @@ pub fn runMainLoop(state: *State) !void {
                     _ = state.closeCurrentTab();
                     state.needs_render = true;
                 } else {
-                    if (state.config.confirm_on_exit and state.pending_action == null) {
+                    // If the shell asked permission to exit and we confirmed,
+                    // don't ask again when it actually dies.
+                    const now_ms = std.time.milliTimestamp();
+                    if (state.exit_intent_deadline_ms > now_ms) {
+                        state.exit_intent_deadline_ms = 0;
+                        state.running = false;
+                    } else if (state.config.confirm_on_exit and state.pending_action == null) {
                         state.pending_action = .exit;
                         state.exit_from_shell_death = true;
                         state.popups.showConfirm("Shell exited. Close mux?", .{}) catch {};

@@ -30,6 +30,9 @@ pub fn save(allocator: std.mem.Allocator, ses_state: *state.SesState) !void {
             p.pod_socket_path,
             @tagName(p.state),
         });
+        if (p.name) |n| {
+            try w.print(",\"name\":\"{s}\"", .{n});
+        }
         if (p.sticky_pwd) |pwd| {
             try w.print(",\"sticky_pwd\":\"{s}\"", .{pwd});
         }
@@ -128,6 +131,11 @@ pub fn load(allocator: std.mem.Allocator, ses_state: *state.SesState) !void {
             const sticky_pwd: ?[]const u8 = if (obj.get("sticky_pwd")) |p| try ses_state.allocator.dupe(u8, p.string) else null;
             const sticky_key: ?u8 = if (obj.get("sticky_key")) |k| @intCast(k.integer) else null;
 
+            const name: ?[]const u8 = if (obj.get("name")) |n|
+                try ses_state.allocator.dupe(u8, n.string)
+            else
+                null;
+
             var session_id: ?[16]u8 = null;
             if (obj.get("session_id")) |sid_val| {
                 const sid_hex = sid_val.string;
@@ -140,6 +148,7 @@ pub fn load(allocator: std.mem.Allocator, ses_state: *state.SesState) !void {
 
             const pane = state.Pane{
                 .uuid = uuid,
+                .name = name,
                 .pod_pid = pod_pid,
                 .pod_socket_path = owned_socket,
                 .child_pid = child_pid,
@@ -154,6 +163,7 @@ pub fn load(allocator: std.mem.Allocator, ses_state: *state.SesState) !void {
             };
             ses_state.panes.put(uuid, pane) catch {
                 ses_state.allocator.free(owned_socket);
+                if (name) |nn| ses_state.allocator.free(nn);
                 if (sticky_pwd) |pwd| ses_state.allocator.free(pwd);
             };
         }

@@ -12,6 +12,8 @@ const NotificationManager = notification.NotificationManager;
 /// Pending action that needs confirmation.
 pub const PendingAction = enum {
     exit,
+    /// Shell asked permission to exit (pre-exit handshake)
+    exit_intent,
     detach,
     disown,
     close,
@@ -23,6 +25,7 @@ pub const PendingAction = enum {
 pub const Tab = struct {
     layout: Layout,
     name: []const u8,
+    name_owned: ?[]u8 = null,
     uuid: [32]u8,
     notifications: NotificationManager,
     popups: pop.PopupManager,
@@ -32,6 +35,7 @@ pub const Tab = struct {
         return .{
             .layout = Layout.init(allocator, width, height),
             .name = name,
+            .name_owned = null,
             .uuid = core.ipc.generateUuid(),
             .notifications = NotificationManager.initWithPopConfig(allocator, notif_cfg),
             .popups = pop.PopupManager.init(allocator),
@@ -39,7 +43,16 @@ pub const Tab = struct {
         };
     }
 
+    pub fn initOwned(allocator: std.mem.Allocator, width: u16, height: u16, name_owned: []u8, notif_cfg: pop.NotificationStyle) Tab {
+        var tab = Tab.init(allocator, width, height, name_owned, notif_cfg);
+        tab.name_owned = name_owned;
+        return tab;
+    }
+
     pub fn deinit(self: *Tab) void {
+        if (self.name_owned) |n| {
+            self.allocator.free(n);
+        }
         self.layout.deinit();
         self.notifications.deinit();
         self.popups.deinit();

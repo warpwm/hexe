@@ -24,6 +24,9 @@ pub const Context = struct {
     cmd_duration_ms: ?u64 = null,
     jobs: u16 = 0,
 
+    // Shell metadata (for mux status bar mode)
+    last_command: ?[]const u8 = null,
+
     // Mux state (for status bar mode)
     session_name: []const u8 = "",
     tab_names: []const []const u8 = &.{},
@@ -59,7 +62,7 @@ pub const Context = struct {
     pub fn renderSegment(self: *Context, name: []const u8) ?[]const Segment {
         // Dynamic segments (cpu, mem, netspeed, time) should not be cached
         // since they need fresh values each render
-        const dynamic_segments = [_][]const u8{ "cpu", "mem", "memory", "netspeed", "time", "battery", "uptime" };
+        const dynamic_segments = [_][]const u8{ "cpu", "mem", "memory", "netspeed", "time", "battery", "uptime", "last_command" };
         var is_dynamic = false;
         for (dynamic_segments) |dyn| {
             if (std.mem.eql(u8, name, dyn)) {

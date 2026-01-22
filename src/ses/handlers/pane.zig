@@ -450,8 +450,99 @@ pub fn handlePaneInfo(
     try writer.print(",\"cursor_visible\":{}", .{pane.cursor_visible});
     try writer.print(",\"alt_screen\":{}", .{pane.alt_screen});
 
+    if (pane.name) |n| {
+        try writer.print(",\"name\":\"{s}\"", .{n});
+    }
+
+    // Shell metadata (from shell integration via mux)
+    if (pane.last_cmd) |cmd| {
+        try writer.writeAll(",\"last_cmd\":\"");
+        try writeJsonEscaped(writer, cmd);
+        try writer.writeAll("\"");
+    }
+    if (pane.last_status) |st| {
+        try writer.print(",\"last_status\":{d}", .{st});
+    }
+    if (pane.last_duration_ms) |d| {
+        try writer.print(",\"last_duration_ms\":{d}", .{d});
+    }
+    if (pane.last_jobs) |j| {
+        try writer.print(",\"last_jobs\":{d}", .{j});
+    }
+
     try writer.writeAll("}\n");
     try conn.send(stream.getWritten());
+}
+
+pub fn handleUpdatePaneShell(
+    ses_state: *state.SesState,
+    conn: *ipc.Connection,
+    root: std.json.ObjectMap,
+    sendError: *const fn (*ipc.Connection, []const u8) anyerror!void,
+) !void {
+    const uuid_val = root.get("uuid") orelse return sendError(conn, "missing_uuid");
+    const uuid_str = switch (uuid_val) {
+        .string => |s| s,
+        else => return sendError(conn, "invalid_uuid"),
+    };
+    if (uuid_str.len != 32) return sendError(conn, "invalid_uuid");
+
+    var uuid: [32]u8 = undefined;
+    @memcpy(&uuid, uuid_str[0..32]);
+
+    const pane = ses_state.panes.getPtr(uuid) orelse {
+        return sendError(conn, "pane_not_found");
+    };
+
+    if (root.get("cmd")) |v| {
+        if (v == .string) {
+            if (pane.last_cmd) |old| pane.allocator.free(old);
+            pane.last_cmd = pane.allocator.dupe(u8, v.string) catch pane.last_cmd;
+        }
+    }
+    if (root.get("cwd")) |v| {
+        if (v == .string) {
+            if (pane.cwd) |old| pane.allocator.free(old);
+            pane.cwd = pane.allocator.dupe(u8, v.string) catch pane.cwd;
+        }
+    }
+    if (root.get("status")) |v| {
+        if (v == .integer) {
+            pane.last_status = @intCast(v.integer);
+        }
+    }
+    if (root.get("duration_ms")) |v| {
+        if (v == .integer) {
+            pane.last_duration_ms = @intCast(@max(@as(i64, 0), v.integer));
+        }
+    }
+    if (root.get("jobs")) |v| {
+        if (v == .integer) {
+            pane.last_jobs = @intCast(@max(@as(i64, 0), v.integer));
+        }
+    }
+
+    ses_state.dirty = true;
+    try conn.sendLine("{\"type\":\"ok\"}");
+}
+
+fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
+    for (value) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.writeByte(' ');
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
 }
 
 /// Handle update_pane_aux request

@@ -299,12 +299,64 @@ const pokemon_names = [_][]const u8{
     "dratini",    "dragonair",  "dragonite",  "mewtwo",     "mew",
 };
 
+// Star names for pane naming (lowercase, ASCII)
+const star_names = [_][]const u8{
+    "achernar",  "acrux",      "adhafera",   "adhara",     "alcor",
+    "aldebaran", "algol",      "alhena",     "alioth",     "alkaid",
+    "almaak",    "alnair",     "alnilam",    "alnitak",    "alphard",
+    "alphecca",  "alpheratz",  "altair",     "aludra",     "alycone",
+    "ancha",     "ankaa",      "antares",    "arcturus",   "atlas",
+    "atria",     "auva",       "avior",      "bellatrix",  "betelgeuse",
+    "canopus",   "capella",    "castor",     "celaeno",    "chara",
+    "deneb",     "denebola",   "diphda",     "dschubba",   "dubhe",
+    "electra",   "elnath",     "elnin",      "enif",       "fomalhaut",
+    "gacrux",    "garnet",     "hadar",      "hamal",      "izaar",
+    "kitalpha",  "kochab",     "lesath",     "maia",       "markab",
+    "meissa",    "mimosa",     "mira",       "mirach",     "mirfak",
+    "mirzam",    "mizar",      "naos",       "nashira",    "nunki",
+    "peacock",   "phaethon",   "pleione",    "pollux",     "polaris",
+    "procyon",   "rasalhague", "rasalgethi", "regor",      "regulus",
+    "rigel",     "rigil",      "rotanev",    "rukbat",     "sabik",
+    "saiph",     "scheat",     "schedar",    "shaula",     "sirius",
+    "spica",     "suhail",     "tarazed",    "thuban",     "unukalhai",
+    "vega",      "vindemiatrix","wasat",      "wezen",      "zubenelgenubi",
+};
+
+// Constellation names for tab naming (lowercase, ASCII)
+const constellation_names = [_][]const u8{
+    "andromeda", "aquarius", "aquila", "aries", "auriga",
+    "bootes", "cancer", "canis-major", "canis-minor", "capricornus",
+    "cassiopeia", "centaurus", "cepheus", "cetus", "columba",
+    "corvus", "crater", "cygnus", "draco", "equuleus",
+    "eridanus", "gemini", "hercules", "hydra", "lacerta",
+    "leo", "libra", "lupus", "lyra", "monoceros",
+    "orion", "pegasus", "perseus", "phoenix", "pisces",
+    "sagitta", "sagittarius", "scorpius", "serpens", "taurus",
+    "triangulum", "ursa-major", "ursa-minor", "virgo",
+};
+
 /// Generate a random Pokemon name for session naming
 pub fn generateSessionName() []const u8 {
     var rand_byte: [1]u8 = undefined;
     std.crypto.random.bytes(&rand_byte);
     const index = rand_byte[0] % pokemon_names.len;
     return pokemon_names[index];
+}
+
+/// Generate a random star name for pane naming.
+pub fn generatePaneName() []const u8 {
+    var rand_byte: [1]u8 = undefined;
+    std.crypto.random.bytes(&rand_byte);
+    const index = rand_byte[0] % star_names.len;
+    return star_names[index];
+}
+
+/// Generate a random constellation name for tab naming.
+pub fn generateTabName() []const u8 {
+    var rand_byte: [1]u8 = undefined;
+    std.crypto.random.bytes(&rand_byte);
+    const index = rand_byte[0] % constellation_names.len;
+    return constellation_names[index];
 }
 
 /// Get the socket directory path

@@ -58,7 +58,18 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
                 }
 
                 if (c.get("mux_state")) |mux_state_val| {
-                    printMuxTree(allocator, mux_state_val.string, "    ");
+                    var pane_names = std.StringHashMap([]const u8).init(allocator);
+                    defer pane_names.deinit();
+
+                    for (panes.items) |pane_val| {
+                        const p = pane_val.object;
+                        const uuid = p.get("uuid").?.string;
+                        if (p.get("name")) |n| {
+                            pane_names.put(uuid, n.string) catch {};
+                        }
+                    }
+
+                    printMuxTree(allocator, mux_state_val.string, "    ", &pane_names);
                 }
             }
         }
@@ -78,7 +89,7 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
                 print("  {s} [{s}] {d} panes - reattach: hexe mux attach {s}\n", .{ name, sid[0..8], pane_count, name });
 
                 if (s.get("mux_state")) |mux_state_val| {
-                    printMuxTree(allocator, mux_state_val.string, "    ");
+                    printMuxTree(allocator, mux_state_val.string, "    ", null);
                 }
             }
         }
@@ -93,7 +104,11 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
                 const p = pane_val.object;
                 const uuid = p.get("uuid").?.string;
                 const pid = p.get("pid").?.integer;
-                print("  [{s}] pid={d}\n", .{ uuid[0..8], pid });
+                if (p.get("name")) |n| {
+                    print("  [{s}] {s} pid={d}\n", .{ uuid[0..8], n.string, pid });
+                } else {
+                    print("  [{s}] pid={d}\n", .{ uuid[0..8], pid });
+                }
             }
         }
     }
@@ -264,6 +279,9 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
     if (root.get("cwd")) |cwd| {
         print("  CWD: {s}\n", .{cwd.string});
     }
+    if (root.get("name")) |n| {
+        print("  Name: {s}\n", .{n.string});
+    }
     if (root.get("tty")) |tty| {
         print("  TTY: {s}\n", .{tty.string});
     }
@@ -306,6 +324,19 @@ pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator:
     }
     if (root.get("alt_screen")) |alt| {
         print("  Alt Screen: {}\n", .{alt.bool});
+    }
+
+    if (root.get("last_cmd")) |cmd| {
+        print("  Last Cmd: {s}\n", .{cmd.string});
+    }
+    if (root.get("last_status")) |st| {
+        print("  Last Status: {d}\n", .{st.integer});
+    }
+    if (root.get("last_duration_ms")) |d| {
+        print("  Last Duration: {d}ms\n", .{d.integer});
+    }
+    if (root.get("last_jobs")) |j| {
+        print("  Last Jobs: {d}\n", .{j.integer});
     }
 }
 
@@ -414,7 +445,7 @@ pub fn runNotify(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, 
     }
 }
 
-pub fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []const u8) void {
+pub fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []const u8, pane_name_map: ?*const std.StringHashMap([]const u8)) void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return;
     defer parsed.deinit();
 
@@ -439,6 +470,12 @@ pub fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []co
                     const pid = if (split.get("id")) |id| @as(i64, id.integer) else 0;
                     const focused = if (split.get("focused")) |f| f.bool else false;
                     const fm = if (focused) ">" else " ";
+                    if (pane_name_map) |m| {
+                        if (m.get(uuid)) |n| {
+                            print("{s}  {s} Split {d} [{s}] {s}\n", .{ indent, fm, pid, uuid[0..@min(8, uuid.len)], n });
+                            continue;
+                        }
+                    }
                     print("{s}  {s} Split {d} [{s}]\n", .{ indent, fm, pid, uuid[0..@min(8, uuid.len)] });
                 }
             }
@@ -625,6 +662,135 @@ pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, la
             } else if (std.mem.eql(u8, t.string, "not_found")) {
                 print("Target pane not found\n", .{});
             }
+        }
+    }
+}
+
+/// Ask mux whether the current shell should be allowed to exit.
+/// Intended to be called from shell keybindings (exit/Ctrl+D) so mux can
+/// present a confirm dialog for the last split.
+///
+/// Exit codes: 0=allow, 1=deny
+pub fn runExitIntent(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+
+    const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
+        // Not in mux; allow.
+        std.process.exit(0);
+    };
+    const pane_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+        std.process.exit(0);
+    };
+    if (pane_uuid.len != 32) {
+        std.process.exit(0);
+    }
+
+    var client = ipc.Client.connect(mux_socket) catch {
+        // If mux is unreachable, don't trap the shell.
+        std.process.exit(0);
+    };
+    defer client.close();
+
+    var conn = client.toConnection();
+
+    var msg_buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"exit_intent\",\"pane_uuid\":\"{s}\"}}", .{pane_uuid}) catch {
+        std.process.exit(0);
+    };
+    conn.sendLine(msg) catch {
+        std.process.exit(0);
+    };
+
+    // Wait for mux response (may block for popup confirm).
+    var resp_buf: [256]u8 = undefined;
+    const response = conn.recvLine(&resp_buf) catch {
+        std.process.exit(0);
+    };
+    if (response == null) {
+        std.process.exit(0);
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response.?, .{}) catch {
+        std.process.exit(0);
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    if (root.get("allow")) |allow_val| {
+        if (allow_val == .bool and allow_val.bool) {
+            std.process.exit(0);
+        }
+        std.process.exit(1);
+    }
+
+    // Unknown response -> allow.
+    std.process.exit(0);
+}
+
+pub fn runShellEvent(allocator: std.mem.Allocator, cmd: []const u8, status: i64, duration_ms: i64, cwd: []const u8, jobs: i64) !void {
+    _ = allocator;
+
+    const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
+        // Not in mux; ignore.
+        return;
+    };
+    const pane_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+        return;
+    };
+    if (pane_uuid.len != 32) return;
+
+    var client = ipc.Client.connect(mux_socket) catch {
+        // Don't break the shell.
+        return;
+    };
+    defer client.close();
+    var conn = client.toConnection();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.heap.page_allocator);
+    var w = buf.writer(std.heap.page_allocator);
+
+    try w.writeAll("{\"type\":\"shell_event\",\"pane_uuid\":\"");
+    try w.writeAll(pane_uuid);
+    try w.writeAll("\"");
+
+    if (cmd.len > 0) {
+        try w.writeAll(",\"cmd\":\"");
+        try writeJsonEscaped(w, cmd);
+        try w.writeAll("\"");
+    }
+    if (cwd.len > 0) {
+        try w.writeAll(",\"cwd\":\"");
+        try writeJsonEscaped(w, cwd);
+        try w.writeAll("\"");
+    }
+    try w.print(",\"status\":{d}", .{status});
+    try w.print(",\"duration_ms\":{d}", .{duration_ms});
+    try w.print(",\"jobs\":{d}", .{jobs});
+    try w.writeAll("}");
+
+    conn.sendLine(buf.items) catch return;
+
+    // Best-effort, ignore response.
+    var resp_buf: [128]u8 = undefined;
+    _ = conn.recvLine(&resp_buf) catch null;
+}
+
+fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
+    for (value) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.writeByte(' ');
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
         }
     }
 }

@@ -90,7 +90,7 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
 
     // Draw status bar if enabled.
     if (state.config.tabs.status.enabled) {
-        statusbar.draw(renderer, state.allocator, &state.config, state.term_width, state.term_height, state.tabs, state.active_tab, state.session_name);
+        statusbar.draw(renderer, state, state.allocator, &state.config, state.term_width, state.term_height, state.tabs, state.active_tab, state.session_name);
     }
 
     // Draw TAB realm notifications (center of screen, below MUX).

@@ -159,6 +159,13 @@
           "outputs": [
             { "style": "bg:237 fg:250", "format": "$output " }
           ]
+        },
+        {
+          "name": "jobs",
+          "priority": 200,
+          "outputs": [
+            { "style": "fg:7", "format": " $output" }
+          ]
         }
       ]
     }

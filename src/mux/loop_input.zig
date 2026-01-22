@@ -66,6 +66,11 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                                 if (confirmed) {
                                     switch (action) {
                                         .exit => state.running = false,
+                                        .exit_intent => {
+                                            // Shell will exit itself; we only approve.
+                                            // Arm a short window to skip the later "Shell exited" confirm.
+                                            state.exit_intent_deadline_ms = std.time.milliTimestamp() + 5000;
+                                        },
                                         .detach => actions.performDetach(state),
                                         .disown => actions.performDisown(state),
                                         .close => actions.performClose(state),
@@ -131,6 +136,20 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                                             }
                                         }
                                     }
+                                }
+
+                                // Reply to a pending exit_intent IPC client, if any.
+                                if (action == .exit_intent) {
+                                    if (state.pending_exit_intent_fd) |fd| {
+                                        var c = core.ipc.Connection{ .fd = fd };
+                                        if (confirmed) {
+                                            c.sendLine("{\"type\":\"exit_intent_result\",\"allow\":true}") catch {};
+                                        } else {
+                                            c.sendLine("{\"type\":\"exit_intent_result\",\"allow\":false}") catch {};
+                                        }
+                                        c.close();
+                                    }
+                                    state.pending_exit_intent_fd = null;
                                 }
                             }
                             state.pending_action = null;

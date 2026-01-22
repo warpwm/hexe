@@ -55,6 +55,15 @@ pub fn main() !void {
     const com_send_ctrl = try com_send.string("C", "ctrl", null);
     const com_send_text = try com_send.stringPositional(null);
 
+    const com_exit_intent = try com_cmd.newCommand("exit-intent", "Ask mux permission before shell exits");
+
+    const com_shell_event = try com_cmd.newCommand("shell-event", "Send shell command metadata to mux/ses");
+    const com_shell_event_cmd = try com_shell_event.string("", "cmd", null);
+    const com_shell_event_status = try com_shell_event.int("", "status", null);
+    const com_shell_event_duration = try com_shell_event.int("", "duration", null);
+    const com_shell_event_cwd = try com_shell_event.string("", "cwd", null);
+    const com_shell_event_jobs = try com_shell_event.int("", "jobs", null);
+
     // SES subcommands
     const ses_daemon = try ses_cmd.newCommand("daemon", "Start the session daemon");
     const ses_daemon_fg = try ses_daemon.flag("f", "foreground", null);
@@ -65,6 +74,7 @@ pub fn main() !void {
     // POD subcommands (mostly for ses-internal use)
     const pod_daemon = try pod_cmd.newCommand("daemon", "Start a per-pane pod daemon");
     const pod_daemon_uuid = try pod_daemon.string("u", "uuid", null);
+    const pod_daemon_name = try pod_daemon.string("n", "name", null);
     const pod_daemon_socket = try pod_daemon.string("s", "socket", null);
     const pod_daemon_shell = try pod_daemon.string("S", "shell", null);
     const pod_daemon_cwd = try pod_daemon.string("C", "cwd", null);
@@ -102,6 +112,7 @@ pub fn main() !void {
 
     const shp_init = try shp_cmd.newCommand("init", "Print shell initialization script");
     const shp_init_shell = try shp_init.stringPositional(null);
+    const shp_init_no_comms = try shp_init.flag("", "no-comms", null);
 
     // POP subcommands
     const pop_notify = try pop_cmd.newCommand("notify", "Show notification");
@@ -140,6 +151,8 @@ pub fn main() !void {
     var found_confirm = false;
     var found_choose = false;
     var found_send = false;
+    var found_exit_intent = false;
+    var found_shell_event = false;
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) has_help = true;
@@ -162,12 +175,18 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "confirm")) found_confirm = true;
         if (std.mem.eql(u8, arg, "choose")) found_choose = true;
         if (std.mem.eql(u8, arg, "send")) found_send = true;
+        if (std.mem.eql(u8, arg, "exit-intent")) found_exit_intent = true;
+        if (std.mem.eql(u8, arg, "shell-event")) found_shell_event = true;
     }
 
     if (has_help) {
         // Show help for the most specific command found (manual strings to avoid argonaut crash)
         if (found_com and found_send) {
             print("Usage: hexe com send [OPTIONS] [text]\n\nSend keystrokes to pane (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all attached panes\n  -e, --enter        Append Enter key after text\n  -C, --ctrl <char>  Send Ctrl+<char> (e.g., -C c for Ctrl+C)\n", .{});
+        } else if (found_com and found_exit_intent) {
+            print("Usage: hexe com exit-intent\n\nAsk the current mux session whether the shell should be allowed to exit.\nIntended for shell keybindings (exit/Ctrl+D) to avoid last-pane death.\n\nExit codes: 0=allow, 1=deny\n", .{});
+        } else if (found_com and found_shell_event) {
+            print("Usage: hexe com shell-event [--cmd <TEXT>] [--status <N>] [--duration <MS>] [--cwd <PATH>] [--jobs <N>]\n\nSend shell command metadata to the current mux session.\nUsed by shell integration to power statusbar + `hexe com info`.\n\nNotes:\n  - No-op outside a mux session\n  - If mux is unreachable, exits 0\n", .{});
         } else if (found_com and found_notify) {
             print("Usage: hexe com notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all muxes\n", .{});
         } else if (found_com and found_info) {
@@ -179,7 +198,7 @@ pub fn main() !void {
         } else if (found_ses and found_info) {
             print("Usage: hexe ses info\n\nShow daemon status and socket path\n", .{});
         } else if (found_pod and found_daemon) {
-            print("Usage: hexe pod daemon [OPTIONS]\n\nStart a per-pane pod daemon (normally launched by ses)\n\nOptions:\n  -u, --uuid <UUID>     Pane UUID (32 hex chars)\n  -s, --socket <PATH>   Pod unix socket path\n  -S, --shell <CMD>     Shell/command to run\n  -C, --cwd <DIR>       Working directory\n  -f, --foreground      Run in foreground (prints pod_ready JSON)\n  -d, --debug           Enable debug output\n  -L, --logfile <PATH>  Log debug output to PATH\n", .{});
+            print("Usage: hexe pod daemon [OPTIONS]\n\nStart a per-pane pod daemon (normally launched by ses)\n\nOptions:\n  -u, --uuid <UUID>     Pane UUID (32 hex chars)\n  -n, --name <NAME>     Human-friendly pane name (for `ps`)\n  -s, --socket <PATH>   Pod unix socket path\n  -S, --shell <CMD>     Shell/command to run\n  -C, --cwd <DIR>       Working directory\n  -f, --foreground      Run in foreground (prints pod_ready JSON)\n  -d, --debug           Enable debug output\n  -L, --logfile <PATH>  Log debug output to PATH\n", .{});
         } else if (found_mux and found_new) {
             print("Usage: hexe mux new [OPTIONS]\n\nCreate new multiplexer session\n\nOptions:\n  -n, --name <NAME>     Session name\n  -d, --debug           Enable debug output\n  -L, --logfile <PATH>  Log debug output to PATH\n", .{});
         } else if (found_mux and found_attach) {
@@ -189,7 +208,7 @@ pub fn main() !void {
         } else if (found_shp and found_prompt) {
             print("Usage: hexe shp prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
         } else if (found_shp and found_init) {
-            print("Usage: hexe shp init <shell>\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n", .{});
+            print("Usage: hexe shp init <shell> [--no-comms]\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n\nOptions:\n      --no-comms  Disable shell->mux communication hooks\n", .{});
         } else if (found_pop and found_notify) {
             print("Usage: hexe pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Duration in milliseconds (default: 3000)\n", .{});
         } else if (found_pop and found_confirm) {
@@ -199,7 +218,7 @@ pub fn main() !void {
         } else if (found_pop) {
             print("Usage: hexe pop <command>\n\nPopup overlays\n\nCommands:\n  notify   Show notification\n  confirm  Yes/No dialog\n  choose   Select from options\n", .{});
         } else if (found_com) {
-            print("Usage: hexe com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list    List all sessions and panes\n  info    Show current pane info\n  notify  Send notification\n  send    Send keystrokes to pane\n", .{});
+            print("Usage: hexe com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list         List all sessions and panes\n  info         Show current pane info\n  notify       Send notification\n  send         Send keystrokes to pane\n  exit-intent  Ask mux permission before shell exits\n  shell-event  Send shell metadata to mux\n", .{});
         } else if (found_ses) {
             print("Usage: hexe ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
         } else if (found_pod) {
@@ -253,6 +272,10 @@ pub fn main() !void {
             try com.runNotify(allocator, com_notify_uuid.*, com_notify_creator.*, com_notify_last.*, com_notify_broadcast.*, com_notify_msg.*);
         } else if (com_send.happened) {
             try com.runSend(allocator, com_send_uuid.*, com_send_creator.*, com_send_last.*, com_send_broadcast.*, com_send_enter.*, com_send_ctrl.*, com_send_text.*);
+        } else if (com_exit_intent.happened) {
+            try com.runExitIntent(allocator);
+        } else if (com_shell_event.happened) {
+            try com.runShellEvent(allocator, com_shell_event_cmd.*, com_shell_event_status.*, com_shell_event_duration.*, com_shell_event_cwd.*, com_shell_event_jobs.*);
         }
     } else if (ses_cmd.happened) {
         // Check which ses subcommand
@@ -271,6 +294,7 @@ pub fn main() !void {
             try runPodDaemon(
                 pod_daemon_fg.*,
                 pod_daemon_uuid.*,
+                pod_daemon_name.*,
                 pod_daemon_socket.*,
                 pod_daemon_shell.*,
                 pod_daemon_cwd.*,
@@ -300,7 +324,7 @@ pub fn main() !void {
         if (shp_prompt.happened) {
             try runShpPrompt(shp_prompt_status.*, shp_prompt_duration.*, shp_prompt_right.*, shp_prompt_shell.*, shp_prompt_jobs.*);
         } else if (shp_init.happened) {
-            try runShpInit(shp_init_shell.*);
+            try runShpInit(shp_init_shell.*, shp_init_no_comms.*);
         }
     } else if (pop_cmd.happened) {
         if (pop_notify.happened) {
@@ -342,7 +366,7 @@ fn runSesInfo(allocator: std.mem.Allocator) !void {
 // POD handlers
 // ============================================================================
 
-fn runPodDaemon(foreground: bool, uuid: []const u8, socket_path: []const u8, shell: []const u8, cwd: []const u8, debug: bool, log_file: []const u8) !void {
+fn runPodDaemon(foreground: bool, uuid: []const u8, name: []const u8, socket_path: []const u8, shell: []const u8, cwd: []const u8, debug: bool, log_file: []const u8) !void {
     if (uuid.len == 0 or socket_path.len == 0) {
         print("Error: --uuid and --socket required\n", .{});
         return;
@@ -351,6 +375,7 @@ fn runPodDaemon(foreground: bool, uuid: []const u8, socket_path: []const u8, she
     try pod.run(.{
         .daemon = !foreground,
         .uuid = uuid,
+        .name = if (name.len > 0) name else null,
         .socket_path = socket_path,
         .shell = if (shell.len > 0) shell else null,
         .cwd = if (cwd.len > 0) cwd else null,
@@ -594,9 +619,9 @@ fn runShpPrompt(status: i64, duration: i64, right: bool, shell: []const u8, jobs
     });
 }
 
-fn runShpInit(shell: []const u8) !void {
+fn runShpInit(shell: []const u8, no_comms: bool) !void {
     if (shell.len > 0) {
-        try shp.run(.{ .init_shell = shell });
+        try shp.run(.{ .init_shell = shell, .no_comms = no_comms });
     } else {
         print("Error: shell name required (bash, zsh, fish)\n", .{});
     }

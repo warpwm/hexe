@@ -17,6 +17,7 @@ fn setBlocking(fd: posix.fd_t) void {
 pub const PodArgs = struct {
     daemon: bool = true,
     uuid: []const u8,
+    name: ?[]const u8 = null,
     socket_path: []const u8,
     shell: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
@@ -50,7 +51,11 @@ pub fn run(args: PodArgs) !void {
     defer pod.deinit();
 
     if (args.debug) {
-        std.debug.print("[pod] started uuid={s} socket={s}\n", .{ args.uuid[0..@min(args.uuid.len, 8)], args.socket_path });
+        if (args.name) |n| {
+            std.debug.print("[pod] started uuid={s} name={s} socket={s}\n", .{ args.uuid[0..@min(args.uuid.len, 8)], n, args.socket_path });
+        } else {
+            std.debug.print("[pod] started uuid={s} socket={s}\n", .{ args.uuid[0..@min(args.uuid.len, 8)], args.socket_path });
+        }
     }
 
     if (args.emit_ready) {

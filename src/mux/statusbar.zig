@@ -1,6 +1,8 @@
 const std = @import("std");
 const core = @import("core");
 const shp = @import("shp");
+
+const State = @import("state.zig").State;
 const render = @import("render.zig");
 const Pane = @import("pane.zig").Pane;
 
@@ -96,6 +98,7 @@ pub fn runStatusModule(module: *const core.StatusModule, buf: []u8) ![]const u8 
 
 pub fn draw(
     renderer: *Renderer,
+    state: *State,
     allocator: std.mem.Allocator,
     config: *const core.Config,
     term_width: u16,
@@ -117,6 +120,27 @@ pub fn draw(
     var ctx = shp.Context.init(allocator);
     defer ctx.deinit();
     ctx.terminal_width = width;
+
+    // Provide shell metadata for status modules.
+    if (state.getCurrentFocusedUuid()) |uuid| {
+        if (state.getPaneShell(uuid)) |info| {
+            if (info.cmd) |c| {
+                ctx.last_command = c;
+            }
+            if (info.cwd) |c| {
+                ctx.cwd = c;
+            }
+            if (info.status) |st| {
+                ctx.exit_status = st;
+            }
+            if (info.duration_ms) |d| {
+                ctx.cmd_duration_ms = d;
+            }
+            if (info.jobs) |j| {
+                ctx.jobs = j;
+            }
+        }
+    }
 
     // Find the tabs module to check tab_title setting
     var use_basename = true;
