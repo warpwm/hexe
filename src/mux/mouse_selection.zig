@@ -1,12 +1,20 @@
 const std = @import("std");
+const ghostty = @import("ghostty-vt");
 
 const Pane = @import("pane.zig").Pane;
 const render = @import("render.zig");
 const Renderer = render.Renderer;
 
+/// Pane-local mouse coordinate (viewport coordinate space).
 pub const Pos = struct {
     x: u16 = 0,
     y: u16 = 0,
+};
+
+/// Terminal-buffer coordinate space ("screen" tag in ghostty).
+pub const BufPos = struct {
+    x: u16 = 0,
+    y: u32 = 0,
 };
 
 pub const Range = struct {
@@ -14,10 +22,15 @@ pub const Range = struct {
     b: Pos,
 };
 
+pub const BufRange = struct {
+    a: BufPos,
+    b: BufPos,
+};
+
 /// Pane-local selection state driven by mux mouse events.
 ///
-/// Selection is locked to the pane where it started and is clamped to that
-/// pane's content rectangle.
+/// Internally we store Y positions in terminal "screen" coordinates so the
+/// selection stays attached to the same buffer lines when the viewport scrolls.
 pub const MouseSelection = struct {
     tab: ?usize = null,
     pane_uuid: ?[32]u8 = null,
@@ -25,33 +38,35 @@ pub const MouseSelection = struct {
     active: bool = false,
     dragging: bool = false,
 
-    anchor: Pos = .{},
-    cursor: Pos = .{},
+    anchor: BufPos = .{},
+    cursor: BufPos = .{},
 
-    // Keep the last selection highlighted after mouse release.
     has_range: bool = false,
-    last_range: Range = .{ .a = .{}, .b = .{} },
+    last_range: BufRange = .{ .a = .{}, .b = .{} },
 
     pub fn clear(self: *MouseSelection) void {
         self.* = .{};
     }
 
-    pub fn begin(self: *MouseSelection, tab_idx: usize, pane_uuid: [32]u8, local_x: u16, local_y: u16) void {
+    pub fn begin(self: *MouseSelection, tab_idx: usize, pane_uuid: [32]u8, pane: *Pane, local_x: u16, local_y: u16) void {
+        const viewport_top = getViewportTopScreenY(pane);
         self.tab = tab_idx;
         self.pane_uuid = pane_uuid;
         self.active = true;
         self.dragging = false;
-        self.anchor = .{ .x = local_x, .y = local_y };
+        self.anchor = .{ .x = local_x, .y = viewport_top + local_y };
         self.cursor = self.anchor;
         self.has_range = false;
     }
 
-    pub fn update(self: *MouseSelection, local_x: u16, local_y: u16) void {
+    pub fn update(self: *MouseSelection, pane: *Pane, local_x: u16, local_y: u16) void {
         if (!self.active) return;
-        if (self.cursor.x != local_x or self.cursor.y != local_y) {
+        const viewport_top = getViewportTopScreenY(pane);
+        const next: BufPos = .{ .x = local_x, .y = viewport_top + local_y };
+        if (self.cursor.x != next.x or self.cursor.y != next.y) {
             self.dragging = true;
         }
-        self.cursor = .{ .x = local_x, .y = local_y };
+        self.cursor = next;
     }
 
     pub fn finish(self: *MouseSelection) void {
@@ -65,14 +80,32 @@ pub const MouseSelection = struct {
         }
     }
 
-    pub fn rangeForPane(self: *const MouseSelection, tab_idx: usize, pane_uuid: [32]u8) ?Range {
+    pub fn bufRangeForPane(self: *const MouseSelection, tab_idx: usize, pane: *Pane) ?BufRange {
         if (self.tab == null or self.pane_uuid == null) return null;
         if (self.tab.? != tab_idx) return null;
-        if (!std.mem.eql(u8, &self.pane_uuid.?, &pane_uuid)) return null;
+        if (!std.mem.eql(u8, &self.pane_uuid.?, &pane.uuid)) return null;
 
         if (self.active) return .{ .a = self.anchor, .b = self.cursor };
         if (self.has_range) return self.last_range;
         return null;
+    }
+
+    /// Convert selection to pane-local viewport coordinates for overlay.
+    /// Returns null if the selection isn't currently visible in this viewport.
+    pub fn rangeForPane(self: *const MouseSelection, tab_idx: usize, pane: *Pane) ?Range {
+        const br = self.bufRangeForPane(tab_idx, pane) orelse return null;
+
+        const viewport_top = getViewportTopScreenY(pane);
+        const viewport_bottom: u32 = viewport_top + @as(u32, @intCast(@max(pane.height, 1) - 1));
+        const norm = normalizeBufRange(br);
+
+        // Not visible at all.
+        if (norm.end.y < viewport_top or norm.start.y > viewport_bottom) return null;
+
+        return .{
+            .a = bufToLocalClipped(norm.start, viewport_top, pane.width, pane.height, true),
+            .b = bufToLocalClipped(norm.end, viewport_top, pane.width, pane.height, false),
+        };
     }
 };
 
@@ -83,6 +116,15 @@ fn clampToPane(x: u16, y: u16, w: u16, h: u16) Pos {
 }
 
 fn normalizeRange(range: Range) struct { start: Pos, end: Pos } {
+    const a = range.a;
+    const b = range.b;
+    if (a.y < b.y or (a.y == b.y and a.x <= b.x)) {
+        return .{ .start = a, .end = b };
+    }
+    return .{ .start = b, .end = a };
+}
+
+fn normalizeBufRange(range: BufRange) struct { start: BufPos, end: BufPos } {
     const a = range.a;
     const b = range.b;
     if (a.y < b.y or (a.y == b.y and a.x <= b.x)) {
@@ -112,63 +154,47 @@ pub fn applyOverlay(renderer: *Renderer, pane_x: u16, pane_y: u16, pane_w: u16, 
     }
 }
 
-/// Extract selected text from the pane's current viewport RenderState.
+/// Extract selection text from the full terminal buffer (supports scrollback).
 ///
-/// Note: This is viewport-only (respects the current scrollback viewport).
-pub fn extractText(allocator: std.mem.Allocator, pane: *Pane, pane_w: u16, pane_h: u16, range: Range) ![]u8 {
-    if (pane_w == 0 or pane_h == 0) return allocator.dupe(u8, "");
+/// This uses ghostty's `Screen.selectionString` to correctly unwrap soft wraps
+/// and handle scrollback/history.
+pub fn extractText(allocator: std.mem.Allocator, pane: *Pane, range: BufRange) ![]u8 {
+    const screen = pane.vt.terminal.screens.active;
+    const pages = &screen.pages;
+    const norm = normalizeBufRange(range);
 
-    const a = clampToPane(range.a.x, range.a.y, pane_w, pane_h);
-    const b = clampToPane(range.b.x, range.b.y, pane_w, pane_h);
-    const norm = normalizeRange(.{ .a = a, .b = b });
+    const start_pin = pages.pin(.{ .screen = .{ .x = @intCast(norm.start.x), .y = norm.start.y } }) orelse return allocator.dupe(u8, "");
+    const end_pin = pages.pin(.{ .screen = .{ .x = @intCast(norm.end.x), .y = norm.end.y } }) orelse return allocator.dupe(u8, "");
 
-    const state = pane.getRenderState() catch return allocator.dupe(u8, "");
-    const row_slice = state.row_data.slice();
-    if (row_slice.len == 0 or state.cols == 0 or state.rows == 0) return allocator.dupe(u8, "");
+    const sel = ghostty.Selection.init(start_pin, end_pin, false);
+    const text_z = try screen.selectionString(allocator, .{ .sel = sel, .trim = true });
+    defer allocator.free(text_z);
 
-    const rows_max: u16 = @intCast(@min(@as(usize, pane_h), @min(@as(usize, state.rows), row_slice.len)));
-    const cols_max: u16 = @intCast(@min(@as(usize, pane_w), @as(usize, state.cols)));
-    if (rows_max == 0 or cols_max == 0) return allocator.dupe(u8, "");
-    if (norm.start.y >= rows_max) return allocator.dupe(u8, "");
+    const slice = std.mem.sliceTo(text_z, 0);
+    return allocator.dupe(u8, slice);
+}
 
-    const row_cells = row_slice.items(.cells);
+fn getViewportTopScreenY(pane: *Pane) u32 {
+    const screen = pane.vt.terminal.screens.active;
+    const pin = screen.pages.getTopLeft(.viewport);
+    const pt = screen.pages.pointFromPin(.screen, pin) orelse return 0;
+    return pt.screen.y;
+}
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+fn bufToLocalClipped(p: BufPos, viewport_top: u32, pane_w: u16, pane_h: u16, is_start: bool) Pos {
+    if (pane_w == 0 or pane_h == 0) return .{};
+    const viewport_bottom: u32 = viewport_top + @as(u32, @intCast(pane_h - 1));
 
-    var y: u16 = norm.start.y;
-    while (y <= norm.end.y and y < rows_max) : (y += 1) {
-        const start_x: u16 = if (y == norm.start.y) norm.start.x else 0;
-        const end_x: u16 = if (y == norm.end.y) norm.end.x else (cols_max - 1);
-
-        const cells_slice = row_cells[@intCast(y)].slice();
-        const raw_cells = cells_slice.items(.raw);
-
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(allocator);
-
-        var x: u16 = start_x;
-        while (x <= end_x and x < cols_max and @as(usize, x) < raw_cells.len) : (x += 1) {
-            const raw = raw_cells[@intCast(x)];
-            if (raw.wide == .spacer_tail) continue;
-
-            var cp: u21 = raw.codepoint();
-            if (cp == 0 or cp < 32 or cp == 127) cp = ' ';
-
-            var buf: [4]u8 = undefined;
-            const len = std.unicode.utf8Encode(cp, &buf) catch {
-                try line.append(allocator, ' ');
-                continue;
-            };
-            try line.appendSlice(allocator, buf[0..len]);
-        }
-
-        const trimmed = std.mem.trimRight(u8, line.items, " ");
-        try out.appendSlice(allocator, trimmed);
-        if (y != norm.end.y and y + 1 < rows_max) {
-            try out.append(allocator, '\n');
-        }
+    // Clip vertically to the viewport. For clipped ends we stretch to full
+    // line so the visible portion is highlighted.
+    if (p.y < viewport_top) {
+        return .{ .x = if (is_start) 0 else pane_w - 1, .y = 0 };
+    }
+    if (p.y > viewport_bottom) {
+        return .{ .x = if (is_start) 0 else pane_w - 1, .y = pane_h - 1 };
     }
 
-    return out.toOwnedSlice(allocator);
+    const local_y: u16 = @intCast(p.y - viewport_top);
+    const local_x: u16 = if (p.x >= pane_w) pane_w - 1 else p.x;
+    return .{ .x = local_x, .y = local_y };
 }

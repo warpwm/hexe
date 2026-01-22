@@ -19,7 +19,7 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
         const render_state = pane.*.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.*.x, pane.*.y, pane.*.width, pane.*.height);
 
-        if (state.mouse_selection.rangeForPane(state.active_tab, pane.*.uuid)) |range| {
+        if (state.mouse_selection.rangeForPane(state.active_tab, pane.*)) |range| {
             mouse_selection.applyOverlay(renderer, pane.*.x, pane.*.y, pane.*.width, pane.*.height, range);
         }
 
@@ -57,7 +57,7 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
         const render_state = pane.getRenderState() catch continue;
         renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
 
-        if (state.mouse_selection.rangeForPane(state.active_tab, pane.uuid)) |range| {
+        if (state.mouse_selection.rangeForPane(state.active_tab, pane)) |range| {
             mouse_selection.applyOverlay(renderer, pane.x, pane.y, pane.width, pane.height, range);
         }
 
@@ -85,7 +85,7 @@ pub fn renderTo(state: *State, stdout: std.fs.File) !void {
             if (pane.getRenderState()) |render_state| {
                 renderer.drawRenderState(render_state, pane.x, pane.y, pane.width, pane.height);
 
-                if (state.mouse_selection.rangeForPane(state.active_tab, pane.uuid)) |range| {
+                if (state.mouse_selection.rangeForPane(state.active_tab, pane)) |range| {
                     mouse_selection.applyOverlay(renderer, pane.x, pane.y, pane.width, pane.height, range);
                 }
             } else |_| {}

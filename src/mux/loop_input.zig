@@ -348,7 +348,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                                     const local = toLocalClamped(sel_pane, ev.x, ev.y);
 
                                     if (!ev.is_release and is_motion and is_left_btn and !is_wheel) {
-                                        state.mouse_selection.update(local.x, local.y);
+                                        state.mouse_selection.update(sel_pane, local.x, local.y);
                                         state.needs_render = true;
                                         i += ev.consumed;
                                         continue;
@@ -357,10 +357,10 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                                     // SGR mouse reports release as button code 3 with the 'm' terminator.
                                     // Don't require is_left_btn here.
                                     if (ev.is_release) {
-                                        state.mouse_selection.update(local.x, local.y);
+                                        state.mouse_selection.update(sel_pane, local.x, local.y);
                                         state.mouse_selection.finish();
-                                        if (state.mouse_selection.rangeForPane(state.active_tab, sel_pane.uuid)) |range| {
-                                            const bytes = mouse_selection.extractText(state.allocator, sel_pane, sel_pane.width, sel_pane.height, range) catch {
+                                        if (state.mouse_selection.bufRangeForPane(state.active_tab, sel_pane)) |range| {
+                                            const bytes = mouse_selection.extractText(state.allocator, sel_pane, range) catch {
                                                 state.notifications.showFor("Copy failed", 1200);
                                                 state.needs_render = true;
                                                 i += ev.consumed;
@@ -449,7 +449,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
 
                         if (use_mux_selection) {
                             const local = toLocalClamped(t.pane, ev.x, ev.y);
-                            state.mouse_selection.begin(state.active_tab, t.pane.uuid, local.x, local.y);
+                            state.mouse_selection.begin(state.active_tab, t.pane.uuid, t.pane, local.x, local.y);
                             state.needs_render = true;
                         } else if (forward_to_app) {
                             t.pane.write(raw) catch {};
