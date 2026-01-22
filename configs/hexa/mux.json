@@ -12,11 +12,17 @@
 
   "floats": [
     {
-      "padding_x": 2,
-      "padding_y": 1,
-      "color": {
-        "active": 1,
-        "passive": 237
+      "padding": {
+        "x": 2,
+        "y": 1
+      },
+      "style": {
+        "border": {
+          "color": {
+            "active": 1,
+            "passive": 237
+          }
+        }
       }
     },
     {
@@ -31,12 +37,9 @@
     },
     {
       "key": "3",
-      "pos_x": 100,
-      "pos_y": 0,
-      "width": 40,
-      "height": 50,
-      "padding_x": 0,
-      "padding_y": 0,
+      "position": { "x": 100, "y": 0 },
+      "size": { "width": 40, "height": 50 },
+      "padding": { "x": 0, "y": 0 },
       "attributes": {
         "global": false
       }
@@ -50,17 +53,19 @@
     {
       "key": "f",
       "command": "btop",
+      "title": "btop",
       "attributes": {
         "exclusive": true
       },
       "style": {
-        "position": "topright",
-        "name": "time",
-        "outputs": [
-          { "style": "bg:0 fg:1", "format": "[" },
-          { "style": "bg:237 fg:250", "format": " $output " },
-          { "style": "bg:0 fg:1", "format": "]" }
-        ]
+        "title": {
+          "position": "topright",
+          "outputs": [
+            { "style": "bg:0 fg:1", "format": "[" },
+            { "style": "bg:237 fg:250", "format": " $output " },
+            { "style": "bg:0 fg:1", "format": "]" }
+          ]
+        }
       }
     }
   ],

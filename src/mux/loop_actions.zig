@@ -420,6 +420,8 @@ pub fn createAdhocFloat(
     errdefer state.allocator.destroy(pane);
 
     const cfg = &state.config;
+    const style = if (cfg.float_style_default) |*s| s else null;
+    const shadow_enabled = if (style) |s| s.shadow_color != null else false;
     const width_pct: u16 = cfg.float_width_percent;
     const height_pct: u16 = cfg.float_height_percent;
     const pos_x_pct: u16 = 50;
@@ -429,10 +431,12 @@ pub fn createAdhocFloat(
     const border_color = cfg.float_color;
 
     const avail_h = state.term_height - state.status_height;
-    const outer_w = state.term_width * width_pct / 100;
-    const outer_h = avail_h * height_pct / 100;
-    const max_x = state.term_width -| outer_w;
-    const max_y = avail_h -| outer_h;
+    const usable_w: u16 = if (shadow_enabled) (state.term_width -| 1) else state.term_width;
+    const usable_h: u16 = if (shadow_enabled and state.status_height == 0) (avail_h -| 1) else avail_h;
+    const outer_w = usable_w * width_pct / 100;
+    const outer_h = usable_h * height_pct / 100;
+    const max_x = usable_w -| outer_w;
+    const max_y = usable_h -| outer_h;
     const outer_x = max_x * pos_x_pct / 100;
     const outer_y = max_y * pos_y_pct / 100;
 
@@ -487,8 +491,8 @@ pub fn createAdhocFloat(
     pane.parent_tab = state.active_tab;
     pane.sticky = false;
 
-    if (state.config.float_style_default) |*style| {
-        pane.float_style = style;
+    if (style) |s| {
+        pane.float_style = s;
     }
 
     pane.configureNotificationsFromPop(&state.pop_config.pane.notification);
@@ -507,6 +511,9 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
 
     const cfg = &state.config;
 
+    const style = if (float_def.style) |*s| s else if (cfg.float_style_default) |*s| s else null;
+    const shadow_enabled = if (style) |s| s.shadow_color != null else false;
+
     // Use per-float settings or fall back to defaults.
     const width_pct: u16 = float_def.width_percent orelse cfg.float_width_percent;
     const height_pct: u16 = float_def.height_percent orelse cfg.float_height_percent;
@@ -518,12 +525,14 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
 
     // Calculate outer frame size.
     const avail_h = state.term_height - state.status_height;
-    const outer_w = state.term_width * width_pct / 100;
-    const outer_h = avail_h * height_pct / 100;
+    const usable_w: u16 = if (shadow_enabled) (state.term_width -| 1) else state.term_width;
+    const usable_h: u16 = if (shadow_enabled and state.status_height == 0) (avail_h -| 1) else avail_h;
+    const outer_w = usable_w * width_pct / 100;
+    const outer_h = usable_h * height_pct / 100;
 
     // Calculate position based on pos_x/pos_y percentages.
-    const max_x = state.term_width -| outer_w;
-    const max_y = avail_h -| outer_h;
+    const max_x = usable_w -| outer_w;
+    const max_y = usable_h -| outer_h;
     const outer_x = max_x * pos_x_pct / 100;
     const outer_y = max_y * pos_y_pct / 100;
 
@@ -553,6 +562,14 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
     pane.floating = true;
     pane.focused = true;
     pane.float_key = float_def.key;
+
+    // Title text is a pane property (outside style). Style only controls
+    // positioning/formatting of the title widget.
+    if (float_def.title) |t| {
+        if (t.len > 0) {
+            pane.float_title = state.allocator.dupe(u8, t) catch null;
+        }
+    }
     // For global floats (special or pwd), set per-tab visibility.
     // For tab-bound floats, use simple visible field.
     if (float_def.attributes.global or float_def.attributes.per_cwd) {
@@ -591,10 +608,8 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
     pane.sticky = float_def.attributes.sticky;
 
     // Store style reference.
-    if (float_def.style) |*style| {
-        pane.float_style = style;
-    } else if (state.config.float_style_default) |*style| {
-        pane.float_style = style;
+    if (style) |s| {
+        pane.float_style = s;
     }
 
     // Configure pane notifications.

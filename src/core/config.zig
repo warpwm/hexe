@@ -54,6 +54,16 @@ pub const FloatStyle = struct {
     bottom_right: u21 = 0x256F, // ╯
     horizontal: u21 = 0x2500, // ─
     vertical: u21 = 0x2502, // │
+    // Optional junction characters (not currently used by float border renderer,
+    // but supported in config for future flexibility)
+    cross: u21 = 0x253C, // ┼
+    top_t: u21 = 0x252C, // ┬
+    bottom_t: u21 = 0x2534, // ┴
+    left_t: u21 = 0x251C, // ├
+    right_t: u21 = 0x2524, // ┤
+
+    // Optional drop shadow (palette index). If null, no shadow.
+    shadow_color: ?u8 = null,
     // Optional module in border
     position: ?FloatStylePosition = null,
     module: ?StatusModule = null,
@@ -79,6 +89,8 @@ pub const FloatAttributes = struct {
 pub const FloatDef = struct {
     key: u8,
     command: ?[]const u8,
+    /// Optional border title text (rendered by mux)
+    title: ?[]const u8 = null,
     attributes: FloatAttributes = .{},
     // Per-float overrides (null = use default)
     width_percent: ?u8 = null,
@@ -288,18 +300,35 @@ pub const Config = struct {
             for (json_floats, 0..) |jf, idx| {
                 // First entry without key = defaults
                 if (idx == 0 and jf.key.len == 0) {
+                    if (jf.size) |sz| {
+                        if (sz.width) |v| def_width = @intCast(@min(100, @max(10, v)));
+                        if (sz.height) |v| def_height = @intCast(@min(100, @max(10, v)));
+                    }
                     if (jf.width) |v| def_width = @intCast(@min(100, @max(10, v)));
                     if (jf.height) |v| def_height = @intCast(@min(100, @max(10, v)));
+
+                    if (jf.position) |p| {
+                        if (p.x) |v| def_pos_x = @intCast(@min(100, @max(0, v)));
+                        if (p.y) |v| def_pos_y = @intCast(@min(100, @max(0, v)));
+                    }
                     if (jf.pos_x) |v| def_pos_x = @intCast(@min(100, @max(0, v)));
                     if (jf.pos_y) |v| def_pos_y = @intCast(@min(100, @max(0, v)));
+
+                    if (jf.padding) |p| {
+                        if (p.x) |v| def_pad_x = @intCast(@min(10, @max(0, v)));
+                        if (p.y) |v| def_pad_y = @intCast(@min(10, @max(0, v)));
+                    }
                     if (jf.padding_x) |v| def_pad_x = @intCast(@min(10, @max(0, v)));
                     if (jf.padding_y) |v| def_pad_y = @intCast(@min(10, @max(0, v)));
-                    if (jf.color) |jc| {
+
+                    const border_color = if (jf.style) |st| if (st.border) |b| b.color else null else null;
+                    if (border_color orelse jf.color) |jc| {
                         var c = BorderColor{};
                         if (jc.active) |a| c.active = @intCast(@min(255, @max(0, a)));
                         if (jc.passive) |p| c.passive = @intCast(@min(255, @max(0, p)));
                         def_color = c;
                     }
+
                     if (jf.style) |js| {
                         def_style = parseFloatStyle(allocator, js);
                     }
@@ -330,7 +359,8 @@ pub const Config = struct {
                     null;
 
                 // Parse color if present
-                const color: ?BorderColor = if (jf.color) |jc| blk: {
+                const border_color = if (jf.style) |st| if (st.border) |b| b.color else null else null;
+                const color: ?BorderColor = if (border_color orelse jf.color) |jc| blk: {
                     var c = BorderColor{};
                     if (jc.active) |a| c.active = @intCast(@min(255, @max(0, a)));
                     if (jc.passive) |p| c.passive = @intCast(@min(255, @max(0, p)));
@@ -356,13 +386,14 @@ pub const Config = struct {
                 float_list.append(allocator, .{
                     .key = key,
                     .command = command,
+                    .title = if (jf.title) |t| allocator.dupe(u8, t) catch null else null,
                     .attributes = attrs,
-                    .width_percent = if (jf.width) |v| @intCast(@min(100, @max(10, v))) else def_width,
-                    .height_percent = if (jf.height) |v| @intCast(@min(100, @max(10, v))) else def_height,
-                    .pos_x = if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else def_pos_x,
-                    .pos_y = if (jf.pos_y) |v| @intCast(@min(100, @max(0, v))) else def_pos_y,
-                    .padding_x = if (jf.padding_x) |v| @intCast(@min(10, @max(0, v))) else def_pad_x,
-                    .padding_y = if (jf.padding_y) |v| @intCast(@min(10, @max(0, v))) else def_pad_y,
+                    .width_percent = if (if (jf.size) |sz| sz.width else null) |v| @intCast(@min(100, @max(10, v))) else if (jf.width) |v| @intCast(@min(100, @max(10, v))) else def_width,
+                    .height_percent = if (if (jf.size) |sz| sz.height else null) |v| @intCast(@min(100, @max(10, v))) else if (jf.height) |v| @intCast(@min(100, @max(10, v))) else def_height,
+                    .pos_x = if (if (jf.position) |p| p.x else null) |v| @intCast(@min(100, @max(0, v))) else if (jf.pos_x) |v| @intCast(@min(100, @max(0, v))) else def_pos_x,
+                    .pos_y = if (if (jf.position) |p| p.y else null) |v| @intCast(@min(100, @max(0, v))) else if (jf.pos_y) |v| @intCast(@min(100, @max(0, v))) else def_pos_y,
+                    .padding_x = if (if (jf.padding) |p| p.x else null) |v| @intCast(@min(10, @max(0, v))) else if (jf.padding_x) |v| @intCast(@min(10, @max(0, v))) else def_pad_x,
+                    .padding_y = if (if (jf.padding) |p| p.y else null) |v| @intCast(@min(10, @max(0, v))) else if (jf.padding_y) |v| @intCast(@min(10, @max(0, v))) else def_pad_y,
                     .color = color orelse def_color,
                     .style = style orelse def_style,
                 }) catch continue;
@@ -456,6 +487,9 @@ pub const Config = struct {
                 if (f.command) |cmd| {
                     alloc.free(cmd);
                 }
+                if (f.title) |t| {
+                    alloc.free(t);
+                }
             }
             if (self.floats.len > 0) {
                 alloc.free(self.floats);
@@ -521,50 +555,136 @@ const JsonBorderColor = struct {
     passive: ?i64 = null,
 };
 
+const JsonXY = struct {
+    x: ?i64 = null,
+    y: ?i64 = null,
+};
+
+const JsonSize = struct {
+    width: ?i64 = null,
+    height: ?i64 = null,
+};
+
 const JsonFloatStyle = struct {
-    // Border appearance
+    // Legacy border appearance (still accepted)
     top_left: ?[]const u8 = null,
     top_right: ?[]const u8 = null,
     bottom_left: ?[]const u8 = null,
     bottom_right: ?[]const u8 = null,
     horizontal: ?[]const u8 = null,
     vertical: ?[]const u8 = null,
-    // Optional module in border
+    // Legacy title module (still accepted)
     position: ?[]const u8 = null, // topleft, topcenter, topright, bottomleft, bottomcenter, bottomright
     name: ?[]const u8 = null, // module name (e.g. "time", "cpu")
     outputs: ?[]const JsonOutput = null,
     command: ?[]const u8 = null,
     when: ?[]const u8 = null,
+
+    // New hierarchical style config
+    border: ?struct {
+        color: ?JsonBorderColor = null,
+        chars: ?struct {
+            top_left: ?[]const u8 = null,
+            top_right: ?[]const u8 = null,
+            bottom_left: ?[]const u8 = null,
+            bottom_right: ?[]const u8 = null,
+            horizontal: ?[]const u8 = null,
+            vertical: ?[]const u8 = null,
+            cross: ?[]const u8 = null,
+            top_t: ?[]const u8 = null,
+            bottom_t: ?[]const u8 = null,
+            left_t: ?[]const u8 = null,
+            right_t: ?[]const u8 = null,
+        } = null,
+    } = null,
+
+    shadow: ?struct {
+        color: ?i64 = null,
+    } = null,
+
+    title: ?struct {
+        position: ?[]const u8 = null,
+        outputs: ?[]const JsonOutput = null,
+        command: ?[]const u8 = null,
+        when: ?[]const u8 = null,
+    } = null,
 };
 
 fn parseFloatStyle(allocator: std.mem.Allocator, js: JsonFloatStyle) ?FloatStyle {
     var result = FloatStyle{};
 
-    if (js.top_left) |s| if (s.len > 0) {
-        result.top_left = std.unicode.utf8Decode(s) catch 0x256D;
+    const border_chars = if (js.border) |b| b.chars else null;
+
+    if (if (border_chars) |bc| bc.top_left else null) |ch| if (ch.len > 0) {
+        result.top_left = std.unicode.utf8Decode(ch) catch 0x256D;
+    } else if (js.top_left) |ch2| if (ch2.len > 0) {
+        result.top_left = std.unicode.utf8Decode(ch2) catch 0x256D;
     };
-    if (js.top_right) |s| if (s.len > 0) {
-        result.top_right = std.unicode.utf8Decode(s) catch 0x256E;
+    if (if (border_chars) |bc| bc.top_right else null) |ch| if (ch.len > 0) {
+        result.top_right = std.unicode.utf8Decode(ch) catch 0x256E;
+    } else if (js.top_right) |ch2| if (ch2.len > 0) {
+        result.top_right = std.unicode.utf8Decode(ch2) catch 0x256E;
     };
-    if (js.bottom_left) |s| if (s.len > 0) {
-        result.bottom_left = std.unicode.utf8Decode(s) catch 0x2570;
+    if (if (border_chars) |bc| bc.bottom_left else null) |ch| if (ch.len > 0) {
+        result.bottom_left = std.unicode.utf8Decode(ch) catch 0x2570;
+    } else if (js.bottom_left) |ch2| if (ch2.len > 0) {
+        result.bottom_left = std.unicode.utf8Decode(ch2) catch 0x2570;
     };
-    if (js.bottom_right) |s| if (s.len > 0) {
-        result.bottom_right = std.unicode.utf8Decode(s) catch 0x256F;
+    if (if (border_chars) |bc| bc.bottom_right else null) |ch| if (ch.len > 0) {
+        result.bottom_right = std.unicode.utf8Decode(ch) catch 0x256F;
+    } else if (js.bottom_right) |ch2| if (ch2.len > 0) {
+        result.bottom_right = std.unicode.utf8Decode(ch2) catch 0x256F;
     };
-    if (js.horizontal) |s| if (s.len > 0) {
-        result.horizontal = std.unicode.utf8Decode(s) catch 0x2500;
+    if (if (border_chars) |bc| bc.horizontal else null) |ch| if (ch.len > 0) {
+        result.horizontal = std.unicode.utf8Decode(ch) catch 0x2500;
+    } else if (js.horizontal) |ch2| if (ch2.len > 0) {
+        result.horizontal = std.unicode.utf8Decode(ch2) catch 0x2500;
     };
-    if (js.vertical) |s| if (s.len > 0) {
-        result.vertical = std.unicode.utf8Decode(s) catch 0x2502;
+    if (if (border_chars) |bc| bc.vertical else null) |ch| if (ch.len > 0) {
+        result.vertical = std.unicode.utf8Decode(ch) catch 0x2502;
+    } else if (js.vertical) |ch2| if (ch2.len > 0) {
+        result.vertical = std.unicode.utf8Decode(ch2) catch 0x2502;
     };
 
-    if (js.position) |pos_str| {
+    if (if (border_chars) |bc| bc.cross else null) |ch| if (ch.len > 0) {
+        result.cross = std.unicode.utf8Decode(ch) catch 0x253C;
+    };
+    if (if (border_chars) |bc| bc.top_t else null) |ch| if (ch.len > 0) {
+        result.top_t = std.unicode.utf8Decode(ch) catch 0x252C;
+    };
+    if (if (border_chars) |bc| bc.bottom_t else null) |ch| if (ch.len > 0) {
+        result.bottom_t = std.unicode.utf8Decode(ch) catch 0x2534;
+    };
+    if (if (border_chars) |bc| bc.left_t else null) |ch| if (ch.len > 0) {
+        result.left_t = std.unicode.utf8Decode(ch) catch 0x251C;
+    };
+    if (if (border_chars) |bc| bc.right_t else null) |ch| if (ch.len > 0) {
+        result.right_t = std.unicode.utf8Decode(ch) catch 0x2524;
+    };
+
+    if (js.shadow) |sh| {
+        if (sh.color) |c| {
+            result.shadow_color = @intCast(@min(255, @max(0, c)));
+        }
+    }
+
+    const title_pos = if (js.title) |t| t.position else null;
+    if (title_pos) |pos_str| {
+        result.position = std.meta.stringToEnum(FloatStylePosition, pos_str);
+    } else if (js.position) |pos_str| {
         result.position = std.meta.stringToEnum(FloatStylePosition, pos_str);
     }
-    if (js.name) |mod_name| {
+
+    // Title widget: either legacy `name` or new `style.title` section.
+    const has_title_cfg = (js.title != null) or (js.outputs != null) or (js.command != null) or (js.when != null);
+    const default_name: []const u8 = "";
+    const mod_name = js.name orelse (if (has_title_cfg) default_name else null);
+    if (mod_name) |mn| {
         var outputs: []const OutputDef = &[_]OutputDef{};
-        if (js.outputs) |json_outputs| {
+        const title_outputs = if (js.title) |t| t.outputs else null;
+        const legacy_outputs = js.outputs;
+        const outputs_src = title_outputs orelse legacy_outputs;
+        if (outputs_src) |json_outputs| {
             var output_list: std.ArrayList(OutputDef) = .empty;
             for (json_outputs) |jo| {
                 output_list.append(allocator, .{
@@ -574,11 +694,14 @@ fn parseFloatStyle(allocator: std.mem.Allocator, js: JsonFloatStyle) ?FloatStyle
             }
             outputs = output_list.toOwnedSlice(allocator) catch &[_]OutputDef{};
         }
+
+        const cmd_src = if (js.title) |t| t.command else js.command;
+        const when_src = if (js.title) |t| t.when else js.when;
         result.module = .{
-            .name = allocator.dupe(u8, mod_name) catch "",
+            .name = allocator.dupe(u8, mn) catch "",
             .outputs = outputs,
-            .command = if (js.command) |cmd| allocator.dupe(u8, cmd) catch null else null,
-            .when = if (js.when) |w| allocator.dupe(u8, w) catch null else null,
+            .command = if (cmd_src) |cmd| allocator.dupe(u8, cmd) catch null else null,
+            .when = if (when_src) |w| allocator.dupe(u8, w) catch null else null,
         };
     }
 
@@ -588,6 +711,7 @@ fn parseFloatStyle(allocator: std.mem.Allocator, js: JsonFloatStyle) ?FloatStyle
 const JsonFloatPane = struct {
     key: []const u8 = "",
     command: ?[]const u8 = null,
+    title: ?[]const u8 = null,
     attributes: ?struct {
         // Preferred names
         exclusive: ?bool = null,
@@ -601,6 +725,7 @@ const JsonFloatPane = struct {
         special: ?bool = null,
         destroy_on_hide: ?bool = null,
     } = null,
+    // Legacy flat fields (still accepted)
     width: ?i64 = null,
     height: ?i64 = null,
     pos_x: ?i64 = null,
@@ -608,6 +733,12 @@ const JsonFloatPane = struct {
     padding_x: ?i64 = null,
     padding_y: ?i64 = null,
     color: ?JsonBorderColor = null,
+
+    // New hierarchical fields
+    size: ?JsonSize = null,
+    position: ?JsonXY = null,
+    padding: ?JsonXY = null,
+
     style: ?JsonFloatStyle = null,
 };
 

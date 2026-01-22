@@ -305,11 +305,15 @@ pub fn resizeFloatingPanes(self: anytype) void {
     const avail_h = self.term_height - self.status_height;
 
     for (self.floats.items) |pane| {
-        const outer_w: u16 = self.term_width * pane.float_width_pct / 100;
-        const outer_h: u16 = avail_h * pane.float_height_pct / 100;
+        const shadow_enabled = if (pane.float_style) |s| s.shadow_color != null else false;
+        const usable_w: u16 = if (shadow_enabled) (self.term_width -| 1) else self.term_width;
+        const usable_h: u16 = if (shadow_enabled and self.status_height == 0) (avail_h -| 1) else avail_h;
 
-        const max_x = self.term_width -| outer_w;
-        const max_y = avail_h -| outer_h;
+        const outer_w: u16 = usable_w * pane.float_width_pct / 100;
+        const outer_h: u16 = usable_h * pane.float_height_pct / 100;
+
+        const max_x = usable_w -| outer_w;
+        const max_y = usable_h -| outer_h;
         const outer_x: u16 = max_x * pane.float_pos_x_pct / 100;
         const outer_y: u16 = max_y * pane.float_pos_y_pct / 100;
 
