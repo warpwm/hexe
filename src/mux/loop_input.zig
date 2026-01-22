@@ -16,7 +16,89 @@ const TabFocusKind = @import("state.zig").TabFocusKind;
 const statusbar = @import("statusbar.zig");
 const keybinds = @import("keybinds.zig");
 
-fn mergeStdinTail(state: *State, input_bytes: []const u8, buf: *[4096 + 64]u8) []const u8 {
+fn forwardSanitizedToFocusedPane(state: *State, bytes: []const u8) void {
+    const ESC: u8 = 0x1b;
+
+    var scratch: [8192]u8 = undefined;
+    var n: usize = 0;
+
+    const flush = struct {
+        fn go(state_: *State, buf: *[8192]u8, len: *usize) void {
+            if (len.* == 0) return;
+            keybinds.forwardInputToFocusedPane(state_, buf[0..len.*]);
+            len.* = 0;
+        }
+    }.go;
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (bytes[i] == ESC and i + 1 < bytes.len and bytes[i + 1] == '[') {
+            // CSI-u / kitty text keys
+            if (keybinds.parseKittyKeyEvent(bytes[i..])) |ke| {
+                // Never forward release events into the app.
+                if (keybinds.bindWhenFromKittyEventType(ke.event_type)) |when| {
+                    if (when == .release) {
+                        i += ke.consumed;
+                        continue;
+                    }
+                }
+
+                var out: [8]u8 = undefined;
+                if (keybinds.translateKittyToLegacy(&out, ke)) |out_len| {
+                    flush(state, &scratch, &n);
+                    keybinds.forwardInputToFocusedPane(state, out[0..out_len]);
+                    i += ke.consumed;
+                    continue;
+                }
+
+                // Can't translate: drop the sequence rather than leaking it.
+                i += ke.consumed;
+                continue;
+            }
+
+            // Kitty legacy functional arrows with optional event types
+            if (keybinds.parseKittyLegacyArrowEvent(bytes[i..])) |ke| {
+                if (keybinds.bindWhenFromKittyEventType(ke.event_type)) |when| {
+                    if (when == .release) {
+                        i += ke.consumed;
+                        continue;
+                    }
+                }
+
+                var out: [16]u8 = undefined;
+                if (keybinds.translateArrowToLegacy(&out, ke.mods, ke.key)) |out_len| {
+                    flush(state, &scratch, &n);
+                    keybinds.forwardInputToFocusedPane(state, out[0..out_len]);
+                }
+                i += ke.consumed;
+                continue;
+            }
+
+            // Last-resort: if it looks like a CSI-u key event, swallow it.
+            if (i + 2 < bytes.len and bytes[i + 2] >= '0' and bytes[i + 2] <= '9') {
+                var j: usize = i + 2;
+                const end = @min(bytes.len, i + 128);
+                while (j < end and bytes[j] != 'u') : (j += 1) {}
+                if (j < end and bytes[j] == 'u') {
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Plain byte, buffer it.
+        if (n < scratch.len) {
+            scratch[n] = bytes[i];
+            n += 1;
+        } else {
+            flush(state, &scratch, &n);
+        }
+        i += 1;
+    }
+    flush(state, &scratch, &n);
+}
+
+fn mergeStdinTail(state: *State, input_bytes: []const u8, buf: *[4096 + 256]u8) []const u8 {
     if (state.stdin_tail_len == 0) return input_bytes;
 
     const tl: usize = @intCast(state.stdin_tail_len);
@@ -98,7 +180,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
     if (input_bytes.len == 0) return;
 
     // Stdin reads can split escape sequences. Merge with any pending tail first.
-    var merged_buf: [4096 + 64]u8 = undefined;
+    var merged_buf: [4096 + 256]u8 = undefined;
     const merged = mergeStdinTail(state, input_bytes, &merged_buf);
 
     const slice = consumeOscReplyFromTerminal(state, merged);
@@ -489,7 +571,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                         fpane.scrollToBottom();
                         state.needs_render = true;
                     }
-                    fpane.write(inp[i..]) catch {};
+                    forwardSanitizedToFocusedPane(state, inp[i..]);
                 } else {
                     // Can't input to tab-bound float on wrong tab, forward to tiled pane.
                     if (state.currentLayout().getFocusedPane()) |pane| {
@@ -505,7 +587,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                             pane.scrollToBottom();
                             state.needs_render = true;
                         }
-                        pane.write(inp[i..]) catch {};
+                        forwardSanitizedToFocusedPane(state, inp[i..]);
                     }
                 }
             } else if (state.currentLayout().getFocusedPane()) |pane| {
@@ -521,7 +603,7 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                     pane.scrollToBottom();
                     state.needs_render = true;
                 }
-                pane.write(inp[i..]) catch {};
+                forwardSanitizedToFocusedPane(state, inp[i..]);
             }
             return;
         }
