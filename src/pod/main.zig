@@ -10,6 +10,189 @@ const core = @import("core");
 const pod_protocol = core.pod_protocol;
 const pod_meta = core.pod_meta;
 
+const PodUplink = struct {
+    allocator: std.mem.Allocator,
+    uuid: [32]u8,
+    conn: ?core.ipc.Connection = null,
+    last_sent_ms: i64 = 0,
+    last_cwd: ?[]u8 = null,
+    last_fg_process: ?[]u8 = null,
+    last_fg_pid: ?i32 = null,
+
+    pub fn init(allocator: std.mem.Allocator, uuid: [32]u8) PodUplink {
+        return .{ .allocator = allocator, .uuid = uuid };
+    }
+
+    pub fn deinit(self: *PodUplink) void {
+        if (self.conn) |*conn| conn.close();
+        if (self.last_cwd) |s| self.allocator.free(s);
+        if (self.last_fg_process) |s| self.allocator.free(s);
+        self.* = undefined;
+    }
+
+    pub fn tick(self: *PodUplink, child_pid: posix.pid_t) void {
+        const now_ms: i64 = std.time.milliTimestamp();
+        if (now_ms - self.last_sent_ms < 500) return;
+        self.last_sent_ms = now_ms;
+
+        const proc_cwd = readProcCwd(self.allocator, child_pid) catch null;
+        defer if (proc_cwd) |s| self.allocator.free(s);
+
+        const fg = readProcForeground(self.allocator, child_pid) catch null;
+        defer if (fg) |v| {
+            self.allocator.free(v.name);
+        };
+
+        var changed = false;
+        if (!optStrEql(self.last_cwd, proc_cwd)) changed = true;
+        const fg_name = if (fg) |v| v.name else null;
+        const fg_pid = if (fg) |v| v.pid else null;
+        if (!optStrEql(self.last_fg_process, fg_name)) changed = true;
+        if (!optIntEql(i32, self.last_fg_pid, fg_pid)) changed = true;
+        if (!changed) return;
+
+        if (self.last_cwd) |s| self.allocator.free(s);
+        self.last_cwd = if (proc_cwd) |s| self.allocator.dupe(u8, s) catch null else null;
+
+        if (self.last_fg_process) |s| self.allocator.free(s);
+        self.last_fg_process = if (fg_name) |s| self.allocator.dupe(u8, s) catch null else null;
+        self.last_fg_pid = fg_pid;
+
+        if (!self.ensureConnected()) return;
+
+        var buf: [2048]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+
+        w.writeAll("{\"type\":\"pod_meta\",\"pane_uuid\":\"") catch return;
+        w.writeAll(&self.uuid) catch return;
+        w.writeAll("\"") catch return;
+
+        if (proc_cwd) |s| {
+            w.writeAll(",\"cwd\":\"") catch return;
+            writeJsonEscaped(w, s) catch return;
+            w.writeAll("\"") catch return;
+        }
+        if (fg_name) |s| {
+            w.writeAll(",\"fg_process\":\"") catch return;
+            writeJsonEscaped(w, s) catch return;
+            w.writeAll("\"") catch return;
+        }
+        if (fg_pid) |p| {
+            w.print(",\"fg_pid\":{d}", .{p}) catch return;
+        }
+
+        w.writeAll("}") catch return;
+
+        self.conn.?.sendLine(fbs.getWritten()) catch {
+            self.conn.?.close();
+            self.conn = null;
+        };
+    }
+
+    fn ensureConnected(self: *PodUplink) bool {
+        if (self.conn != null) return true;
+
+        const ses_path = core.ipc.getSesSocketPath(self.allocator) catch return false;
+        defer self.allocator.free(ses_path);
+
+        var client = core.ipc.Client.connect(ses_path) catch return false;
+        self.conn = client.toConnection();
+
+        // Best-effort: identify this connection to SES.
+        var buf: [128]u8 = undefined;
+        const hello = std.fmt.bufPrint(&buf, "{{\"type\":\"pod_register\",\"pane_uuid\":\"{s}\"}}", .{self.uuid[0..]}) catch {
+            return true;
+        };
+        self.conn.?.sendLine(hello) catch {};
+        return true;
+    }
+};
+
+fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn optIntEql(comptime T: type, a: ?T, b: ?T) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.? == b.?;
+}
+
+fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
+    for (value) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.writeByte(' ');
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
+}
+
+fn readProcCwd(allocator: std.mem.Allocator, pid: posix.pid_t) !?[]u8 {
+    if (pid <= 0) return null;
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid});
+    var tmp: [std.fs.max_path_bytes]u8 = undefined;
+    const link = posix.readlink(path, &tmp) catch return null;
+    return try allocator.dupe(u8, link);
+}
+
+fn readProcForeground(allocator: std.mem.Allocator, child_pid: posix.pid_t) !?struct { name: []u8, pid: i32 } {
+    if (child_pid <= 0) return null;
+
+    // /proc/<pid>/stat field 8 after the comm+state is tpgid.
+    var stat_path_buf: [64]u8 = undefined;
+    const stat_path = try std.fmt.bufPrint(&stat_path_buf, "/proc/{d}/stat", .{child_pid});
+    const stat_file = std.fs.openFileAbsolute(stat_path, .{}) catch return null;
+    defer stat_file.close();
+
+    var stat_buf: [512]u8 = undefined;
+    const stat_len = stat_file.read(&stat_buf) catch return null;
+    if (stat_len == 0) return null;
+    const stat = stat_buf[0..stat_len];
+
+    const right_paren = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+    if (right_paren + 2 >= stat.len) return null;
+    const rest = stat[right_paren + 2 ..];
+
+    var it = std.mem.tokenizeScalar(u8, rest, ' ');
+    var idx: usize = 0;
+    var tpgid: ?i32 = null;
+    while (it.next()) |tok| {
+        idx += 1;
+        if (idx == 6) {
+            const v = std.fmt.parseInt(i32, tok, 10) catch return null;
+            if (v > 0) tpgid = v;
+            break;
+        }
+    }
+    if (tpgid == null) return null;
+
+    var comm_path_buf: [64]u8 = undefined;
+    const comm_path = try std.fmt.bufPrint(&comm_path_buf, "/proc/{d}/comm", .{tpgid.?});
+    const comm_file = std.fs.openFileAbsolute(comm_path, .{}) catch return null;
+    defer comm_file.close();
+    var comm_buf: [128]u8 = undefined;
+    const comm_len = comm_file.read(&comm_buf) catch return null;
+    if (comm_len == 0) return null;
+    const end = if (comm_buf[comm_len - 1] == '\n') comm_len - 1 else comm_len;
+
+    const name = try allocator.dupe(u8, comm_buf[0..end]);
+    return .{ .name = name, .pid = tpgid.? };
+}
+
 fn setBlocking(fd: posix.fd_t) void {
     const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch return;
     const new_flags: usize = flags & ~@as(usize, @intCast(c.O_NONBLOCK));
@@ -368,6 +551,8 @@ const Pod = struct {
     input_reader: pod_protocol.Reader,
     pty_paused: bool = false,
 
+    uplink: PodUplink,
+
     const RunOptions = struct {
         write_meta: bool,
         created_at: i64,
@@ -407,6 +592,7 @@ const Pod = struct {
             .backlog = backlog,
             .reader = reader,
             .input_reader = input_reader,
+            .uplink = PodUplink.init(allocator, uuid),
         };
     }
 
@@ -419,6 +605,7 @@ const Pod = struct {
         self.backlog.deinit(self.allocator);
         self.reader.deinit(self.allocator);
         self.input_reader.deinit(self.allocator);
+        self.uplink.deinit();
     }
 
     pub fn run(self: *Pod, opts: RunOptions) !void {
@@ -431,6 +618,9 @@ const Pod = struct {
         var last_meta_ms: i64 = 0;
 
         while (true) {
+            // Phase 2: POD is source of truth; periodically push metadata to SES.
+            self.uplink.tick(self.pty.child_pid);
+
             // Periodically refresh sidecar meta so PID/cwd changes are reflected.
             if (opts.write_meta) {
                 const now_ms: i64 = std.time.milliTimestamp();

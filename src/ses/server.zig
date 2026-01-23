@@ -197,6 +197,12 @@ pub const Server = struct {
         if (std.mem.eql(u8, type_str, "ping")) {
             try conn.sendLine("{\"type\":\"pong\"}");
             return;
+        } else if (std.mem.eql(u8, type_str, "pod_register")) {
+            // Phase 2: POD establishes a persistent-ish control link by
+            // registering itself with SES. For now this is best-effort: we
+            // accept the message so the pod can keep using the same ses.sock.
+            try conn.sendLine("{\"type\":\"ok\"}");
+            return;
         } else if (std.mem.eql(u8, type_str, "status")) {
             try notify_handlers.handleStatus(self.allocator, self.ses_state, conn, root, sendErrorFn);
             return;
@@ -265,13 +271,23 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, type_str, "list_sessions")) {
             try session_handlers.handleListSessions(self.allocator, self.ses_state, conn, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "update_pane_aux")) {
-            try pane_handlers.handleUpdatePaneAux(self.ses_state, conn, root, sendErrorFn);
+            // Phase 2: pane metadata should come from POD -> SES.
+            // Keep the handler for backward compatibility (older mux), but
+            // explicitly ignore/ack the message so it doesn't overwrite
+            // authoritative pod-derived state.
+            try conn.sendLine("{\"type\":\"ok\"}");
         } else if (std.mem.eql(u8, type_str, "update_pane_name")) {
             try pane_handlers.handleUpdatePaneName(self.ses_state, conn, root, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "update_pane_shell")) {
             try pane_handlers.handleUpdatePaneShell(self.ses_state, conn, root, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "shell_event")) {
             try pane_handlers.handleShellEvent(self.ses_state, conn, root, msg, sendErrorFn);
+        } else if (std.mem.eql(u8, type_str, "pod_meta")) {
+            try pane_handlers.handlePodMeta(self.ses_state, conn, root, sendErrorFn);
+        } else if (std.mem.eql(u8, type_str, "pod_register")) {
+            // Allow pods to send a hello on their uplink connection.
+            // Nothing to do yet besides acknowledging.
+            try conn.sendLine("{\"type\":\"ok\"}");
         } else if (std.mem.eql(u8, type_str, "pop_response")) {
             try pop_handlers.handlePopResponse(&self.pending_pop_requests, conn, root);
         } else if (std.mem.eql(u8, type_str, "send_keys")) {

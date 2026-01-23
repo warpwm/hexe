@@ -526,6 +526,56 @@ pub fn handleUpdatePaneShell(
     try conn.sendLine("{\"type\":\"ok\"}");
 }
 
+/// Handle pod_meta from POD.
+///
+/// Phase 2: POD is the authoritative source for pane metadata.
+/// SES updates its per-pane state from these reports.
+pub fn handlePodMeta(
+    ses_state: *state.SesState,
+    conn: *ipc.Connection,
+    root: std.json.ObjectMap,
+    sendError: *const fn (*ipc.Connection, []const u8) anyerror!void,
+) !void {
+    const uuid_val = root.get("pane_uuid") orelse return sendError(conn, "missing_pane_uuid");
+    const uuid_str = switch (uuid_val) {
+        .string => |s| s,
+        else => return sendError(conn, "invalid_uuid"),
+    };
+    if (uuid_str.len != 32) return sendError(conn, "invalid_uuid");
+
+    var uuid: [32]u8 = undefined;
+    @memcpy(&uuid, uuid_str[0..32]);
+
+    const pane = ses_state.panes.getPtr(uuid) orelse {
+        // Pane might have been GC'd or belongs to a different instance.
+        try conn.sendLine("{\"type\":\"ok\"}");
+        return;
+    };
+
+    if (root.get("cwd")) |v| {
+        if (v == .string) {
+            if (pane.cwd) |old| ses_state.allocator.free(old);
+            pane.cwd = ses_state.allocator.dupe(u8, v.string) catch pane.cwd;
+        }
+    }
+
+    if (root.get("fg_process")) |v| {
+        if (v == .string) {
+            if (pane.fg_process) |old| ses_state.allocator.free(old);
+            pane.fg_process = ses_state.allocator.dupe(u8, v.string) catch pane.fg_process;
+        }
+    }
+
+    if (root.get("fg_pid")) |v| {
+        if (v == .integer) {
+            pane.fg_pid = @intCast(v.integer);
+        }
+    }
+
+    ses_state.markDirty();
+    try conn.sendLine("{\"type\":\"ok\"}");
+}
+
 /// Handle shell_event from POD (forwarded from SHP).
 /// Updates local pane state and forwards the event to the owning MUX client.
 pub fn handleShellEvent(
