@@ -21,7 +21,10 @@ pub const VT = struct {
     render_state: ghostty.RenderState = .empty,
     width: u16 = 0,
     height: u16 = 0,
-    dirty: bool = true,
+    // NOTE: Do NOT cache RenderState across calls.
+    // Ghostty's "visible viewport" for main-screen scrollback can change due to
+    // viewport movement even when no new output is fed. Caching at this layer can
+    // cause panes to appear visually frozen while scrolling.
 
     /// Initialize the VT in-place.
     ///
@@ -55,7 +58,14 @@ pub const VT = struct {
     /// state for sequences that arrive split across PTY reads.
     pub fn feed(self: *VT, data: []const u8) !void {
         try self.stream.nextSlice(data);
-        self.dirty = true;
+    }
+
+    /// Mark the VT as needing a fresh render snapshot.
+    ///
+    /// Kept for API compatibility with callers, but RenderState is currently not
+    /// cached so this is a no-op.
+    pub fn invalidateRenderState(self: *VT) void {
+        _ = self;
     }
 
     /// Resize the virtual terminal
@@ -64,7 +74,6 @@ pub const VT = struct {
         try self.terminal.resize(self.allocator, width, height);
         self.width = width;
         self.height = height;
-        self.dirty = true;
     }
 
     /// Get cursor position
@@ -111,15 +120,12 @@ pub const VT = struct {
     /// SAFETY: When scrollback is very large, this can fail or return invalid data.
     /// Callers should check the returned RenderState's rows/cols are reasonable.
     pub fn getRenderState(self: *VT) !*const ghostty.RenderState {
-        if (!self.dirty) return &self.render_state;
-
         // Clear previous state before updating to free memory from previous large scrollback
         self.render_state.deinit(self.allocator);
         self.render_state = .empty;
 
         // Update render state - this allocates based on current VT dimensions
         try self.render_state.update(self.allocator, &self.terminal);
-        self.dirty = false;
 
         // Validate the RenderState dimensions are reasonable
         // Large scrollback can cause rows to become extremely large

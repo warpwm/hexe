@@ -941,21 +941,25 @@ pub const Pane = struct {
     /// Scroll up by given number of lines
     pub fn scrollUp(self: *Pane, lines: u32) void {
         self.vt.terminal.scrollViewport(.{ .delta = -@as(isize, @intCast(lines)) }) catch {};
+        self.vt.invalidateRenderState();
     }
 
     /// Scroll down by given number of lines
     pub fn scrollDown(self: *Pane, lines: u32) void {
         self.vt.terminal.scrollViewport(.{ .delta = @as(isize, @intCast(lines)) }) catch {};
+        self.vt.invalidateRenderState();
     }
 
     /// Scroll to top of history
     pub fn scrollToTop(self: *Pane) void {
         self.vt.terminal.scrollViewport(.top) catch {};
+        self.vt.invalidateRenderState();
     }
 
     /// Scroll to bottom (current output)
     pub fn scrollToBottom(self: *Pane) void {
         self.vt.terminal.scrollViewport(.bottom) catch {};
+        self.vt.invalidateRenderState();
     }
 
     /// Check if we're scrolled (not at bottom)

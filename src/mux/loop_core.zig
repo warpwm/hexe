@@ -253,7 +253,13 @@ pub fn runMainLoop(state: *State) !void {
             if (idx < fd_count) {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
                     if (pane.*.poll(&buffer)) |had_data| {
-                        if (had_data) state.needs_render = true;
+                        if (had_data) {
+                            // If the viewport is scrolled, new output still changes what should be visible:
+                            // lines may be pushed into/out of scrollback, even if the top line stays anchored.
+                            // Force the render snapshot to refresh so the contents don't "freeze".
+                            pane.*.vt.invalidateRenderState();
+                            state.needs_render = true;
+                        }
                         if (pane.*.takeOscExpectResponse()) {
                             state.osc_reply_target_uuid = pane.*.uuid;
                         }
@@ -278,7 +284,10 @@ pub fn runMainLoop(state: *State) !void {
             if (idx < fd_count) {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
                     if (pane.poll(&buffer)) |had_data| {
-                        if (had_data) state.needs_render = true;
+                        if (had_data) {
+                            pane.vt.invalidateRenderState();
+                            state.needs_render = true;
+                        }
                         if (pane.takeOscExpectResponse()) {
                             state.osc_reply_target_uuid = pane.uuid;
                         }
