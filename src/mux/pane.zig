@@ -98,11 +98,6 @@ pub const Pane = struct {
     float_style: ?*const core.FloatStyle = null,
     float_title: ?[]u8 = null,
 
-    // Cached foreground process name (avoids repeated /proc reads)
-    fg_proc_cache_len: u8 = 0,
-    fg_proc_cache_ms: i64 = 0,
-    fg_proc_cache_buf: [64]u8 = undefined,
-
     // Tracks whether we saw a clear-screen sequence in the last output.
     did_clear: bool = false,
     // Keep last bytes so we can detect escape sequences across boundaries.
@@ -913,13 +908,8 @@ pub const Pane = struct {
     }
 
     /// Get foreground process name by reading /proc/<pid>/comm.
-    /// Only available for local PTY panes. Results are cached for 500ms.
+    /// Only available for local PTY panes.
     pub fn getFgProcess(self: *Pane) ?[]const u8 {
-        const now = std.time.milliTimestamp();
-        if (self.fg_proc_cache_len > 0 and (now - self.fg_proc_cache_ms) < 500) {
-            return self.fg_proc_cache_buf[0..self.fg_proc_cache_len];
-        }
-
         const pid = self.getFgPid() orelse return null;
         var path_buf: [64]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
@@ -928,14 +918,7 @@ pub const Pane = struct {
         const len = file.read(&proc_buf) catch return null;
         if (len == 0) return null;
         const end = if (len > 0 and proc_buf[len - 1] == '\n') len - 1 else len;
-
-        // Cache the result
-        const cache_len = @min(end, self.fg_proc_cache_buf.len);
-        @memcpy(self.fg_proc_cache_buf[0..cache_len], proc_buf[0..cache_len]);
-        self.fg_proc_cache_len = @intCast(cache_len);
-        self.fg_proc_cache_ms = now;
-
-        return self.fg_proc_cache_buf[0..cache_len];
+        return proc_buf[0..end];
     }
 
     /// Scroll up by given number of lines
