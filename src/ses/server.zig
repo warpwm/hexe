@@ -270,6 +270,8 @@ pub const Server = struct {
             try pane_handlers.handleUpdatePaneName(self.ses_state, conn, root, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "update_pane_shell")) {
             try pane_handlers.handleUpdatePaneShell(self.ses_state, conn, root, sendErrorFn);
+        } else if (std.mem.eql(u8, type_str, "shell_event")) {
+            try pane_handlers.handleShellEvent(self.ses_state, conn, root, msg, sendErrorFn);
         } else if (std.mem.eql(u8, type_str, "pop_response")) {
             try pop_handlers.handlePopResponse(&self.pending_pop_requests, conn, root);
         } else if (std.mem.eql(u8, type_str, "send_keys")) {

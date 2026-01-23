@@ -382,6 +382,7 @@ const Pod = struct {
         const extra_env = [_][2][]const u8{
             .{ "HEXE_PANE_UUID", uuid_str },
             .{ "HEXE_POD_NAME", pod_name orelse "" },
+            .{ "HEXE_POD_SOCKET", socket_path },
         };
         var pty = try core.Pty.spawnWithEnv(shell, cwd, &extra_env);
         errdefer pty.close();
@@ -465,22 +466,30 @@ const Pod = struct {
             // Accept new connection.
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 if (self.server.tryAccept() catch null) |conn| {
-                    if (self.client == null) {
-                        // No existing client - this is the main mux connection
-                        // IMPORTANT: core.ipc.Server.tryAccept accepts with SOCK_NONBLOCK,
-                        // which makes the accepted client fd non-blocking. Under heavy
-                        // output, writes can return WouldBlock and we would otherwise
-                        // close the mux connection, making the mux think the pane died.
-                        //
-                        // For the main mux connection we want blocking semantics.
+                    // Non-blocking peek at first byte to distinguish connection type.
+                    // SHP sends a control frame (type=5) immediately after connecting.
+                    // MUX connects silently and waits for backlog replay.
+                    var peek_byte: [1]u8 = undefined;
+                    const peeked = posix.read(conn.fd, &peek_byte) catch 0;
+
+                    if (peeked > 0 and peek_byte[0] == @intFromEnum(pod_protocol.FrameType.control)) {
+                        // Control frame from SHP - read payload and forward to SES.
+                        self.handleControlConnection(conn, &peek_byte);
+                    } else if (self.client == null) {
+                        // No existing client - this is the main mux connection.
                         setBlocking(conn.fd);
                         self.client = conn;
 
                         // Reset the frame reader to discard any partial state left
-                        // from the previous connection. Without this, a new mux's
-                        // input frames get misinterpreted as continuations of the
-                        // old connection's partial frames, causing commands to hang.
+                        // from the previous connection.
                         self.reader.reset();
+
+                        // If we peeked a byte (unusual - MUX sent before backlog),
+                        // feed it to the reader.
+                        if (peeked > 0) {
+                            self.reader.feed(peek_byte[0..1], @ptrCast(self), podFrameCallback);
+                        }
+
                         // Replay backlog.
                         const n = self.backlog.copyOut(backlog_tmp);
                         var off: usize = 0;
@@ -496,13 +505,18 @@ const Pod = struct {
                         self.backlog.clear();
                         self.pty_paused = false;
                     } else {
-                        // Already have a client - this is an input-only connection (e.g., hexe mux send)
-                        // Read any input frames and process them, then close
+                        // Aux binary input connection (e.g., hexe mux send).
                         var input_buf: [4096]u8 = undefined;
-                        const n = posix.read(conn.fd, &input_buf) catch 0;
-                        if (n > 0) {
+                        var total: usize = 0;
+                        if (peeked > 0) {
+                            input_buf[0] = peek_byte[0];
+                            total = 1;
+                        }
+                        const n = posix.read(conn.fd, input_buf[total..]) catch 0;
+                        total += n;
+                        if (total > 0) {
                             self.input_reader.reset();
-                            self.input_reader.feed(input_buf[0..n], @ptrCast(self), podFrameCallback);
+                            self.input_reader.feed(input_buf[0..total], @ptrCast(self), podFrameCallback);
                         }
                         var tmp_conn = conn;
                         tmp_conn.close();
@@ -603,8 +617,98 @@ const Pod = struct {
                     self.pty.setSize(cols, rows) catch {};
                 }
             },
+            .control => {
+                // Control frame (shell event) - forward to SES.
+                if (frame.payload.len > 0) {
+                    self.forwardToSes(frame.payload);
+                }
+            },
             else => {},
         }
+    }
+
+    /// Handle a control connection from SHP.
+    /// Reads the rest of the control frame (header byte already consumed),
+    /// extracts the JSON payload, and forwards it to SES.
+    fn handleControlConnection(self: *Pod, conn: core.IpcConnection, first_byte: *const [1]u8) void {
+        _ = first_byte; // Already consumed as type byte
+        var header_rest: [4]u8 = undefined;
+        var header_read: usize = 0;
+
+        // Read the 4-byte length (blocking-ish: poll briefly then read).
+        var poll_fd: [1]posix.pollfd = .{.{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&poll_fd, 100) catch {};
+        if (poll_fd[0].revents & posix.POLL.IN == 0) {
+            var tmp = conn;
+            tmp.close();
+            return;
+        }
+
+        header_read = posix.read(conn.fd, &header_rest) catch 0;
+        if (header_read < 4) {
+            var tmp = conn;
+            tmp.close();
+            return;
+        }
+
+        const payload_len = std.mem.readInt(u32, &header_rest, .big);
+        if (payload_len == 0 or payload_len > 8192) {
+            var tmp = conn;
+            tmp.close();
+            return;
+        }
+
+        // Read the JSON payload.
+        var payload_buf: [8192]u8 = undefined;
+        var total: usize = 0;
+        while (total < payload_len) {
+            _ = posix.poll(&poll_fd, 100) catch break;
+            const n = posix.read(conn.fd, payload_buf[total..payload_len]) catch break;
+            if (n == 0) break;
+            total += n;
+        }
+
+        var tmp = conn;
+        tmp.close();
+
+        if (total < payload_len) return;
+
+        // Forward the shell event to SES with our pane UUID injected.
+        self.forwardToSes(payload_buf[0..payload_len]);
+    }
+
+    /// Forward a JSON control message to SES daemon.
+    /// Connects to ses.sock, sends the message as a JSON line, and closes.
+    fn forwardToSes(self: *Pod, payload: []const u8) void {
+        // Construct ses socket path from the socket directory.
+        const ses_path = core.ipc.getSesSocketPath(self.allocator) catch return;
+        defer self.allocator.free(ses_path);
+
+        var client = core.ipc.Client.connect(ses_path) catch return;
+        defer client.close();
+        var conn = client.toConnection();
+
+        // The payload is already a complete JSON object from SHP.
+        // Inject/override the pane_uuid field to ensure it matches this pod.
+        // Build: {"type":"shell_event","pane_uuid":"<our-uuid>", ...rest of fields}
+        var buf: [8192 + 128]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        const w = fbs.writer();
+        w.writeAll("{\"type\":\"shell_event\",\"pane_uuid\":\"") catch return;
+        w.writeAll(&self.uuid) catch return;
+        w.writeAll("\"") catch return;
+
+        // Parse the incoming JSON to extract fields (skip the opening brace).
+        // Find first comma after opening brace to append remaining fields.
+        if (std.mem.indexOfScalar(u8, payload, ',')) |comma_idx| {
+            w.writeAll(payload[comma_idx..]) catch return;
+        } else {
+            // No extra fields, just close the object.
+            w.writeAll("}") catch return;
+        }
+
+        const msg = fbs.getWritten();
+        conn.sendLine(msg) catch {};
     }
 
     fn lastOsc7Cwd(self: *Pod) ?[]const u8 {

@@ -9,6 +9,7 @@ pub const FrameType = enum(u8) {
     input = 2,
     resize = 3,
     backlog_end = 4,
+    control = 5, // JSON control messages (shell events from SHP)
 };
 
 pub fn writeFrame(conn: *ipc.Connection, frame_type: FrameType, payload: []const u8) !void {

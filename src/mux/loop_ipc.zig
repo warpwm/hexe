@@ -227,6 +227,78 @@ pub fn handleSesMessage(state: *State, buffer: []u8) void {
             state.needs_render = true;
         }
     }
+    // Handle shell_event forwarded from POD via SES.
+    else if (std.mem.eql(u8, msg_type, "shell_event")) {
+        const uuid_str = if (root.get("pane_uuid")) |v|
+            if (v == .string) v.string else ""
+        else
+            "";
+        if (uuid_str.len != 32) return;
+
+        var uuid: [32]u8 = undefined;
+        @memcpy(&uuid, uuid_str[0..32]);
+
+        const cmd = if (root.get("cmd")) |v| if (v == .string) v.string else null else null;
+        const cwd = if (root.get("cwd")) |v| if (v == .string) v.string else null else null;
+        const status_opt: ?i32 = if (root.get("status")) |v| switch (v) {
+            .integer => |i| @intCast(i),
+            else => null,
+        } else null;
+        const dur_opt: ?u64 = if (root.get("duration_ms")) |v| switch (v) {
+            .integer => |i| @intCast(@max(@as(i64, 0), i)),
+            else => null,
+        } else null;
+        const jobs_opt: ?u16 = if (root.get("jobs")) |v| switch (v) {
+            .integer => |i| @intCast(@max(@as(i64, 0), i)),
+            else => null,
+        } else null;
+        const phase = if (root.get("phase")) |v| if (v == .string) v.string else "end" else "end";
+        const running = if (root.get("running")) |v| switch (v) {
+            .bool => |b| b,
+            else => null,
+        } else null;
+        const started_at_opt: ?u64 = if (root.get("started_at_ms")) |v| switch (v) {
+            .integer => |i| @intCast(@max(@as(i64, 0), i)),
+            else => null,
+        } else null;
+
+        // Job count delta notifications.
+        const old_jobs: ?u16 = if (state.pane_shell.get(uuid)) |info| info.jobs else null;
+        if (jobs_opt) |new_jobs| {
+            if (old_jobs) |old| {
+                if (old == 0 and new_jobs > 0) {
+                    var msg_buf: [64]u8 = undefined;
+                    const notify_msg = std.fmt.bufPrint(&msg_buf, "Background jobs: {d}", .{new_jobs}) catch null;
+                    if (notify_msg) |m| {
+                        state.notifications.show(m);
+                    }
+                } else if (old > 0 and new_jobs == 0) {
+                    state.notifications.show("Background jobs finished");
+                }
+            }
+        }
+
+        if (std.mem.eql(u8, phase, "start")) {
+            const now_ms: u64 = @intCast(std.time.milliTimestamp());
+            state.setPaneShellRunning(uuid, running orelse true, started_at_opt orelse now_ms, cmd, cwd, jobs_opt);
+        } else {
+            const now_ms: u64 = @intCast(std.time.milliTimestamp());
+            var computed_dur: ?u64 = dur_opt;
+            if (state.pane_shell.get(uuid)) |info| {
+                if (info.started_at_ms) |t0| {
+                    if (now_ms >= t0) computed_dur = now_ms - t0;
+                }
+            }
+            state.setPaneShellRunning(uuid, running orelse false, null, null, null, null);
+            state.setPaneShell(uuid, cmd, cwd, status_opt, computed_dur, jobs_opt);
+            if (state.pane_shell.getPtr(uuid)) |info_ptr| {
+                info_ptr.started_at_ms = null;
+            }
+        }
+
+        // No need to forward to SES - it already came from there.
+        state.needs_render = true;
+    }
 }
 
 /// Send popup response back to ses (for CLI-triggered popups).

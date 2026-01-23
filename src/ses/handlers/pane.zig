@@ -526,6 +526,76 @@ pub fn handleUpdatePaneShell(
     try conn.sendLine("{\"type\":\"ok\"}");
 }
 
+/// Handle shell_event from POD (forwarded from SHP).
+/// Updates local pane state and forwards the event to the owning MUX client.
+pub fn handleShellEvent(
+    ses_state: *state.SesState,
+    conn: *ipc.Connection,
+    root: std.json.ObjectMap,
+    raw_msg: []const u8,
+    sendError: *const fn (*ipc.Connection, []const u8) anyerror!void,
+) !void {
+    const uuid_val = root.get("pane_uuid") orelse return sendError(conn, "missing_pane_uuid");
+    const uuid_str = switch (uuid_val) {
+        .string => |s| s,
+        else => return sendError(conn, "invalid_uuid"),
+    };
+    if (uuid_str.len != 32) return sendError(conn, "invalid_uuid");
+
+    var uuid: [32]u8 = undefined;
+    @memcpy(&uuid, uuid_str[0..32]);
+
+    const pane = ses_state.panes.getPtr(uuid) orelse {
+        // Pane not found - might be a race. Just ack and move on.
+        try conn.sendLine("{\"type\":\"ok\"}");
+        return;
+    };
+
+    // Update local pane shell state (same as handleUpdatePaneShell).
+    if (root.get("cmd")) |v| {
+        if (v == .string) {
+            if (pane.last_cmd) |old| pane.allocator.free(old);
+            pane.last_cmd = pane.allocator.dupe(u8, v.string) catch pane.last_cmd;
+        }
+    }
+    if (root.get("cwd")) |v| {
+        if (v == .string) {
+            if (pane.cwd) |old| pane.allocator.free(old);
+            pane.cwd = pane.allocator.dupe(u8, v.string) catch pane.cwd;
+        }
+    }
+    if (root.get("status")) |v| {
+        if (v == .integer) {
+            pane.last_status = @intCast(v.integer);
+        }
+    }
+    if (root.get("duration_ms")) |v| {
+        if (v == .integer) {
+            pane.last_duration_ms = @intCast(@max(@as(i64, 0), v.integer));
+        }
+    }
+    if (root.get("jobs")) |v| {
+        if (v == .integer) {
+            pane.last_jobs = @intCast(@max(@as(i64, 0), v.integer));
+        }
+    }
+    ses_state.dirty = true;
+
+    // Forward the shell_event to the owning MUX client.
+    if (pane.attached_to) |client_id| {
+        for (ses_state.clients.items) |client| {
+            if (client.id == client_id) {
+                // Forward raw message to the MUX client.
+                var client_conn = ipc.Connection{ .fd = client.fd };
+                client_conn.sendLine(raw_msg) catch {};
+                break;
+            }
+        }
+    }
+
+    try conn.sendLine("{\"type\":\"ok\"}");
+}
+
 /// Handle update_pane_name request
 ///
 /// This updates the in-memory pane name in ses. This is intended for mux UI

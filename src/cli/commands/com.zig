@@ -876,22 +876,10 @@ pub fn runShellEvent(
 ) !void {
     _ = allocator;
 
-    const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
-        // Not in mux; ignore.
-        return;
-    };
-    const pane_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
-        return;
-    };
+    const pane_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse return;
     if (pane_uuid.len != 32) return;
 
-    var client = ipc.Client.connect(mux_socket) catch {
-        // Don't break the shell.
-        return;
-    };
-    defer client.close();
-    var conn = client.toConnection();
-
+    // Build JSON payload.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.heap.page_allocator);
     var w = buf.writer(std.heap.page_allocator);
@@ -922,13 +910,39 @@ pub fn runShellEvent(
         try w.print(",\"started_at_ms\":{d}", .{started_at_ms});
     }
 
-    // End-of-command metadata
     try w.print(",\"status\":{d}", .{status});
     try w.print(",\"duration_ms\":{d}", .{duration_ms});
     try w.print(",\"jobs\":{d}", .{jobs});
     try w.writeAll("}");
 
-    conn.sendLine(buf.items) catch return;
+    // Try POD socket first (pod-centric path: SHP → POD → SES → MUX).
+    const pod_socket = std.posix.getenv("HEXE_POD_SOCKET");
+    if (pod_socket) |ps| {
+        var client = ipc.Client.connect(ps) catch {
+            // POD socket unavailable, try MUX fallback below.
+            return sendToMux(buf.items);
+        };
+        defer client.close();
+        var conn = client.toConnection();
+
+        // Send as a control frame: [type=5][len:4B BE][JSON payload]
+        const pod_protocol = core.pod_protocol;
+        pod_protocol.writeFrame(&conn, .control, buf.items) catch return;
+        return;
+    }
+
+    // Fallback: legacy path via MUX socket (SHP → MUX).
+    sendToMux(buf.items);
+}
+
+fn sendToMux(payload: []const u8) void {
+    const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse return;
+
+    var client = ipc.Client.connect(mux_socket) catch return;
+    defer client.close();
+    var conn = client.toConnection();
+
+    conn.sendLine(payload) catch return;
 
     // Best-effort, ignore response.
     var resp_buf: [128]u8 = undefined;
