@@ -35,7 +35,7 @@ jobs:
         uses: mlugg/setup-zig@v2
 
       - name: Build binary
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -freference-trace=10
 
       - name: Prepare artifact
         run: |

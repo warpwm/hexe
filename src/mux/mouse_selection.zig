@@ -267,7 +267,7 @@ pub fn selectWordRange(pane: *Pane, local_x: u16, local_y: u16) ?BufRange {
     const screen = pane.vt.terminal.screens.active;
     const pages = &screen.pages;
     const pin = pages.pin(.{ .viewport = .{ .x = @intCast(local_x), .y = local_y } }) orelse return null;
-    const sel = screen.selectWord(pin) orelse return null;
+    const sel = screen.selectWord(pin, &[_]u21{}) orelse return null;
     return bufRangeFromSelection(screen, sel);
 }
 
