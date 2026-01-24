@@ -205,7 +205,8 @@ fn printUsage() !void {
 }
 
 fn sendNotify(allocator: std.mem.Allocator, message: []const u8, target_uuid: ?[]const u8) !void {
-    // Connect to running daemon
+    const wire = core.wire;
+
     const socket_path = try ipc.getSesSocketPath(allocator);
     defer allocator.free(socket_path);
 
@@ -217,39 +218,32 @@ fn sendNotify(allocator: std.mem.Allocator, message: []const u8, target_uuid: ?[
         return err;
     };
     defer client.close();
+    const fd = client.fd;
 
-    var conn = client.toConnection();
+    // CLI handshake
+    const handshake: [1]u8 = .{wire.SES_HANDSHAKE_CLI};
+    wire.writeAll(fd, &handshake) catch return;
 
-    // Send notify request (broadcast or targeted)
-    var buf: [4096]u8 = undefined;
-    const request = if (target_uuid) |uuid|
-        std.fmt.bufPrint(&buf, "{{\"type\":\"targeted_notify\",\"message\":\"{s}\",\"uuid\":\"{s}\"}}", .{ message, uuid }) catch {
-            print("Message too long\n", .{});
-            return;
+    if (target_uuid) |uuid| {
+        if (uuid.len >= 32) {
+            var tn: wire.TargetedNotify = .{
+                .uuid = undefined,
+                .timeout_ms = 0,
+                .msg_len = @intCast(message.len),
+            };
+            @memcpy(&tn.uuid, uuid[0..32]);
+            wire.writeControlWithTrail(fd, .targeted_notify, std.mem.asBytes(&tn), message) catch return;
         }
-    else
-        std.fmt.bufPrint(&buf, "{{\"type\":\"broadcast_notify\",\"message\":\"{s}\"}}", .{message}) catch {
-            print("Message too long\n", .{});
-            return;
-        };
-    try conn.sendLine(request);
-
-    // Receive response
-    var resp_buf: [256]u8 = undefined;
-    const line = try conn.recvLine(&resp_buf);
-    if (line) |resp| {
-        if (std.mem.indexOf(u8, resp, "\"ok\"") != null) {
-            print("Notification sent\n", .{});
-        } else if (std.mem.indexOf(u8, resp, "\"not_found\"") != null) {
-            print("Target UUID not found\n", .{});
-        } else {
-            print("Failed to send notification\n", .{});
-        }
+    } else {
+        const notify = wire.Notify{ .msg_len = @intCast(message.len) };
+        wire.writeControlWithTrail(fd, .notify, std.mem.asBytes(&notify), message) catch return;
     }
+    print("Notification sent\n", .{});
 }
 
 fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
-    // Connect to running daemon
+    const wire = core.wire;
+
     const socket_path = try ipc.getSesSocketPath(allocator);
     defer allocator.free(socket_path);
 
@@ -261,132 +255,144 @@ fn listStatus(allocator: std.mem.Allocator, full_mode: bool) !void {
         return err;
     };
     defer client.close();
+    const fd = client.fd;
 
-    var conn = client.toConnection();
+    // CLI handshake
+    const handshake: [1]u8 = .{wire.SES_HANDSHAKE_CLI};
+    wire.writeAll(fd, &handshake) catch return;
 
-    // Always request full status to get the tree
+    // Always request full to get mux_state trees
     _ = full_mode;
-    try conn.sendLine("{\"type\":\"status\",\"full\":true}");
+    const flag: [1]u8 = .{1}; // full mode
+    wire.writeControl(fd, .status, &flag) catch return;
 
-    // Receive response - use larger buffer for full mode
-    var buf: [65536]u8 = undefined;
-    const line = try conn.recvLine(&buf);
-    if (line == null) {
-        print("No response from daemon\n", .{});
-        return;
-    }
-
-    // Parse and display
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line.?, .{}) catch {
+    // Read response
+    const hdr = wire.readControlHeader(fd) catch return;
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type != .status or hdr.payload_len < @sizeOf(wire.StatusResp)) {
         print("Invalid response from daemon\n", .{});
         return;
+    }
+
+    const payload = allocator.alloc(u8, hdr.payload_len) catch {
+        print("Allocation failed\n", .{});
+        return;
     };
-    defer parsed.deinit();
+    defer allocator.free(payload);
+    wire.readExact(fd, payload) catch return;
 
-    const root = parsed.value.object;
+    var off: usize = 0;
 
-    // Print clients (connected muxes) - only if there are any
-    if (root.get("clients")) |clients_val| {
-        const clients = clients_val.array;
-        if (clients.items.len > 0) {
-            print("Connected muxes: {d}\n", .{clients.items.len});
+    if (off + @sizeOf(wire.StatusResp) > payload.len) return;
+    const status_hdr = std.mem.bytesToValue(wire.StatusResp, payload[off..][0..@sizeOf(wire.StatusResp)]);
+    off += @sizeOf(wire.StatusResp);
 
-            for (clients.items) |client_val| {
-                const c = client_val.object;
-                const id = c.get("id").?.integer;
-                const panes = c.get("panes").?.array;
+    // Connected clients
+    if (status_hdr.client_count > 0) {
+        print("Connected muxes: {d}\n", .{status_hdr.client_count});
+    }
 
-                // Get session name and id if available
-                const name = if (c.get("session_name")) |n| n.string else "unknown";
-                const sid = if (c.get("session_id")) |s| s.string else null;
+    var ci: u16 = 0;
+    while (ci < status_hdr.client_count) : (ci += 1) {
+        if (off + @sizeOf(wire.StatusClient) > payload.len) return;
+        const sc = std.mem.bytesToValue(wire.StatusClient, payload[off..][0..@sizeOf(wire.StatusClient)]);
+        off += @sizeOf(wire.StatusClient);
 
-                if (sid) |session_id| {
-                    print("  {s} [{s}] (mux #{d}, {d} panes)\n", .{ name, session_id[0..8], id, panes.items.len });
-                } else {
-                    print("  {s} (mux #{d}, {d} panes)\n", .{ name, id, panes.items.len });
-                }
+        if (off + sc.name_len > payload.len) return;
+        const name_str = if (sc.name_len > 0) payload[off .. off + sc.name_len] else "unknown";
+        off += sc.name_len;
 
-                // Always show full mux state tree if available
-                if (c.get("mux_state")) |mux_state_val| {
-                    printMuxStateTree(allocator, mux_state_val.string, "    ");
-                } else {
-                    for (panes.items) |pane_val| {
-                        const p = pane_val.object;
-                        const uuid = p.get("uuid").?.string;
-                        const pid = p.get("pid").?.integer;
+        if (off + sc.mux_state_len > payload.len) return;
+        const mux_state = if (sc.mux_state_len > 0) payload[off .. off + sc.mux_state_len] else "";
+        off += sc.mux_state_len;
 
-                        print("    [{s}] pid={d}", .{ uuid[0..8], pid });
+        const sid8: []const u8 = if (sc.has_session_id != 0) sc.session_id[0..8] else "????????";
+        print("  {s} [{s}] (mux #{d}, {d} panes)\n", .{ name_str, sid8, sc.id, sc.pane_count });
 
-                        if (p.get("sticky_pwd")) |pwd| {
-                            print(" pwd={s}", .{pwd.string});
-                        }
-                        print("\n", .{});
-                    }
-                }
-            }
+        // Read pane entries
+        var pi: u16 = 0;
+        while (pi < sc.pane_count) : (pi += 1) {
+            if (off + @sizeOf(wire.StatusPaneEntry) > payload.len) return;
+            const pe = std.mem.bytesToValue(wire.StatusPaneEntry, payload[off..][0..@sizeOf(wire.StatusPaneEntry)]);
+            off += @sizeOf(wire.StatusPaneEntry);
+            if (off + pe.name_len > payload.len) return;
+            off += pe.name_len;
+            if (off + pe.sticky_pwd_len > payload.len) return;
+            off += pe.sticky_pwd_len;
+        }
+
+        if (mux_state.len > 0) {
+            printMuxStateTree(allocator, mux_state, "    ");
         }
     }
 
-    // Print detached sessions
-    if (root.get("detached_sessions")) |sessions_val| {
-        const sessions = sessions_val.array;
-        if (sessions.items.len > 0) {
-            print("\nDetached sessions: {d}\n", .{sessions.items.len});
+    // Detached sessions
+    if (status_hdr.detached_count > 0) {
+        print("\nDetached sessions: {d}\n", .{status_hdr.detached_count});
+    }
 
-            for (sessions.items) |sess_val| {
-                const s = sess_val.object;
-                const sid = s.get("session_id").?.string;
-                const pane_count = s.get("pane_count").?.integer;
-                const name = if (s.get("session_name")) |n| n.string else "unknown";
+    var di: u16 = 0;
+    while (di < status_hdr.detached_count) : (di += 1) {
+        if (off + @sizeOf(wire.DetachedSessionEntry) > payload.len) return;
+        const de = std.mem.bytesToValue(wire.DetachedSessionEntry, payload[off..][0..@sizeOf(wire.DetachedSessionEntry)]);
+        off += @sizeOf(wire.DetachedSessionEntry);
 
-                print("  {s} [{s}] {d} panes - reattach: hexe-mux -a {s}\n", .{ name, sid[0..8], pane_count, name });
+        if (off + de.name_len > payload.len) return;
+        const name_str = if (de.name_len > 0) payload[off .. off + de.name_len] else "unknown";
+        off += de.name_len;
 
-                // Always show full mux state tree if available
-                if (s.get("mux_state")) |mux_state_val| {
-                    printMuxStateTree(allocator, mux_state_val.string, "    ");
-                }
-            }
+        if (off + de.mux_state_len > payload.len) return;
+        const mux_state = if (de.mux_state_len > 0) payload[off .. off + de.mux_state_len] else "";
+        off += de.mux_state_len;
+
+        print("  {s} [{s}] {d} panes - reattach: hexe mux attach {s}\n", .{ name_str, de.session_id[0..8], de.pane_count, name_str });
+
+        if (mux_state.len > 0) {
+            printMuxStateTree(allocator, mux_state, "    ");
         }
     }
 
-    // Print orphaned panes (disowned)
-    if (root.get("orphaned")) |orphaned_val| {
-        const orphaned = orphaned_val.array;
-        if (orphaned.items.len > 0) {
-            print("\nOrphaned panes (disowned): {d}\n", .{orphaned.items.len});
-
-            for (orphaned.items) |pane_val| {
-                const p = pane_val.object;
-                const uuid = p.get("uuid").?.string;
-                const pid = p.get("pid").?.integer;
-
-                print("  [{s}] pid={d}\n", .{ uuid[0..8], pid });
-            }
-        }
+    // Orphaned panes
+    if (status_hdr.orphaned_count > 0) {
+        print("\nOrphaned panes (disowned): {d}\n", .{status_hdr.orphaned_count});
     }
 
-    // Print sticky panes
-    if (root.get("sticky")) |sticky_val| {
-        const sticky = sticky_val.array;
-        if (sticky.items.len > 0) {
-            print("\nSticky panes: {d}\n", .{sticky.items.len});
+    var oi: u16 = 0;
+    while (oi < status_hdr.orphaned_count) : (oi += 1) {
+        if (off + @sizeOf(wire.StatusPaneEntry) > payload.len) return;
+        const pe = std.mem.bytesToValue(wire.StatusPaneEntry, payload[off..][0..@sizeOf(wire.StatusPaneEntry)]);
+        off += @sizeOf(wire.StatusPaneEntry);
+        if (off + pe.name_len > payload.len) return;
+        off += pe.name_len;
+        if (off + pe.sticky_pwd_len > payload.len) return;
+        off += pe.sticky_pwd_len;
+        print("  [{s}] pid={d}\n", .{ pe.uuid[0..8], pe.pid });
+    }
 
-            for (sticky.items) |pane_val| {
-                const p = pane_val.object;
-                const uuid = p.get("uuid").?.string;
-                const pid = p.get("pid").?.integer;
+    // Sticky panes
+    if (status_hdr.sticky_count > 0) {
+        print("\nSticky panes: {d}\n", .{status_hdr.sticky_count});
+    }
 
-                print("  [{s}] pid={d}", .{ uuid[0..8], pid });
+    var si: u16 = 0;
+    while (si < status_hdr.sticky_count) : (si += 1) {
+        if (off + @sizeOf(wire.StickyPaneEntry) > payload.len) return;
+        const se = std.mem.bytesToValue(wire.StickyPaneEntry, payload[off..][0..@sizeOf(wire.StickyPaneEntry)]);
+        off += @sizeOf(wire.StickyPaneEntry);
+        if (off + se.name_len > payload.len) return;
+        off += se.name_len;
+        if (off + se.pwd_len > payload.len) return;
+        const pwd = if (se.pwd_len > 0) payload[off .. off + se.pwd_len] else "";
+        off += se.pwd_len;
 
-                if (p.get("pwd")) |pwd| {
-                    print(" pwd={s}", .{pwd.string});
-                }
-                if (p.get("key")) |key| {
-                    print(" key={s}", .{key.string});
-                }
-                print("\n", .{});
-            }
+        print("  [{s}] pid={d}", .{ se.uuid[0..8], se.pid });
+        if (pwd.len > 0) {
+            print(" pwd={s}", .{pwd});
         }
+        if (se.key != 0) {
+            print(" key={c}", .{se.key});
+        }
+        print("\n", .{});
     }
 }
 

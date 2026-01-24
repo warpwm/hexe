@@ -32,6 +32,26 @@ pub fn findPaneByUuid(self: anytype, uuid: [32]u8) ?*Pane {
     return null;
 }
 
+/// Find a pane by its SES-assigned pane_id (pod panes only).
+pub fn findPaneByPaneId(self: anytype, pane_id: u16) ?*Pane {
+    for (self.floats.items) |pane| {
+        if (pane.getPaneId()) |id| {
+            if (id == pane_id) return pane;
+        }
+    }
+
+    for (self.tabs.items) |*tab| {
+        var it = tab.layout.splits.valueIterator();
+        while (it.next()) |p| {
+            if (p.*.getPaneId()) |id| {
+                if (id == pane_id) return p.*;
+            }
+        }
+    }
+
+    return null;
+}
+
 /// Create a new tab with one pane.
 pub fn createTab(self: anytype) !void {
     const parent_uuid = self.getCurrentFocusedUuid();
@@ -133,15 +153,14 @@ pub fn adoptStickyPanes(self: anytype) void {
         const result = self.ses_client.findStickyPane(cwd, float_def.key) catch continue;
         if (result) |r| {
             // Found a sticky pane - adopt it as a float.
-            defer self.allocator.free(r.socket_path);
-            self.adoptAsFloat(r.uuid, r.socket_path, r.pid, float_def, cwd) catch continue;
+            self.adoptAsFloat(r.uuid, r.pane_id, float_def, cwd) catch continue;
             self.notifications.showFor("Sticky float restored", 2000);
         }
     }
 }
 
 /// Adopt a pane from ses as a float with given float definition.
-pub fn adoptAsFloat(self: anytype, uuid: [32]u8, socket_path: []const u8, pid: std.posix.pid_t, float_def: *const core.FloatDef, cwd: []const u8) !void {
+pub fn adoptAsFloat(self: anytype, uuid: [32]u8, pane_id: u16, float_def: *const core.FloatDef, cwd: []const u8) !void {
     const pane = try self.allocator.create(Pane);
     errdefer self.allocator.destroy(pane);
 
@@ -178,9 +197,9 @@ pub fn adoptAsFloat(self: anytype, uuid: [32]u8, socket_path: []const u8, pid: s
     // Generate pane ID (floats use 100+ offset).
     const id: u16 = @intCast(100 + self.floats.items.len);
 
-    _ = pid;
-    // Initialize pane with the adopted pod.
-    try pane.initWithPod(self.allocator, id, content_x, content_y, content_w, content_h, socket_path, uuid);
+    // Initialize pane with the adopted pod — VT routed through SES.
+    const vt_fd = self.ses_client.getVtFd() orelse return error.NoVtChannel;
+    try pane.initWithPod(self.allocator, id, content_x, content_y, content_w, content_h, pane_id, vt_fd, uuid);
 
     pane.floating = true;
     pane.focused = true;
@@ -260,14 +279,14 @@ pub fn adoptOrphanedPane(self: anytype) bool {
 
     // Adopt the first one.
     const result = self.ses_client.adoptPane(panes[0].uuid) catch return false;
-    defer self.allocator.free(result.socket_path);
+    const vt_fd = self.ses_client.getVtFd() orelse return false;
 
     // Get the current focused pane and replace it.
     if (self.active_floating) |idx| {
         const old_pane = self.floats.items[idx];
-        old_pane.replaceWithPod(result.socket_path, result.uuid) catch return false;
+        old_pane.replaceWithPod(result.pane_id, vt_fd, result.uuid) catch return false;
     } else if (self.currentLayout().getFocusedPane()) |pane| {
-        pane.replaceWithPod(result.socket_path, result.uuid) catch return false;
+        pane.replaceWithPod(result.pane_id, vt_fd, result.uuid) catch return false;
     } else {
         return false;
     }
@@ -334,23 +353,6 @@ pub fn reattachSession(self: anytype, session_id_prefix: []const u8) bool {
         const uuid_str = uuid_val.string;
         if (uuid_str.len == 32) {
             @memcpy(&self.uuid, uuid_str[0..32]);
-
-            // Recreate the IPC server at the restored UUID's socket path.
-            // The shell's HEXE_MUX_SOCKET env var points to this path, and it
-            // doesn't change on reattach (shell was spawned by the pod, not mux).
-            // Without this, shell-event messages silently fail after reattach.
-            if (self.ipc_server) |*old_srv| {
-                old_srv.deinit();
-                self.ipc_server = null;
-            }
-            if (self.socket_path) |old_path| {
-                self.allocator.free(old_path);
-                self.socket_path = null;
-            }
-            if (core.ipc.getMuxSocketPath(self.allocator, uuid_str)) |new_path| {
-                self.socket_path = new_path;
-                self.ipc_server = core.ipc.Server.init(self.allocator, new_path) catch null;
-            } else |_| {}
         }
     }
 
@@ -377,22 +379,14 @@ pub fn reattachSession(self: anytype, session_id_prefix: []const u8) bool {
     else
         null;
 
-    // Build a map of UUID -> pod socket path for pane adoption.
-    var uuid_socket_map = std.AutoHashMap([32]u8, []u8).init(self.allocator);
-    defer {
-        var vit = uuid_socket_map.valueIterator();
-        while (vit.next()) |sock| {
-            self.allocator.free(sock.*);
-        }
-        uuid_socket_map.deinit();
-    }
+    // Build a map of UUID -> pane_id for adopted panes.
+    const AdoptInfo = struct { pane_id: u16 };
+    var uuid_pane_map = std.AutoHashMap([32]u8, AdoptInfo).init(self.allocator);
+    defer uuid_pane_map.deinit();
 
     for (reattach_result.pane_uuids) |uuid| {
         const adopt_result = self.ses_client.adoptPane(uuid) catch continue;
-        uuid_socket_map.put(uuid, adopt_result.socket_path) catch {
-            self.allocator.free(adopt_result.socket_path);
-            continue;
-        };
+        uuid_pane_map.put(uuid, .{ .pane_id = adopt_result.pane_id }) catch continue;
     }
 
     // Restore tabs.
@@ -434,10 +428,11 @@ pub fn reattachSession(self: anytype, session_id_prefix: []const u8) bool {
                     var uuid_arr: [32]u8 = undefined;
                     @memcpy(&uuid_arr, uuid_str[0..32]);
 
-                    if (uuid_socket_map.get(uuid_arr)) |sock| {
+                    if (uuid_pane_map.get(uuid_arr)) |info| {
                         const pane = self.allocator.create(Pane) catch continue;
+                        const vt_fd = self.ses_client.getVtFd() orelse continue;
 
-                        pane.initWithPod(self.allocator, pane_id, 0, 0, self.layout_width, self.layout_height, sock, uuid_arr) catch {
+                        pane.initWithPod(self.allocator, pane_id, 0, 0, self.layout_width, self.layout_height, info.pane_id, vt_fd, uuid_arr) catch {
                             self.allocator.destroy(pane);
                             continue;
                         };
@@ -488,10 +483,11 @@ pub fn reattachSession(self: anytype, session_id_prefix: []const u8) bool {
             var uuid_arr: [32]u8 = undefined;
             @memcpy(&uuid_arr, uuid_str[0..32]);
 
-            if (uuid_socket_map.get(uuid_arr)) |sock| {
+            if (uuid_pane_map.get(uuid_arr)) |info| {
                 const pane = self.allocator.create(Pane) catch continue;
+                const vt_fd = self.ses_client.getVtFd() orelse continue;
 
-                pane.initWithPod(self.allocator, 0, 0, 0, self.layout_width, self.layout_height, sock, uuid_arr) catch {
+                pane.initWithPod(self.allocator, 0, 0, 0, self.layout_width, self.layout_height, info.pane_id, vt_fd, uuid_arr) catch {
                     self.allocator.destroy(pane);
                     continue;
                 };
@@ -617,10 +613,10 @@ pub fn attachOrphanedPane(self: anytype, uuid_prefix: []const u8) bool {
             }
             tab.layout.setPanePopConfig(&self.pop_config.pane.notification);
 
-            defer self.allocator.free(result.socket_path);
+            const vt_fd = self.ses_client.getVtFd() orelse return false;
 
             const pane = self.allocator.create(Pane) catch return false;
-            pane.initWithPod(self.allocator, 0, 0, 0, self.layout_width, self.layout_height, result.socket_path, result.uuid) catch {
+            pane.initWithPod(self.allocator, 0, 0, 0, self.layout_width, self.layout_height, result.pane_id, vt_fd, result.uuid) catch {
                 self.allocator.destroy(pane);
                 return false;
             };

@@ -126,8 +126,7 @@ pub const State = struct {
     popups: pop.PopupManager,
     pending_action: ?PendingAction,
     exit_from_shell_death: bool,
-    /// IPC client waiting for exit_intent decision (fd kept open)
-    pending_exit_intent_fd: ?posix.fd_t,
+    pending_exit_intent: bool,
     /// If non-zero and in the future, skip confirm_on_exit for the next last-pane death.
     exit_intent_deadline_ms: i64,
     adopt_orphans: [32]OrphanedPaneInfo = undefined,
@@ -141,8 +140,6 @@ pub const State = struct {
     uuid: [32]u8,
     session_name: []const u8,
     session_name_owned: ?[]const u8,
-    ipc_server: ?core.ipc.Server,
-    socket_path: ?[]const u8,
 
     osc_reply_target_uuid: ?[32]u8,
     osc_reply_buf: std.ArrayList(u8),
@@ -201,12 +198,6 @@ pub const State = struct {
         const uuid = core.ipc.generateUuid();
         const session_name = core.ipc.generateSessionName();
 
-        const socket_path = core.ipc.getMuxSocketPath(allocator, &uuid) catch null;
-        var ipc_server: ?core.ipc.Server = null;
-        if (socket_path) |path| {
-            ipc_server = core.ipc.Server.init(allocator, path) catch null;
-        }
-
         return .{
             .allocator = allocator,
             .config = cfg,
@@ -232,7 +223,7 @@ pub const State = struct {
             .popups = pop.PopupManager.init(allocator),
             .pending_action = null,
             .exit_from_shell_death = false,
-            .pending_exit_intent_fd = null,
+            .pending_exit_intent = false,
             .exit_intent_deadline_ms = 0,
             .skip_dead_check = false,
             .pending_pop_response = false,
@@ -242,8 +233,6 @@ pub const State = struct {
             .uuid = uuid,
             .session_name = session_name,
             .session_name_owned = null,
-            .ipc_server = ipc_server,
-            .socket_path = socket_path,
 
             .osc_reply_target_uuid = null,
             .osc_reply_buf = .empty,
@@ -412,7 +401,6 @@ pub const State = struct {
         self.popups.deinit();
         var req_it = self.pending_float_requests.iterator();
         while (req_it.next()) |entry| {
-            _ = posix.close(entry.value_ptr.fd);
             if (entry.value_ptr.result_path) |path| {
                 self.allocator.free(path);
             }
@@ -420,12 +408,6 @@ pub const State = struct {
         self.pending_float_requests.deinit();
 
         self.float_rename_buf.deinit(self.allocator);
-        if (self.ipc_server) |*srv| {
-            srv.deinit();
-        }
-        if (self.socket_path) |path| {
-            self.allocator.free(path);
-        }
         if (self.session_name_owned) |owned| {
             self.allocator.free(owned);
         }
@@ -463,6 +445,10 @@ pub const State = struct {
         return state_tabs.findPaneByUuid(self, uuid);
     }
 
+    pub fn findPaneByPaneId(self: *State, pane_id: u16) ?*Pane {
+        return state_tabs.findPaneByPaneId(self, pane_id);
+    }
+
     pub fn createTab(self: *State) !void {
         return state_tabs.createTab(self);
     }
@@ -475,8 +461,8 @@ pub const State = struct {
         return state_tabs.adoptStickyPanes(self);
     }
 
-    pub fn adoptAsFloat(self: *State, uuid: [32]u8, socket_path: []const u8, pid: posix.pid_t, float_def: *const core.FloatDef, cwd: []const u8) !void {
-        return state_tabs.adoptAsFloat(self, uuid, socket_path, pid, float_def, cwd);
+    pub fn adoptAsFloat(self: *State, uuid: [32]u8, pane_id: u16, float_def: *const core.FloatDef, cwd: []const u8) !void {
+        return state_tabs.adoptAsFloat(self, uuid, pane_id, float_def, cwd);
     }
 
     pub fn nextTab(self: *State) void {

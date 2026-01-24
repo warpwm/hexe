@@ -303,7 +303,7 @@ pub fn main() !void {
             // Show help for the most specific command found (manual strings to avoid argonaut crash)
             if (found_mux and found_focus) {
                 print(
-                    "Usage: hexe mux focus <dir>\n\nMove focus to adjacent pane in the mux. Intended for editor integration (nvim).\n\nDirs: left, right, up, down\n\nRequires running inside mux (HEXE_MUX_SOCKET)\n",
+                    "Usage: hexe mux focus <dir>\n\nMove focus to adjacent pane in the mux. Intended for editor integration (nvim).\n\nDirs: left, right, up, down\n\nRequires running inside mux (HEXE_PANE_UUID)\n",
                     .{},
                 );
             } else
@@ -745,213 +745,181 @@ fn runShpSpinner(name: []const u8, width_i: i64, interval_i: i64, hold_i: i64, l
 // ============================================================================
 
 fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, message: []const u8) !void {
+    const wire = core.wire;
+    const posix = std.posix;
+
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
+    var target_uuid: [32]u8 = undefined;
+    if (uuid.len >= 32) {
+        @memcpy(&target_uuid, uuid[0..32]);
+    } else {
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --uuid required (or run inside hexe mux)\n", .{});
             return;
-        }
-        return err;
+        };
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+        } else return;
+    }
+
+    const fd = cli_cmds.connectSesCliChannel(allocator) orelse return;
+    defer posix.close(fd);
+
+    const timeout_ms: i32 = if (timeout > 0) @intCast(timeout) else 3000;
+    const tn = wire.TargetedNotify{
+        .uuid = target_uuid,
+        .timeout_ms = timeout_ms,
+        .msg_len = @intCast(message.len),
     };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [4096]u8 = undefined;
-
-    // Determine target UUID: explicit > current pane
-    var target_uuid: ?[]const u8 = null;
-    if (uuid.len > 0) {
-        target_uuid = uuid;
-    } else {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
-    }
-
-    if (target_uuid) |t| {
-        const timeout_ms = if (timeout > 0) timeout else 3000; // Default 3 seconds
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}", .{ t, message, timeout_ms });
-        try conn.sendLine(msg);
-    } else {
-        print("Error: --uuid required (or run inside hexe mux)\n", .{});
-        return;
-    }
-
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
-        defer parsed.deinit();
-
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                if (parsed.value.object.get("message")) |m| {
-                    print("Error: {s}\n", .{m.string});
-                }
-            }
-        }
-    }
+    wire.writeControlWithTrail(fd, .targeted_notify, std.mem.asBytes(&tn), message) catch {};
 }
 
 fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, message: []const u8) !void {
+    const wire = core.wire;
+    const posix = std.posix;
+
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
+    var target_uuid: [32]u8 = undefined;
+    if (uuid.len >= 32) {
+        @memcpy(&target_uuid, uuid[0..32]);
+    } else {
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --uuid required (or run inside hexe mux)\n", .{});
             return;
-        }
-        return err;
-    };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [4096]u8 = undefined;
-
-    // Determine target UUID
-    var target_uuid: ?[]const u8 = null;
-    if (uuid.len > 0) {
-        target_uuid = uuid;
-    } else {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
-    }
-
-    if (target_uuid) |t| {
-        if (timeout > 0) {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}", .{ t, message, timeout });
-            try conn.sendLine(msg);
-        } else {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
-            try conn.sendLine(msg);
-        }
-    } else {
-        print("Error: --uuid required (or run inside hexe mux)\n", .{});
-        return;
-    }
-
-    // Wait for response (blocking)
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
-            std.process.exit(1);
         };
-        defer parsed.deinit();
-
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                if (parsed.value.object.get("message")) |m| {
-                    print("Error: {s}\n", .{m.string});
-                }
-                std.process.exit(1);
-            } else if (std.mem.eql(u8, t.string, "pop_response")) {
-                if (parsed.value.object.get("confirmed")) |conf| {
-                    if (conf == .bool and conf.bool) {
-                        std.process.exit(0); // Confirmed
-                    }
-                }
-                std.process.exit(1); // Cancelled, timeout, or not confirmed
-            }
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+        } else {
+            std.process.exit(1);
         }
     }
-    std.process.exit(1);
+
+    const fd = cli_cmds.connectSesCliChannel(allocator) orelse std.process.exit(1);
+    // Don't close fd — we need to read the response.
+
+    const timeout_ms: i32 = if (timeout > 0) @intCast(timeout) else 0;
+    const pc = wire.PopConfirm{
+        .uuid = target_uuid,
+        .timeout_ms = timeout_ms,
+        .msg_len = @intCast(message.len),
+    };
+    wire.writeControlWithTrail(fd, .pop_confirm, std.mem.asBytes(&pc), message) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+
+    // Wait for binary PopResponse.
+    const hdr = wire.readControlHeader(fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type != .pop_response or hdr.payload_len < @sizeOf(wire.PopResponse)) {
+        posix.close(fd);
+        std.process.exit(1);
+    }
+    const resp = wire.readStruct(wire.PopResponse, fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    posix.close(fd);
+
+    if (resp.response_type == 1) {
+        std.process.exit(0); // Confirmed
+    }
+    std.process.exit(1); // Cancelled or timeout
 }
 
 fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, items: []const u8, message: []const u8) !void {
+    const wire = core.wire;
+    const posix = std.posix;
+
     if (items.len == 0) {
         print("Error: --items is required\n", .{});
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
-            return;
-        }
-        return err;
-    };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [8192]u8 = undefined;
-
-    // Determine target UUID
-    var target_uuid: ?[]const u8 = null;
-    if (uuid.len > 0) {
-        target_uuid = uuid;
+    var target_uuid: [32]u8 = undefined;
+    if (uuid.len >= 32) {
+        @memcpy(&target_uuid, uuid[0..32]);
     } else {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --uuid required (or run inside hexe mux)\n", .{});
+            return;
+        };
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+        } else {
+            std.process.exit(1);
+        }
     }
 
-    if (target_uuid) |t| {
-        // Build items JSON array from comma-separated string
-        var items_json: std.ArrayList(u8) = .empty;
-        defer items_json.deinit(allocator);
-        try items_json.appendSlice(allocator, "[");
+    // Build trailing data: title + length-prefixed items.
+    var trail: std.ArrayList(u8) = .empty;
+    defer trail.deinit(allocator);
 
-        var it = std.mem.splitScalar(u8, items, ',');
-        var first = true;
-        while (it.next()) |item| {
-            const trimmed = std.mem.trim(u8, item, " ");
-            if (trimmed.len > 0) {
-                if (!first) try items_json.appendSlice(allocator, ",");
-                try items_json.appendSlice(allocator, "\"");
-                try items_json.appendSlice(allocator, trimmed);
-                try items_json.appendSlice(allocator, "\"");
-                first = false;
-            }
-        }
-        try items_json.appendSlice(allocator, "]");
+    const title = if (message.len > 0) message else "Select option";
+    try trail.appendSlice(allocator, title);
 
-        const title = if (message.len > 0) message else "Select option";
-        if (timeout > 0) {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s},\"timeout_ms\":{d}}}", .{ t, title, items_json.items, timeout });
-            try conn.sendLine(msg);
-        } else {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s}}}", .{ t, title, items_json.items });
-            try conn.sendLine(msg);
+    // Count and encode items.
+    var item_count: u16 = 0;
+    var it = std.mem.splitScalar(u8, items, ',');
+    while (it.next()) |item| {
+        const trimmed = std.mem.trim(u8, item, " ");
+        if (trimmed.len > 0) {
+            const len: u16 = @intCast(trimmed.len);
+            try trail.appendSlice(allocator, std.mem.asBytes(&len));
+            try trail.appendSlice(allocator, trimmed);
+            item_count += 1;
         }
-    } else {
-        print("Error: --uuid required (or run inside hexe mux)\n", .{});
+    }
+
+    if (item_count == 0) {
+        print("Error: no valid items provided\n", .{});
         return;
     }
 
-    // Wait for response (blocking)
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
-            std.process.exit(1);
-        };
-        defer parsed.deinit();
+    const fd = cli_cmds.connectSesCliChannel(allocator) orelse std.process.exit(1);
 
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                if (parsed.value.object.get("message")) |m| {
-                    print("Error: {s}\n", .{m.string});
-                }
-                std.process.exit(1);
-            } else if (std.mem.eql(u8, t.string, "pop_response")) {
-                if (parsed.value.object.get("selected")) |sel| {
-                    if (sel == .integer) {
-                        print("{d}\n", .{sel.integer}); // Output selected index
-                        std.process.exit(0);
-                    }
-                }
-                std.process.exit(1); // Cancelled or timeout
-            }
-        }
+    const timeout_ms: i32 = if (timeout > 0) @intCast(timeout) else 0;
+    const pc = wire.PopChoose{
+        .uuid = target_uuid,
+        .timeout_ms = timeout_ms,
+        .title_len = @intCast(title.len),
+        .item_count = item_count,
+    };
+    wire.writeControlWithTrail(fd, .pop_choose, std.mem.asBytes(&pc), trail.items) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+
+    // Wait for binary PopResponse.
+    const hdr = wire.readControlHeader(fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type != .pop_response or hdr.payload_len < @sizeOf(wire.PopResponse)) {
+        posix.close(fd);
+        std.process.exit(1);
     }
-    std.process.exit(1);
+    const resp = wire.readStruct(wire.PopResponse, fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    posix.close(fd);
+
+    if (resp.response_type == 2) {
+        print("{d}\n", .{resp.selected_idx});
+        std.process.exit(0);
+    }
+    std.process.exit(1); // Cancelled or timeout
 }

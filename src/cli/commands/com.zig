@@ -49,7 +49,10 @@ fn printTreeNode(prefix: []const u8, symbol: []const u8, type_color: []const u8,
 }
 
 pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
-    const inst = std.posix.getenv("HEXE_INSTANCE");
+    const wire = core.wire;
+    const posix = std.posix;
+
+    const inst = posix.getenv("HEXE_INSTANCE");
     if (inst) |name| {
         if (name.len > 0) {
             print("Instance: {s}\n", .{name});
@@ -60,456 +63,426 @@ pub fn runList(allocator: std.mem.Allocator, details: bool) !void {
         print("Instance: default\n", .{});
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
+    const fd = connectSesCliChannel(allocator) orelse return;
+    defer posix.close(fd);
 
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
-            return;
-        }
-        return err;
-    };
-    defer client.close();
+    // Send status request with full_mode flag
+    const flag: [1]u8 = .{if (details) @as(u8, 1) else @as(u8, 0)};
+    wire.writeControl(fd, .status, &flag) catch return;
 
-    var conn = client.toConnection();
-    if (details) {
-        try conn.sendLine("{\"type\":\"status\",\"full\":true}");
-    } else {
-        try conn.sendLine("{\"type\":\"status\"}");
-    }
-
-    var buf: [65536]u8 = undefined;
-    const line = try conn.recvLine(&buf);
-    if (line == null) {
-        print("No response from daemon\n", .{});
-        return;
-    }
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line.?, .{}) catch {
+    // Read response
+    const hdr = wire.readControlHeader(fd) catch return;
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type != .status or hdr.payload_len < @sizeOf(wire.StatusResp)) {
         print("Invalid response from daemon\n", .{});
         return;
+    }
+
+    // Read the entire payload into a buffer
+    const payload = allocator.alloc(u8, hdr.payload_len) catch {
+        print("Allocation failed\n", .{});
+        return;
     };
-    defer parsed.deinit();
+    defer allocator.free(payload);
+    wire.readExact(fd, payload) catch return;
 
-    const root = parsed.value.object;
+    var off: usize = 0;
 
-    // Connected muxes
-    if (root.get("clients")) |clients_val| {
-        const clients = clients_val.array;
-        if (clients.items.len > 0) {
-            print("Connected muxes: {d}\n", .{clients.items.len});
-            for (clients.items, 0..) |client_val, ci| {
-                const c = client_val.object;
-                const id = c.get("id").?.integer;
-                const panes = c.get("panes").?.array;
-                const name = if (c.get("session_name")) |n| n.string else "unknown";
-                const sid = if (c.get("session_id")) |s| s.string else null;
+    // Parse StatusResp header
+    if (off + @sizeOf(wire.StatusResp) > payload.len) return;
+    const status_hdr = std.mem.bytesToValue(wire.StatusResp, payload[off..][0..@sizeOf(wire.StatusResp)]);
+    off += @sizeOf(wire.StatusResp);
 
-                const is_last_client = (ci + 1 == clients.items.len);
-                const branch = if (is_last_client) "└" else "├";
-                const child_prefix = if (is_last_client) "   " else "│  ";
+    // Connected clients
+    if (status_hdr.client_count > 0) {
+        print("Connected muxes: {d}\n", .{status_hdr.client_count});
+    }
 
-                if (sid) |session_id| {
-                    var mux_line: [256]u8 = undefined;
-                    const prefix = std.fmt.bufPrint(&mux_line, "{s}─ ", .{branch}) catch "";
-                    // mux uuid uses session_id prefix for stability
-                    printTreeNode(prefix, " ", ansi.MUX, "mux", name, session_id[0..8]);
-                    _ = id;
-                } else {
-                    var mux_line: [256]u8 = undefined;
-                    const prefix = std.fmt.bufPrint(&mux_line, "{s}─ ", .{branch}) catch "";
-                    printTreeNode(prefix, " ", ansi.MUX, "mux", name, "????????");
-                    _ = id;
-                }
+    var ci: u16 = 0;
+    while (ci < status_hdr.client_count) : (ci += 1) {
+        if (off + @sizeOf(wire.StatusClient) > payload.len) return;
+        const sc = std.mem.bytesToValue(wire.StatusClient, payload[off..][0..@sizeOf(wire.StatusClient)]);
+        off += @sizeOf(wire.StatusClient);
 
-                if (c.get("mux_state")) |mux_state_val| {
-                    var pane_names = std.StringHashMap([]const u8).init(allocator);
-                    defer pane_names.deinit();
+        // Read trailing: name, mux_state
+        if (off + sc.name_len > payload.len) return;
+        const name_str = if (sc.name_len > 0) payload[off .. off + sc.name_len] else "unknown";
+        off += sc.name_len;
 
-                    for (panes.items) |pane_val| {
-                        const p = pane_val.object;
-                        const uuid = p.get("uuid").?.string;
-                        if (p.get("name")) |n| {
-                            pane_names.put(uuid, n.string) catch {};
-                        }
-                    }
+        if (off + sc.mux_state_len > payload.len) return;
+        const mux_state = if (sc.mux_state_len > 0) payload[off .. off + sc.mux_state_len] else "";
+        off += sc.mux_state_len;
 
-                    printMuxTree(allocator, mux_state_val.string, child_prefix, &pane_names);
-                }
+        const is_last_client = (ci + 1 == status_hdr.client_count);
+        const branch = if (is_last_client) "\xe2\x94\x94" else "\xe2\x94\x9c";
+        const child_prefix = if (is_last_client) "   " else "\xe2\x94\x82  ";
+
+        const sid8: []const u8 = if (sc.has_session_id != 0) sc.session_id[0..8] else "????????";
+
+        var mux_line: [256]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&mux_line, "{s}\xe2\x94\x80 ", .{branch}) catch "";
+        printTreeNode(prefix, " ", ansi.MUX, "mux", name_str, sid8);
+
+        // Read pane entries and build name map
+        var pane_names = std.StringHashMap([]const u8).init(allocator);
+        defer pane_names.deinit();
+
+        var pi: u16 = 0;
+        while (pi < sc.pane_count) : (pi += 1) {
+            if (off + @sizeOf(wire.StatusPaneEntry) > payload.len) return;
+            const pe = std.mem.bytesToValue(wire.StatusPaneEntry, payload[off..][0..@sizeOf(wire.StatusPaneEntry)]);
+            off += @sizeOf(wire.StatusPaneEntry);
+
+            if (off + pe.name_len > payload.len) return;
+            const pname = if (pe.name_len > 0) payload[off .. off + pe.name_len] else "";
+            off += pe.name_len;
+            if (off + pe.sticky_pwd_len > payload.len) return;
+            off += pe.sticky_pwd_len; // skip sticky_pwd
+
+            if (pname.len > 0) {
+                pane_names.put(&pe.uuid, pname) catch {};
             }
+        }
+
+        if (mux_state.len > 0) {
+            printMuxTree(allocator, mux_state, child_prefix, &pane_names);
         }
     }
 
     // Detached sessions
-    if (root.get("detached_sessions")) |sessions_val| {
-        const sessions = sessions_val.array;
-        if (sessions.items.len > 0) {
-            print("\nDetached sessions: {d}\n", .{sessions.items.len});
-            for (sessions.items) |sess_val| {
-                const s = sess_val.object;
-                const sid = s.get("session_id").?.string;
-                const pane_count = s.get("pane_count").?.integer;
-                const name = if (s.get("session_name")) |n| n.string else "unknown";
+    if (status_hdr.detached_count > 0) {
+        print("\nDetached sessions: {d}\n", .{status_hdr.detached_count});
+    }
 
-                print("  {s} [{s}] {d} panes - reattach: hexe mux attach {s}\n", .{ name, sid[0..8], pane_count, name });
+    var di: u16 = 0;
+    while (di < status_hdr.detached_count) : (di += 1) {
+        if (off + @sizeOf(wire.DetachedSessionEntry) > payload.len) return;
+        const de = std.mem.bytesToValue(wire.DetachedSessionEntry, payload[off..][0..@sizeOf(wire.DetachedSessionEntry)]);
+        off += @sizeOf(wire.DetachedSessionEntry);
 
-                if (s.get("mux_state")) |mux_state_val| {
-                    printMuxTree(allocator, mux_state_val.string, "    ", null);
-                }
-            }
+        if (off + de.name_len > payload.len) return;
+        const name_str = if (de.name_len > 0) payload[off .. off + de.name_len] else "unknown";
+        off += de.name_len;
+
+        if (off + de.mux_state_len > payload.len) return;
+        const mux_state = if (de.mux_state_len > 0) payload[off .. off + de.mux_state_len] else "";
+        off += de.mux_state_len;
+
+        print("  {s} [{s}] {d} panes - reattach: hexe mux attach {s}\n", .{ name_str, de.session_id[0..8], de.pane_count, name_str });
+
+        if (mux_state.len > 0) {
+            printMuxTree(allocator, mux_state, "    ", null);
         }
     }
 
     // Orphaned panes
-    if (root.get("orphaned")) |orphaned_val| {
-        const orphaned = orphaned_val.array;
-        if (orphaned.items.len > 0) {
-            print("\nOrphaned panes: {d}\n", .{orphaned.items.len});
-            for (orphaned.items) |pane_val| {
-                const p = pane_val.object;
-                const uuid = p.get("uuid").?.string;
-                const pid = p.get("pid").?.integer;
-                if (p.get("name")) |n| {
-                    print("  [{s}] {s} pid={d}\n", .{ uuid[0..8], n.string, pid });
-                } else {
-                    print("  [{s}] pid={d}\n", .{ uuid[0..8], pid });
-                }
-            }
+    if (status_hdr.orphaned_count > 0) {
+        print("\nOrphaned panes: {d}\n", .{status_hdr.orphaned_count});
+    }
+
+    var oi: u16 = 0;
+    while (oi < status_hdr.orphaned_count) : (oi += 1) {
+        if (off + @sizeOf(wire.StatusPaneEntry) > payload.len) return;
+        const pe = std.mem.bytesToValue(wire.StatusPaneEntry, payload[off..][0..@sizeOf(wire.StatusPaneEntry)]);
+        off += @sizeOf(wire.StatusPaneEntry);
+
+        if (off + pe.name_len > payload.len) return;
+        const pname = if (pe.name_len > 0) payload[off .. off + pe.name_len] else "";
+        off += pe.name_len;
+        if (off + pe.sticky_pwd_len > payload.len) return;
+        off += pe.sticky_pwd_len;
+
+        if (pname.len > 0) {
+            print("  [{s}] {s} pid={d}\n", .{ pe.uuid[0..8], pname, pe.pid });
+        } else {
+            print("  [{s}] pid={d}\n", .{ pe.uuid[0..8], pe.pid });
         }
     }
 
     // Sticky panes
-    if (root.get("sticky")) |sticky_val| {
-        const sticky = sticky_val.array;
-        if (sticky.items.len > 0) {
-            print("\nSticky panes: {d}\n", .{sticky.items.len});
-            for (sticky.items) |pane_val| {
-                const p = pane_val.object;
-                const uuid = p.get("uuid").?.string;
-                const pid = p.get("pid").?.integer;
-                print("  [{s}] pid={d}", .{ uuid[0..8], pid });
-                if (p.get("pwd")) |pwd| {
-                    print(" pwd={s}", .{pwd.string});
-                }
-                if (p.get("key")) |key| {
-                    print(" key={s}", .{key.string});
-                }
-                print("\n", .{});
-            }
+    if (status_hdr.sticky_count > 0) {
+        print("\nSticky panes: {d}\n", .{status_hdr.sticky_count});
+    }
+
+    var si: u16 = 0;
+    while (si < status_hdr.sticky_count) : (si += 1) {
+        if (off + @sizeOf(wire.StickyPaneEntry) > payload.len) return;
+        const se = std.mem.bytesToValue(wire.StickyPaneEntry, payload[off..][0..@sizeOf(wire.StickyPaneEntry)]);
+        off += @sizeOf(wire.StickyPaneEntry);
+
+        if (off + se.name_len > payload.len) return;
+        off += se.name_len; // skip name (not displayed for sticky currently)
+
+        if (off + se.pwd_len > payload.len) return;
+        const pwd = if (se.pwd_len > 0) payload[off .. off + se.pwd_len] else "";
+        off += se.pwd_len;
+
+        print("  [{s}] pid={d}", .{ se.uuid[0..8], se.pid });
+        if (pwd.len > 0) {
+            print(" pwd={s}", .{pwd});
         }
+        if (se.key != 0) {
+            print(" key={c}", .{se.key});
+        }
+        print("\n", .{});
     }
 }
 
 pub fn runInfo(allocator: std.mem.Allocator, uuid_arg: []const u8, show_creator: bool, show_last: bool) !void {
-    // Connect to ses
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
+    const wire = core.wire;
+    const posix = std.posix;
 
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
-            return;
-        }
-        return err;
-    };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [1024]u8 = undefined;
-    var resp_buf: [4096]u8 = undefined;
-    var uuid_buf: [32]u8 = undefined;
-
-    // Determine which UUID to query
-    var target_uuid: []const u8 = undefined;
+    var target_uuid: [32]u8 = undefined;
 
     if (uuid_arg.len > 0) {
-        // Explicit UUID provided
-        target_uuid = uuid_arg;
+        if (uuid_arg.len >= 32) {
+            @memcpy(&target_uuid, uuid_arg[0..32]);
+        } else {
+            print("Invalid UUID\n", .{});
+            return;
+        }
     } else if (show_creator or show_last) {
-        // Need current pane UUID first, then get creator/last from it
-        const current_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
-            print("--creator/--last requires running inside hexe mux\n", .{});
-            return;
-        };
-
-        // Query current pane to get creator/last UUID
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{current_uuid});
-        try conn.sendLine(msg);
-
-        const response = try conn.recvLine(&resp_buf);
-        if (response == null) {
-            print("No response from daemon\n", .{});
-            return;
-        }
-
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.?, .{}) catch {
-            print("Invalid response from daemon\n", .{});
-            return;
-        };
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        if (show_creator) {
-            if (root.get("created_from")) |cf| {
-                if (cf.string.len == 32) {
-                    @memcpy(&uuid_buf, cf.string[0..32]);
-                    target_uuid = &uuid_buf;
-                } else {
-                    print("Current pane has no creator\n", .{});
-                    return;
-                }
-            } else {
-                print("Current pane has no creator\n", .{});
-                return;
-            }
-        } else if (show_last) {
-            if (root.get("focused_from")) |ff| {
-                if (ff.string.len == 32) {
-                    @memcpy(&uuid_buf, ff.string[0..32]);
-                    target_uuid = &uuid_buf;
-                } else {
-                    print("Current pane has no last focused\n", .{});
-                    return;
-                }
-            } else {
-                print("Current pane has no last focused\n", .{});
-                return;
-            }
-        }
+        if (resolveRelatedPane(allocator, show_creator)) |resolved| {
+            target_uuid = resolved;
+        } else return;
     } else {
-        // Default: query current pane
-        const pane_uuid = std.posix.getenv("HEXE_PANE_UUID");
-        if (pane_uuid == null) {
+        const env_uuid = posix.getenv("HEXE_PANE_UUID") orelse {
             print("Not inside a hexe mux session (use --uuid to query specific pane)\n", .{});
             return;
-        }
-        target_uuid = pane_uuid.?;
-    }
-
-    // Query the target pane
-    const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{target_uuid});
-    try conn.sendLine(msg);
-
-    const response = try conn.recvLine(&resp_buf);
-    if (response == null) {
-        print("No response from daemon\n", .{});
-        return;
-    }
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.?, .{}) catch {
-        print("Invalid response from daemon\n", .{});
-        return;
-    };
-    defer parsed.deinit();
-
-    const root = parsed.value.object;
-
-    // Check for error
-    if (root.get("type")) |t| {
-        if (std.mem.eql(u8, t.string, "error")) {
-            if (root.get("message")) |m| {
-                print("Error: {s}\n", .{m.string});
-            }
+        };
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+        } else {
+            print("Invalid HEXE_PANE_UUID\n", .{});
             return;
         }
     }
 
-    // Show all info
+    // Query SES for pane info via binary protocol
+    const fd = connectSesCliChannel(allocator) orelse return;
+    defer posix.close(fd);
+
+    var pu: wire.PaneUuid = undefined;
+    pu.uuid = target_uuid;
+    wire.writeControl(fd, .pane_info, std.mem.asBytes(&pu)) catch return;
+
+    // Read response
+    const hdr = wire.readControlHeader(fd) catch return;
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type == .pane_not_found) {
+        print("Pane not found\n", .{});
+        return;
+    }
+    if (msg_type != .pane_info or hdr.payload_len < @sizeOf(wire.PaneInfoResp)) {
+        print("Invalid response from daemon\n", .{});
+        return;
+    }
+
+    const resp = wire.readStruct(wire.PaneInfoResp, fd) catch return;
+
+    // Read trailing data
+    const trail_len = hdr.payload_len - @sizeOf(wire.PaneInfoResp);
+    var trail_buf: [8192]u8 = undefined;
+    if (trail_len > trail_buf.len) return;
+    if (trail_len > 0) {
+        wire.readExact(fd, trail_buf[0..trail_len]) catch return;
+    }
+
+    // Parse trailing data in order: name, fg, cwd, tty, socket, session_name, layout, last_cmd, base_process, sticky_pwd
+    var off: usize = 0;
+    const name = trail_buf[off .. off + resp.name_len];
+    off += resp.name_len;
+    const fg_process = trail_buf[off .. off + resp.fg_len];
+    off += resp.fg_len;
+    const cwd_str = trail_buf[off .. off + resp.cwd_len];
+    off += resp.cwd_len;
+    const tty_str = trail_buf[off .. off + resp.tty_len];
+    off += resp.tty_len;
+    const socket_path = trail_buf[off .. off + resp.socket_path_len];
+    off += resp.socket_path_len;
+    const session_name = trail_buf[off .. off + resp.session_name_len];
+    off += resp.session_name_len;
+    const layout_path = trail_buf[off .. off + resp.layout_path_len];
+    off += resp.layout_path_len;
+    const last_cmd = trail_buf[off .. off + resp.last_cmd_len];
+    off += resp.last_cmd_len;
+    const base_process = trail_buf[off .. off + resp.base_process_len];
+    off += resp.base_process_len;
+    _ = trail_buf[off .. off + resp.sticky_pwd_len]; // sticky_pwd (not displayed currently)
+
+    // Display
     print("Pane Info:\n", .{});
-    print("  UUID: {s}\n", .{target_uuid});
+    print("  UUID: {s}\n", .{&target_uuid});
+    print("  Shell PID: {d}\n", .{resp.pid});
 
-    if (root.get("pid")) |pid| {
-        print("  Shell PID: {d}\n", .{pid.integer});
+    if (resp.base_process_len > 0) {
+        print("  Base Process: {s} (pid={d})\n", .{ base_process, resp.base_pid });
     }
-    if (root.get("base_process")) |proc| {
-        if (root.get("base_pid")) |pid| {
-            print("  Base Process: {s} (pid={d})\n", .{ proc.string, pid.integer });
-        } else {
-            print("  Base Process: {s}\n", .{proc.string});
-        }
+    if (resp.fg_len > 0) {
+        print("  Active Process: {s} (pid={d})\n", .{ fg_process, resp.fg_pid });
     }
-    if (root.get("active_process")) |proc| {
-        if (root.get("active_pid")) |pid| {
-            print("  Active Process: {s} (pid={d})\n", .{ proc.string, pid.integer });
-        } else {
-            print("  Active Process: {s}\n", .{proc.string});
-        }
-    } else if (root.get("fg_process")) |proc| {
-        if (root.get("fg_pid")) |pid| {
-            print("  Process: {s} (pid={d})\n", .{ proc.string, pid.integer });
-        } else {
-            print("  Process: {s}\n", .{proc.string});
-        }
+    if (resp.cwd_len > 0) {
+        print("  CWD: {s}\n", .{cwd_str});
     }
-    if (root.get("cwd")) |cwd| {
-        print("  CWD: {s}\n", .{cwd.string});
+    if (resp.name_len > 0) {
+        print("  Name: {s}\n", .{name});
     }
-    if (root.get("name")) |n| {
-        print("  Name: {s}\n", .{n.string});
+    if (resp.tty_len > 0) {
+        print("  TTY: {s}\n", .{tty_str});
     }
-    if (root.get("tty")) |tty| {
-        print("  TTY: {s}\n", .{tty.string});
+    if (resp.cols > 0 and resp.rows > 0) {
+        print("  Window: {d}x{d}\n", .{ resp.cols, resp.rows });
     }
-    if (root.get("cols")) |cols| {
-        if (root.get("rows")) |rows| {
-            print("  Window: {d}x{d}\n", .{ cols.integer, rows.integer });
-        }
+    if (resp.session_name_len > 0) {
+        print("  Session: {s}\n", .{session_name});
     }
-    if (root.get("session_name")) |sn| {
-        print("  Session: {s}\n", .{sn.string});
+    if (resp.has_created_from != 0) {
+        print("  Creator: {s}\n", .{resp.created_from[0..8]});
     }
-    if (root.get("created_from")) |cf| {
-        print("  Creator: {s}\n", .{cf.string[0..8]});
+    if (resp.has_focused_from != 0) {
+        print("  Last: {s}\n", .{resp.focused_from[0..8]});
     }
-    if (root.get("focused_from")) |ff| {
-        print("  Last: {s}\n", .{ff.string[0..8]});
+    if (resp.layout_path_len > 0) {
+        print("  Layout: {s}\n", .{layout_path});
     }
-    if (root.get("layout_path")) |path| {
-        print("  Layout: {s}\n", .{path.string});
+    if (resp.socket_path_len > 0) {
+        print("  Socket: {s}\n", .{socket_path});
     }
-    if (root.get("socket_path")) |path| {
-        print("  Socket: {s}\n", .{path.string});
-    }
-    if (root.get("is_focused")) |f| {
-        print("  Focused: {}\n", .{f.bool});
-    }
-    if (root.get("pane_type")) |pt| {
-        print("  Type: {s}\n", .{pt.string});
-    }
-    if (root.get("cursor_x")) |cx| {
-        if (root.get("cursor_y")) |cy| {
-            print("  Cursor: {d},{d}\n", .{ cx.integer, cy.integer });
-        }
-    }
-    if (root.get("cursor_style")) |cs| {
-        print("  Cursor Style: {d}\n", .{cs.integer});
-    }
-    if (root.get("cursor_visible")) |cv| {
-        print("  Cursor Visible: {}\n", .{cv.bool});
-    }
-    if (root.get("alt_screen")) |alt| {
-        print("  Alt Screen: {}\n", .{alt.bool});
-    }
+    print("  Focused: {}\n", .{resp.is_focused != 0});
+    const pane_type_str: []const u8 = if (resp.pane_type == 1) "float" else "split";
+    print("  Type: {s}\n", .{pane_type_str});
+    print("  Cursor: {d},{d}\n", .{ resp.cursor_x, resp.cursor_y });
+    print("  Cursor Style: {d}\n", .{resp.cursor_style});
+    print("  Cursor Visible: {}\n", .{resp.cursor_visible != 0});
+    print("  Alt Screen: {}\n", .{resp.alt_screen != 0});
 
-    if (root.get("last_cmd")) |cmd| {
-        print("  Last Cmd: {s}\n", .{cmd.string});
+    if (resp.last_cmd_len > 0) {
+        print("  Last Cmd: {s}\n", .{last_cmd});
     }
-    if (root.get("last_status")) |st| {
-        print("  Last Status: {d}\n", .{st.integer});
+    if (resp.has_last_status != 0) {
+        print("  Last Status: {d}\n", .{resp.last_status});
     }
-    if (root.get("last_duration_ms")) |d| {
-        print("  Last Duration: {d}ms\n", .{d.integer});
+    if (resp.has_last_duration != 0) {
+        print("  Last Duration: {d}ms\n", .{resp.last_duration_ms});
     }
-    if (root.get("last_jobs")) |j| {
-        print("  Last Jobs: {d}\n", .{j.integer});
+    if (resp.has_last_jobs != 0) {
+        print("  Last Jobs: {d}\n", .{resp.last_jobs});
     }
 }
 
 pub fn runNotify(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, last: bool, broadcast: bool, message: []const u8) !void {
+    const wire = core.wire;
+    const posix = std.posix;
+
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
+    var target_uuid: [32]u8 = undefined;
+    var has_target = false;
 
+    if (uuid.len > 0) {
+        if (uuid.len >= 32) {
+            @memcpy(&target_uuid, uuid[0..32]);
+            has_target = true;
+        }
+    } else if (creator or last) {
+        if (resolveRelatedPane(allocator, creator)) |resolved| {
+            target_uuid = resolved;
+            has_target = true;
+        } else return;
+    } else if (!broadcast) {
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: no target (use --uuid, --creator, --last, --broadcast, or run inside mux)\n", .{});
+            return;
+        };
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+            has_target = true;
+        }
+    }
+
+    const fd = connectSesCliChannel(allocator) orelse return;
+    defer posix.close(fd);
+
+    if (has_target) {
+        const tn = wire.TargetedNotify{
+            .uuid = target_uuid,
+            .timeout_ms = 0,
+            .msg_len = @intCast(message.len),
+        };
+        wire.writeControlWithTrail(fd, .targeted_notify, std.mem.asBytes(&tn), message) catch {};
+    } else {
+        const n = wire.Notify{ .msg_len = @intCast(message.len) };
+        wire.writeControlWithTrail(fd, .broadcast_notify, std.mem.asBytes(&n), message) catch {};
+    }
+}
+
+// ─── Binary CLI helpers ────────────────────────────────────────────────────
+
+/// Connect to SES with CLI handshake byte. Returns fd on success.
+pub fn connectSesCliChannel(allocator: std.mem.Allocator) ?std.posix.fd_t {
+    const wire = core.wire;
+    const socket_path = ipc.getSesSocketPath(allocator) catch return null;
+    defer allocator.free(socket_path);
     var client = ipc.Client.connect(socket_path) catch |err| {
         if (err == error.ConnectionRefused or err == error.FileNotFound) {
             print("ses daemon is not running\n", .{});
-            return;
         }
-        return err;
+        return null;
     };
-    defer client.close();
+    const fd = client.fd;
+    const handshake: [1]u8 = .{wire.SES_HANDSHAKE_CLI};
+    wire.writeAll(fd, &handshake) catch {
+        client.close();
+        return null;
+    };
+    return fd;
+}
 
-    var conn = client.toConnection();
-    var buf: [4096]u8 = undefined;
+/// Query SES for a pane's created_from or focused_from UUID.
+/// If `want_creator` is true, returns created_from; otherwise focused_from.
+fn resolveRelatedPane(allocator: std.mem.Allocator, want_creator: bool) ?[32]u8 {
+    const wire = core.wire;
+    const posix = std.posix;
 
-    var target_uuid: ?[]const u8 = null;
-    var uuid_buf: [32]u8 = undefined; // Buffer to copy UUID into (outlives JSON)
+    const current_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+        print("Error: --creator/--last requires running inside hexe mux\n", .{});
+        return null;
+    };
+    if (current_uuid.len < 32) return null;
 
-    if (uuid.len > 0) {
-        target_uuid = uuid;
-    } else if (creator or last) {
-        // Query pane_info to get creator or last focused pane
-        const current_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
-            print("Error: --creator/--last requires running inside hexe mux\n", .{});
-            return;
-        };
+    const fd = connectSesCliChannel(allocator) orelse return null;
+    defer posix.close(fd);
 
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{current_uuid});
-        try conn.sendLine(msg);
+    var pu: wire.PaneUuid = undefined;
+    @memcpy(&pu.uuid, current_uuid[0..32]);
+    wire.writeControl(fd, .pane_info, std.mem.asBytes(&pu)) catch return null;
 
-        var resp_buf: [4096]u8 = undefined;
-        if (try conn.recvLine(&resp_buf)) |r| {
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
-                print("Error: invalid response from daemon\n", .{});
-                return;
-            };
-            defer parsed.deinit();
-
-            const root = parsed.value.object;
-            if (root.get("type")) |t| {
-                if (std.mem.eql(u8, t.string, "pane_info")) {
-                    if (creator) {
-                        if (root.get("created_from")) |cf| {
-                            if (cf.string.len == 32) {
-                                @memcpy(&uuid_buf, cf.string[0..32]);
-                                target_uuid = &uuid_buf;
-                            }
-                        } else {
-                            print("Error: current pane has no creator\n", .{});
-                            return;
-                        }
-                    } else if (last) {
-                        if (root.get("focused_from")) |ff| {
-                            if (ff.string.len == 32) {
-                                @memcpy(&uuid_buf, ff.string[0..32]);
-                                target_uuid = &uuid_buf;
-                            }
-                        } else {
-                            print("Error: current pane has no previous focus\n", .{});
-                            return;
-                        }
-                    }
-                } else {
-                    print("Error: pane not found\n", .{});
-                    return;
-                }
-            }
-        }
-    } else if (!broadcast) {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
+    const hdr = wire.readControlHeader(fd) catch return null;
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type == .pane_not_found) {
+        print("Error: pane not found\n", .{});
+        return null;
     }
+    if (msg_type != .pane_info) return null;
+    if (hdr.payload_len < @sizeOf(wire.PaneInfoResp)) return null;
 
-    if (target_uuid) |t| {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"targeted_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
-        try conn.sendLine(msg);
+    const resp = wire.readStruct(wire.PaneInfoResp, fd) catch return null;
+    if (want_creator) {
+        if (resp.has_created_from != 0) return resp.created_from;
+        print("Error: current pane has no creator\n", .{});
+        return null;
     } else {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"broadcast_notify\",\"message\":\"{s}\"}}", .{message});
-        try conn.sendLine(msg);
-    }
-
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
-        defer parsed.deinit();
-
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "not_found")) {
-                print("Target UUID not found\n", .{});
-            } else if (std.mem.eql(u8, t.string, "ok")) {
-                if (parsed.value.object.get("realm")) |realm| {
-                    print("Notification sent to {s}\n", .{realm.string});
-                } else {
-                    print("Notification sent\n", .{});
-                }
-            }
-        }
+        if (resp.has_focused_from != 0) return resp.focused_from;
+        print("Error: current pane has no previous focus\n", .{});
+        return null;
     }
 }
+
+// ─── End binary CLI helpers ────────────────────────────────────────────────
+
 
 pub fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []const u8, pane_name_map: ?*const std.StringHashMap([]const u8)) void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return;
@@ -616,14 +589,16 @@ pub fn printMuxTree(allocator: std.mem.Allocator, json: []const u8, indent: []co
 }
 
 pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, last: bool, broadcast: bool, enter: bool, ctrl: []const u8, text: []const u8) !void {
-    // Build the data to send
+    const wire = core.wire;
+    const posix = std.posix;
+
+    // Build the data to send.
     var data_buf: [4096]u8 = undefined;
     var data_len: usize = 0;
 
-    // Handle --ctrl option (e.g., --ctrl c sends Ctrl+C)
     if (ctrl.len > 0) {
         if (ctrl.len == 1 and ctrl[0] >= 'a' and ctrl[0] <= 'z') {
-            data_buf[0] = ctrl[0] - 'a' + 1; // Ctrl+a = 0x01, Ctrl+c = 0x03, etc.
+            data_buf[0] = ctrl[0] - 'a' + 1;
             data_len = 1;
         } else if (ctrl.len == 1 and ctrl[0] >= 'A' and ctrl[0] <= 'Z') {
             data_buf[0] = ctrl[0] - 'A' + 1;
@@ -641,7 +616,6 @@ pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, la
         data_len = text.len;
     }
 
-    // Append newline if --enter
     if (enter and data_len < data_buf.len) {
         data_buf[data_len] = '\n';
         data_len += 1;
@@ -652,116 +626,32 @@ pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, la
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
-            return;
-        }
-        return err;
-    };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [4096]u8 = undefined;
-
-    var target_uuid: ?[]const u8 = null;
-    var uuid_buf: [32]u8 = undefined;
+    var target_uuid: [32]u8 = .{0} ** 32;
 
     if (uuid.len > 0) {
-        target_uuid = uuid;
+        if (uuid.len >= 32) @memcpy(&target_uuid, uuid[0..32]);
     } else if (creator or last) {
-        // Query pane_info to get creator or last focused pane
-        const current_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
-            print("Error: --creator/--last requires running inside hexe mux\n", .{});
+        if (resolveRelatedPane(allocator, creator)) |resolved| {
+            target_uuid = resolved;
+        } else return;
+    } else if (broadcast) {
+        // All-zeros UUID = broadcast.
+    } else {
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: no target specified (use --uuid, --creator, --last, --broadcast, or run inside mux)\n", .{});
             return;
         };
-
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{current_uuid});
-        try conn.sendLine(msg);
-
-        var resp_buf: [4096]u8 = undefined;
-        if (try conn.recvLine(&resp_buf)) |r| {
-            const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
-                print("Error: invalid response from daemon\n", .{});
-                return;
-            };
-            defer parsed.deinit();
-
-            const root = parsed.value.object;
-            if (root.get("type")) |t| {
-                if (std.mem.eql(u8, t.string, "pane_info")) {
-                    if (creator) {
-                        if (root.get("created_from")) |cf| {
-                            if (cf.string.len == 32) {
-                                @memcpy(&uuid_buf, cf.string[0..32]);
-                                target_uuid = &uuid_buf;
-                            }
-                        } else {
-                            print("Error: current pane has no creator\n", .{});
-                            return;
-                        }
-                    } else if (last) {
-                        if (root.get("focused_from")) |ff| {
-                            if (ff.string.len == 32) {
-                                @memcpy(&uuid_buf, ff.string[0..32]);
-                                target_uuid = &uuid_buf;
-                            }
-                        } else {
-                            print("Error: current pane has no previous focus\n", .{});
-                            return;
-                        }
-                    }
-                } else {
-                    print("Error: pane not found\n", .{});
-                    return;
-                }
-            }
-        }
-    } else if (!broadcast) {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
+        if (env_uuid.len >= 32) @memcpy(&target_uuid, env_uuid[0..32]);
     }
 
-    // Build send_keys request with hex-encoded data
-    // Manually encode to hex
-    var hex_buf: [8192]u8 = undefined;
-    for (data_buf[0..data_len], 0..) |byte, i| {
-        const hex_chars = "0123456789abcdef";
-        hex_buf[i * 2] = hex_chars[byte >> 4];
-        hex_buf[i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-    const hex_data = hex_buf[0 .. data_len * 2];
+    const fd = connectSesCliChannel(allocator) orelse return;
+    defer posix.close(fd);
 
-    if (target_uuid) |t| {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"send_keys\",\"uuid\":\"{s}\",\"hex\":\"{s}\"}}", .{ t, hex_data });
-        try conn.sendLine(msg);
-    } else if (broadcast) {
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"send_keys\",\"broadcast\":true,\"hex\":\"{s}\"}}", .{hex_data});
-        try conn.sendLine(msg);
-    } else {
-        print("Error: no target specified (use --uuid, --creator, --last, --broadcast, or run inside mux)\n", .{});
-        return;
-    }
-
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
-        defer parsed.deinit();
-
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                if (parsed.value.object.get("message")) |m| {
-                    print("Error: {s}\n", .{m.string});
-                }
-            } else if (std.mem.eql(u8, t.string, "ok")) {
-                // Success - silent
-            } else if (std.mem.eql(u8, t.string, "not_found")) {
-                print("Target pane not found\n", .{});
-            }
-        }
-    }
+    const sk = wire.SendKeys{
+        .uuid = target_uuid,
+        .data_len = @intCast(data_len),
+    };
+    wire.writeControlWithTrail(fd, .send_keys, std.mem.asBytes(&sk), data_buf[0..data_len]) catch {};
 }
 
 /// Ask the current mux to move focus in the given direction.
@@ -769,37 +659,50 @@ pub fn runSend(allocator: std.mem.Allocator, uuid: []const u8, creator: bool, la
 /// Intended for editor integration: Neovim tries wincmd first, and if it
 /// cannot move, it calls this.
 pub fn runFocusMove(allocator: std.mem.Allocator, dir: []const u8) !void {
-    _ = allocator;
+    const wire = core.wire;
+    const posix = std.posix;
 
-    const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
-        print("Error: not inside a hexe mux session (HEXE_MUX_SOCKET not set)\n", .{});
+    const dir_norm = std.mem.trim(u8, dir, " \t\n\r");
+    const dir_byte: u8 = if (std.mem.eql(u8, dir_norm, "left"))
+        0
+    else if (std.mem.eql(u8, dir_norm, "right"))
+        1
+    else if (std.mem.eql(u8, dir_norm, "up"))
+        2
+    else if (std.mem.eql(u8, dir_norm, "down"))
+        3
+    else {
+        print("Error: invalid dir (use left/right/up/down)\n", .{});
         return;
     };
 
-    const dir_norm = std.mem.trim(u8, dir, " \t\n\r");
-    if (!(std.mem.eql(u8, dir_norm, "left") or std.mem.eql(u8, dir_norm, "right") or std.mem.eql(u8, dir_norm, "up") or std.mem.eql(u8, dir_norm, "down"))) {
-        print("Error: invalid dir (use left/right/up/down)\n", .{});
+    const ses_path = ipc.getSesSocketPath(allocator) catch {
+        print("Error: cannot determine ses socket path\n", .{});
         return;
-    }
+    };
+    defer allocator.free(ses_path);
 
-    var client = ipc.Client.connect(mux_socket) catch |err| {
+    var client = ipc.Client.connect(ses_path) catch |err| {
         if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("mux is not running\n", .{});
+            print("ses is not running\n", .{});
             return;
         }
         return err;
     };
     defer client.close();
+    const fd = client.fd;
 
-    var conn = client.toConnection();
+    const pane_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse return;
+    if (pane_uuid.len != 32) return;
 
-    var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"focus_move\",\"dir\":\"{s}\"}}", .{dir_norm}) catch return;
-    conn.sendLine(msg) catch return;
+    // Send CLI handshake byte.
+    _ = posix.write(fd, &.{wire.SES_HANDSHAKE_CLI}) catch return;
 
-    // Read and ignore response (best-effort).
-    var resp_buf: [256]u8 = undefined;
-    _ = conn.recvLine(&resp_buf) catch null;
+    // Send focus_move message.
+    var fm: wire.FocusMove = undefined;
+    @memcpy(&fm.uuid, pane_uuid[0..32]);
+    fm.dir = dir_byte;
+    wire.writeControl(fd, .focus_move, std.mem.asBytes(&fm)) catch return;
 }
 
 /// Ask mux whether the current shell should be allowed to exit.
@@ -808,12 +711,9 @@ pub fn runFocusMove(allocator: std.mem.Allocator, dir: []const u8) !void {
 ///
 /// Exit codes: 0=allow, 1=deny
 pub fn runExitIntent(allocator: std.mem.Allocator) !void {
-    _ = allocator;
+    const wire = core.wire;
+    const posix = std.posix;
 
-    const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
-        // Not in mux; allow.
-        std.process.exit(0);
-    };
     const pane_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
         std.process.exit(0);
     };
@@ -821,46 +721,45 @@ pub fn runExitIntent(allocator: std.mem.Allocator) !void {
         std.process.exit(0);
     }
 
-    var client = ipc.Client.connect(mux_socket) catch {
-        // If mux is unreachable, don't trap the shell.
+    const ses_path = ipc.getSesSocketPath(allocator) catch {
+        std.process.exit(0);
+    };
+    defer allocator.free(ses_path);
+
+    var client = ipc.Client.connect(ses_path) catch {
+        // If ses is unreachable, don't trap the shell.
         std.process.exit(0);
     };
     defer client.close();
+    const fd = client.fd;
 
-    var conn = client.toConnection();
-
-    var msg_buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "{{\"type\":\"exit_intent\",\"pane_uuid\":\"{s}\"}}", .{pane_uuid}) catch {
-        std.process.exit(0);
-    };
-    conn.sendLine(msg) catch {
+    // Send CLI handshake byte.
+    _ = posix.write(fd, &.{wire.SES_HANDSHAKE_CLI}) catch {
         std.process.exit(0);
     };
 
-    // Wait for mux response (may block for popup confirm).
-    var resp_buf: [256]u8 = undefined;
-    const response = conn.recvLine(&resp_buf) catch {
+    // Send exit_intent message.
+    var ei: wire.ExitIntent = undefined;
+    @memcpy(&ei.uuid, pane_uuid[0..32]);
+    wire.writeControl(fd, .exit_intent, std.mem.asBytes(&ei)) catch {
         std.process.exit(0);
     };
-    if (response == null) {
+
+    // Wait for exit_intent_result (may block for popup confirm).
+    const hdr = wire.readControlHeader(fd) catch {
+        std.process.exit(0);
+    };
+    if (@as(wire.MsgType, @enumFromInt(hdr.msg_type)) != .exit_intent_result) {
         std.process.exit(0);
     }
-
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, response.?, .{}) catch {
+    const result = wire.readStruct(wire.ExitIntentResult, fd) catch {
         std.process.exit(0);
     };
-    defer parsed.deinit();
 
-    const root = parsed.value.object;
-    if (root.get("allow")) |allow_val| {
-        if (allow_val == .bool and allow_val.bool) {
-            std.process.exit(0);
-        }
-        std.process.exit(1);
+    if (result.allow != 0) {
+        std.process.exit(0);
     }
-
-    // Unknown response -> allow.
-    std.process.exit(0);
+    std.process.exit(1);
 }
 
 pub fn runShellEvent(
@@ -876,94 +775,32 @@ pub fn runShellEvent(
 ) !void {
     _ = allocator;
 
-    const pane_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse return;
-    if (pane_uuid.len != 32) return;
+    const pod_socket = std.posix.getenv("HEXE_POD_SOCKET") orelse return;
 
-    // Build JSON payload.
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.page_allocator);
-    var w = buf.writer(std.heap.page_allocator);
+    const wire = core.wire;
+    const posix = std.posix;
 
-    try w.writeAll("{\"type\":\"shell_event\",\"pane_uuid\":\"");
-    try w.writeAll(pane_uuid);
-    try w.writeAll("\"");
-
-    if (cmd.len > 0) {
-        try w.writeAll(",\"cmd\":\"");
-        try writeJsonEscaped(w, cmd);
-        try w.writeAll("\"");
-    }
-    if (cwd.len > 0) {
-        try w.writeAll(",\"cwd\":\"");
-        try writeJsonEscaped(w, cwd);
-        try w.writeAll("\"");
-    }
-    if (phase.len > 0) {
-        try w.writeAll(",\"phase\":\"");
-        try writeJsonEscaped(w, phase);
-        try w.writeAll("\"");
-    }
-    if (running) {
-        try w.writeAll(",\"running\":true");
-    }
-    if (started_at_ms > 0) {
-        try w.print(",\"started_at_ms\":{d}", .{started_at_ms});
-    }
-
-    try w.print(",\"status\":{d}", .{status});
-    try w.print(",\"duration_ms\":{d}", .{duration_ms});
-    try w.print(",\"jobs\":{d}", .{jobs});
-    try w.writeAll("}");
-
-    // Try POD socket first (pod-centric path: SHP → POD → SES → MUX).
-    const pod_socket = std.posix.getenv("HEXE_POD_SOCKET");
-    if (pod_socket) |ps| {
-        var client = ipc.Client.connect(ps) catch {
-            // POD socket unavailable, try MUX fallback below.
-            return sendToMux(buf.items);
-        };
-        defer client.close();
-        var conn = client.toConnection();
-
-        // Send as a control frame: [type=5][len:4B BE][JSON payload]
-        const pod_protocol = core.pod_protocol;
-        pod_protocol.writeFrame(&conn, .control, buf.items) catch return;
-        return;
-    }
-
-    // Fallback: legacy path via MUX socket (SHP → MUX).
-    sendToMux(buf.items);
-}
-
-fn sendToMux(payload: []const u8) void {
-    const mux_socket = std.posix.getenv("HEXE_MUX_SOCKET") orelse return;
-
-    var client = ipc.Client.connect(mux_socket) catch return;
+    var client = ipc.Client.connect(pod_socket) catch return;
     defer client.close();
-    var conn = client.toConnection();
+    const fd = client.fd;
 
-    conn.sendLine(payload) catch return;
+    // Send SHP handshake byte.
+    _ = posix.write(fd, &.{wire.POD_HANDSHAKE_SHP_CTL}) catch return;
 
-    // Best-effort, ignore response.
-    var resp_buf: [128]u8 = undefined;
-    _ = conn.recvLine(&resp_buf) catch null;
+    // Build ShpShellEvent struct.
+    const phase_byte: u8 = if (std.mem.eql(u8, phase, "start")) 1 else 0;
+    const evt = wire.ShpShellEvent{
+        .phase = phase_byte,
+        .status = @intCast(status),
+        .duration_ms = duration_ms,
+        .started_at = started_at_ms,
+        .jobs = @intCast(jobs),
+        .running = @intFromBool(running),
+        .cmd_len = @intCast(cmd.len),
+        .cwd_len = @intCast(cwd.len),
+    };
+
+    // Send as binary control message with trailing cmd + cwd.
+    wire.writeControlMsg(fd, .shp_shell_event, std.mem.asBytes(&evt), &.{ cmd, cwd }) catch return;
 }
 
-fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (ch < 0x20) {
-                    try writer.writeByte(' ');
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
-        }
-    }
-}

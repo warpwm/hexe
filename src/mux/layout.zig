@@ -127,9 +127,19 @@ pub const Layout = struct {
                     return pane;
                 };
 
-                // Use pod from ses
-                defer ses.allocator.free(result.socket_path);
-                try pane.initWithPod(self.allocator, id, self.x, self.y, self.width, self.height, result.socket_path, result.uuid);
+                // Use pod from ses — VT data routed through SES VT channel.
+                const vt_fd = ses.getVtFd() orelse {
+                    try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
+                    pane.focused = true;
+                    self.focused_split_id = id;
+                    try self.splits.put(id, pane);
+                    self.configurePaneNotifications(pane);
+                    const node2 = try self.allocator.create(LayoutNode);
+                    node2.* = .{ .pane = id };
+                    self.root = node2;
+                    return pane;
+                };
+                try pane.initWithPod(self.allocator, id, self.x, self.y, self.width, self.height, result.pane_id, vt_fd, result.uuid);
                 pane.focused = true;
                 self.focused_split_id = id;
                 try self.splits.put(id, pane);
@@ -181,8 +191,11 @@ pub const Layout = struct {
         if (self.ses_client) |ses| {
             if (ses.isConnected()) {
                 if (ses.createPane(null, cwd, null, null, null, null)) |result| {
-                    defer ses.allocator.free(result.socket_path);
-                    try new_pane.initWithPod(self.allocator, new_id, new_x, new_y, new_width, new_height, result.socket_path, result.uuid);
+                    if (ses.getVtFd()) |vt_fd| {
+                        try new_pane.initWithPod(self.allocator, new_id, new_x, new_y, new_width, new_height, result.pane_id, vt_fd, result.uuid);
+                    } else {
+                        try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
+                    }
                 } else |_| {
                     // Fall back to local spawn
                     try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);

@@ -199,11 +199,13 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                                                     };
                                                     state.ses_client.killPane(pane.uuid) catch {};
                                                     if (state.ses_client.createPane(null, cwd, null, null, null, null)) |result| {
-                                                        defer state.allocator.free(result.socket_path);
+                                                        const vt_fd = state.ses_client.getVtFd();
                                                         var replaced = true;
-                                                        pane.replaceWithPod(result.socket_path, result.uuid) catch {
-                                                            replaced = false;
-                                                        };
+                                                        if (vt_fd) |fd| {
+                                                            pane.replaceWithPod(result.pane_id, fd, result.uuid) catch {
+                                                                replaced = false;
+                                                            };
+                                                        } else replaced = false;
                                                         if (replaced) {
                                                             const pane_type: SesClient.PaneType = if (pane.floating) .float else .split;
                                                             const cursor = pane.getCursorPos();
@@ -242,18 +244,10 @@ pub fn handleInput(state: *State, input_bytes: []const u8) void {
                                     }
                                 }
 
-                                // Reply to a pending exit_intent IPC client, if any.
+                                // Reply to a pending exit_intent request via SES.
                                 if (action == .exit_intent) {
-                                    if (state.pending_exit_intent_fd) |fd| {
-                                        var c = core.ipc.Connection{ .fd = fd };
-                                        if (confirmed) {
-                                            c.sendLine("{\"type\":\"exit_intent_result\",\"allow\":true}") catch {};
-                                        } else {
-                                            c.sendLine("{\"type\":\"exit_intent_result\",\"allow\":false}") catch {};
-                                        }
-                                        c.close();
-                                    }
-                                    state.pending_exit_intent_fd = null;
+                                    loop_ipc.sendExitIntentResultPub(state, confirmed);
+                                    state.pending_exit_intent = false;
                                 }
                             }
                             state.pending_action = null;

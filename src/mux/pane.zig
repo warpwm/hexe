@@ -3,25 +3,13 @@ const posix = std.posix;
 const core = @import("core");
 const ghostty = @import("ghostty-vt");
 const pod_protocol = core.pod_protocol;
+const wire = core.wire;
 
 const pane_capture = @import("pane_capture.zig");
 
 const notification = @import("notification.zig");
 const NotificationManager = notification.NotificationManager;
 const pop = @import("pop");
-
-const PodBackend = struct {
-    conn: core.ipc.Connection,
-    reader: pod_protocol.Reader,
-    socket_path: []u8,
-
-    pub fn deinit(self: *PodBackend, allocator: std.mem.Allocator) void {
-        self.conn.close();
-        self.reader.deinit(allocator);
-        allocator.free(self.socket_path);
-        self.* = undefined;
-    }
-};
 
 const QueryState = enum {
     idle,
@@ -33,11 +21,15 @@ const QueryState = enum {
 
 const Backend = union(enum) {
     local: core.Pty,
-    pod: PodBackend,
+    /// Pod-backed pane — VT routed through SES.
+    pod: struct {
+        pane_id: u16,
+        vt_fd: posix.fd_t, // shared MUX VT channel fd
+    },
 };
 
 /// A Pane is a ghostty VT that receives bytes from either a local PTY
-/// (legacy mode) or a per-pane pod process (persistent scrollback mode).
+/// (legacy mode) or via the SES VT channel (pod-backed, persistent scrollback).
 pub const Pane = struct {
     allocator: std.mem.Allocator = undefined,
     id: u16 = 0,
@@ -197,20 +189,11 @@ pub const Pane = struct {
     }
 
     /// Initialize a pane backed by a per-pane pod process.
-    /// `pod_socket_path` is duped and owned by the pane.
-    pub fn initWithPod(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16, pod_socket_path: []const u8, uuid: [32]u8) !void {
+    /// VT data is routed through the SES VT channel.
+    pub fn initWithPod(self: *Pane, allocator: std.mem.Allocator, id: u16, x: u16, y: u16, width: u16, height: u16, pane_id: u16, vt_fd: posix.fd_t, uuid: [32]u8) !void {
         self.* = .{ .allocator = allocator, .id = id, .x = x, .y = y, .width = width, .height = height, .uuid = uuid };
 
-        const owned_path = try allocator.dupe(u8, pod_socket_path);
-        errdefer allocator.free(owned_path);
-
-        var client = try core.ipc.Client.connect(owned_path);
-        const conn = client.toConnection();
-
-        var reader = try pod_protocol.Reader.init(allocator, pod_protocol.MAX_FRAME_LEN);
-        errdefer reader.deinit(allocator);
-
-        self.backend = .{ .pod = .{ .conn = conn, .socket_path = owned_path, .reader = reader } };
+        self.backend = .{ .pod = .{ .pane_id = pane_id, .vt_fd = vt_fd } };
 
         try self.vt.init(allocator, width, height);
         errdefer self.vt.deinit();
@@ -220,14 +203,14 @@ pub const Pane = struct {
         self.popups = pop.PopupManager.init(allocator);
         self.popups_initialized = true;
 
-        // Tell pod initial size.
+        // Tell pod initial size via VT channel.
         self.sendResizeToPod(width, height);
     }
 
     pub fn deinit(self: *Pane) void {
         switch (self.backend) {
             .local => |*pty| pty.close(),
-            .pod => |*pod| pod.deinit(self.allocator),
+            .pod => {}, // VT channel is shared, not owned by pane
         }
         self.vt.deinit();
         self.captured_output.deinit(self.allocator);
@@ -266,31 +249,22 @@ pub const Pane = struct {
 
     /// Set cached CWD from ses daemon (for pod panes)
     pub fn setSesCwd(self: *Pane, cwd: ?[]u8) void {
-        // Free old cached CWD if any
         if (self.ses_cwd) |old| {
             self.allocator.free(old);
         }
         self.ses_cwd = cwd;
     }
 
-    pub fn replaceWithPod(self: *Pane, pod_socket_path: []const u8, uuid: [32]u8) !void {
+    /// Replace backend with a pod (used during reattach to adopt panes).
+    pub fn replaceWithPod(self: *Pane, pane_id: u16, vt_fd: posix.fd_t, uuid: [32]u8) !void {
         // Close old backend.
         switch (self.backend) {
             .local => |*pty| pty.close(),
-            .pod => |*pod| pod.deinit(self.allocator),
+            .pod => {},
         }
 
         self.uuid = uuid;
-
-        const owned_path = try self.allocator.dupe(u8, pod_socket_path);
-        errdefer self.allocator.free(owned_path);
-
-        var client = try core.ipc.Client.connect(owned_path);
-        const conn = client.toConnection();
-        var reader = try pod_protocol.Reader.init(self.allocator, pod_protocol.MAX_FRAME_LEN);
-        errdefer reader.deinit(self.allocator);
-
-        self.backend = .{ .pod = .{ .conn = conn, .socket_path = owned_path, .reader = reader } };
+        self.backend = .{ .pod = .{ .pane_id = pane_id, .vt_fd = vt_fd } };
 
         // Reset VT state (will be reconstructed from pod backlog replay).
         self.vt.deinit();
@@ -335,7 +309,8 @@ pub const Pane = struct {
         }
     }
 
-    /// Read from backend and feed to VT. Returns true if data was read.
+    /// Read from local backend and feed to VT. Returns true if data was read.
+    /// For pod panes, output comes from the VT channel (see feedPodOutput).
     pub fn poll(self: *Pane, buffer: []u8) !bool {
         self.did_clear = false;
 
@@ -352,33 +327,16 @@ pub const Pane = struct {
                 try self.vt.feed(data);
                 break :blk true;
             },
-            .pod => |*pod| blk: {
-                const n = posix.read(pod.conn.fd, buffer) catch |err| {
-                    if (err == error.WouldBlock) break :blk false;
-                    return err;
-                };
-                if (n == 0) break :blk false;
-                const data = buffer[0..n];
-                pod.reader.feed(data, @ptrCast(self), podFrameCallback);
-                break :blk true;
-            },
+            .pod => false, // Pod panes don't poll — data comes via feedPodOutput
         };
     }
 
-    fn podFrameCallback(ctx: *anyopaque, frame: pod_protocol.Frame) void {
-        const self: *Pane = @ptrCast(@alignCast(ctx));
-        self.handlePodFrame(frame);
-    }
-
-    fn handlePodFrame(self: *Pane, frame: pod_protocol.Frame) void {
-        switch (frame.frame_type) {
-            .output => {
-                self.processOutput(frame.payload);
-                self.vt.feed(frame.payload) catch {};
-            },
-            .backlog_end => {},
-            else => {},
-        }
+    /// Feed output data received from the SES VT channel.
+    /// Called by the event loop when a MuxVtHeader frame arrives for this pane.
+    pub fn feedPodOutput(self: *Pane, data: []const u8) void {
+        self.did_clear = false;
+        self.processOutput(data);
+        self.vt.feed(data) catch {};
     }
 
     fn processOutput(self: *Pane, data: []const u8) void {
@@ -447,7 +405,6 @@ pub const Pane = struct {
             self.osc_prev_esc = (b == ESC);
 
             if (self.osc_buf.items.len > 64 * 1024) {
-                // Safety bound: drop runaway sequences.
                 self.osc_in_progress = false;
                 self.osc_pending_esc = false;
                 self.osc_prev_esc = false;
@@ -642,42 +599,30 @@ pub const Pane = struct {
     fn shouldPassthroughOsc(seq: []const u8) bool {
         const code = parseOscCode(seq) orelse return false;
 
-        // For pywal + terminals that support it, we want the host terminal's
-        // palette/default colors to be updated.
-        if (code == 0 or code == 1 or code == 2) return true; // title/icon
-        if (code == 7) return true; // cwd URL
-        if (code == 52) return true; // clipboard
-
-        // Color-related OSCs:
-        // 4, 10-19, 104, 110-119
+        if (code == 0 or code == 1 or code == 2) return true;
+        if (code == 7) return true;
+        if (code == 52) return true;
         if (code == 4 or code == 104) return true;
         if (code >= 10 and code <= 19) return true;
         if (code >= 110 and code <= 119) return true;
-
-        // Notifications (OSC 9) can be spammy; keep disabled by default.
         return false;
     }
 
     fn isOscQuery(seq: []const u8) bool {
         const code = parseOscCode(seq) orelse return false;
         if (!(code == 4 or code == 104 or (code >= 10 and code <= 19) or (code >= 110 and code <= 119))) return false;
-        // crude but effective: query forms include ";?"
         return std.mem.indexOf(u8, seq, ";?") != null;
     }
 
     fn handleOsc52(self: *Pane, seq: []const u8) void {
-        // Parse: ESC ] 52 ; <sel> ; <base64> (BEL or ST)
-        // We only support "set" (base64 payload), not query.
         const start = std.mem.indexOf(u8, seq, "\x1b]52;") orelse return;
         var i: usize = start + 5;
 
-        // Skip selection up to next ';'
         const sel_end = std.mem.indexOfScalarPos(u8, seq, i, ';') orelse return;
         i = sel_end + 1;
         if (i >= seq.len) return;
 
         var payload = seq[i..];
-        // Strip terminator.
         if (payload.len >= 2 and payload[payload.len - 2] == 0x1b and payload[payload.len - 1] == '\\') {
             payload = payload[0 .. payload.len - 2];
         } else if (payload.len >= 1 and payload[payload.len - 1] == 0x07) {
@@ -686,7 +631,6 @@ pub const Pane = struct {
 
         if (payload.len == 0 or (payload.len == 1 and payload[0] == '?')) return;
 
-        // Decode base64.
         const decoder = std.base64.standard.Decoder;
         const out_len = decoder.calcSizeForSlice(payload) catch return;
         const decoded = self.allocator.alloc(u8, out_len) catch return;
@@ -697,7 +641,6 @@ pub const Pane = struct {
     }
 
     fn setSystemClipboard(self: *Pane, bytes: []const u8) void {
-        // Best-effort. Prefer Wayland, then X11. Still passthrough to host.
         if (std.posix.getenv("WAYLAND_DISPLAY") != null) {
             if (spawnClipboardWriter(self.allocator, &.{"wl-copy"}, bytes)) return;
         }
@@ -724,8 +667,6 @@ pub const Pane = struct {
     }
 
     fn containsClearSeq(tail: []const u8, data: []const u8) bool {
-        // Fast path: if no ESC (0x1b) or FF (0x0c) in data, and no pending
-        // ESC in tail, no clear sequence is possible.
         const has_esc = std.mem.indexOfScalar(u8, data, 0x1b) != null;
         const has_ff = std.mem.indexOfScalar(u8, data, 0x0c) != null;
         const tail_has_esc = tail.len > 0 and tail[tail.len - 1] == 0x1b;
@@ -768,8 +709,10 @@ pub const Pane = struct {
             .local => |*pty| {
                 _ = try pty.write(data);
             },
-            .pod => |*pod| {
-                pod_protocol.writeFrame(&pod.conn, .input, data) catch {};
+            .pod => |pod| {
+                // Send input through SES VT channel as MuxVtHeader frame.
+                const frame_type = @intFromEnum(pod_protocol.FrameType.input);
+                wire.writeMuxVt(pod.vt_fd, pod.pane_id, frame_type, data) catch {};
             },
         }
     }
@@ -791,11 +734,12 @@ pub const Pane = struct {
 
     fn sendResizeToPod(self: *Pane, cols: u16, rows: u16) void {
         switch (self.backend) {
-            .pod => |*pod| {
+            .pod => |pod| {
                 var payload: [4]u8 = undefined;
                 std.mem.writeInt(u16, payload[0..2], cols, .big);
                 std.mem.writeInt(u16, payload[2..4], rows, .big);
-                pod_protocol.writeFrame(&pod.conn, .resize, &payload) catch {};
+                const frame_type = @intFromEnum(pod_protocol.FrameType.resize);
+                wire.writeMuxVt(pod.vt_fd, pod.pane_id, frame_type, &payload) catch {};
             },
             else => {},
         }
@@ -804,7 +748,15 @@ pub const Pane = struct {
     pub fn getFd(self: *Pane) posix.fd_t {
         return switch (self.backend) {
             .local => |pty| pty.master_fd,
-            .pod => |pod| pod.conn.fd,
+            .pod => -1, // Pod panes don't have their own fd
+        };
+    }
+
+    /// Whether this pane has a pollable fd (local panes only).
+    pub fn hasPollableFd(self: *const Pane) bool {
+        return switch (self.backend) {
+            .local => true,
+            .pod => false,
         };
     }
 
@@ -871,16 +823,11 @@ pub const Pane = struct {
     }
 
     /// Get best available current working directory.
-    /// Tries OSC 7 first (most reliable and up-to-date), then falls back
-    /// to local /proc/<pid>/cwd (works for local PTY panes), then falls back
-    /// to cached CWD from ses (works for pod panes where mux can't read /proc).
     pub fn getRealCwd(self: *Pane) ?[]const u8 {
-        // Try OSC 7 first (works for both local and pod panes)
         if (self.vt.getPwd()) |pwd| {
             return pwd;
         }
 
-        // Try local /proc fallback (works for local PTY panes)
         if (self.getFgPid()) |pid| {
             var path_buf: [64]u8 = undefined;
             const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cwd", .{pid}) catch return self.ses_cwd;
@@ -888,7 +835,6 @@ pub const Pane = struct {
             return link;
         }
 
-        // For pod panes, use cached CWD from ses daemon (populated by main.zig)
         return self.ses_cwd;
     }
 
@@ -919,6 +865,14 @@ pub const Pane = struct {
         if (len == 0) return null;
         const end = if (len > 0 and proc_buf[len - 1] == '\n') len - 1 else len;
         return proc_buf[0..end];
+    }
+
+    /// Get the pane_id for pod-backed panes (used for VT routing).
+    pub fn getPaneId(self: *const Pane) ?u16 {
+        return switch (self.backend) {
+            .pod => |pod| pod.pane_id,
+            .local => null,
+        };
     }
 
     /// Scroll up by given number of lines

@@ -1,11 +1,17 @@
 const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
+const wire = core.wire;
+const mux = @import("main.zig");
 
-/// Client for communicating with the ses daemon
+/// Client for communicating with the ses daemon using binary protocol.
+/// Opens two channels:
+///   - ctl_fd (handshake 0x01): binary control messages
+///   - vt_fd (handshake 0x02): multiplexed VT data (MuxVtHeader frames)
 pub const SesClient = struct {
     allocator: std.mem.Allocator,
-    conn: ?core.ipc.Connection,
+    ctl_fd: ?posix.fd_t,
+    vt_fd: ?posix.fd_t,
     just_started_daemon: bool,
     debug: bool,
     log_file: ?[]const u8,
@@ -18,7 +24,8 @@ pub const SesClient = struct {
     pub fn init(allocator: std.mem.Allocator, session_id: [32]u8, session_name: []const u8, keepalive: bool, debug: bool, log_file: ?[]const u8) SesClient {
         return .{
             .allocator = allocator,
-            .conn = null,
+            .ctl_fd = null,
+            .vt_fd = null,
             .just_started_daemon = false,
             .debug = debug,
             .log_file = log_file,
@@ -29,26 +36,23 @@ pub const SesClient = struct {
     }
 
     pub fn deinit(self: *SesClient) void {
-        if (self.conn) |*c| {
-            c.close();
-        }
+        if (self.ctl_fd) |fd| posix.close(fd);
+        if (self.vt_fd) |fd| posix.close(fd);
+        self.ctl_fd = null;
+        self.vt_fd = null;
     }
 
-    /// Connect to the ses daemon, starting it if necessary
+    /// Connect to the ses daemon, starting it if necessary.
+    /// Opens two channels: control (0x01) and VT (0x02).
     pub fn connect(self: *SesClient) !void {
         const socket_path = try core.ipc.getSesSocketPath(self.allocator);
         defer self.allocator.free(socket_path);
 
         // Try to connect to existing daemon first
-        if (core.ipc.Client.connect(socket_path)) |client| {
-            self.conn = client.toConnection();
+        if (self.connectChannels(socket_path)) {
             self.just_started_daemon = false;
             try self.register();
             return;
-        } else |err| {
-            if (err != error.ConnectionRefused and err != error.FileNotFound) {
-                return err;
-            }
         }
 
         // Daemon not running, start it
@@ -59,90 +63,565 @@ pub const SesClient = struct {
         std.Thread.sleep(200 * std.time.ns_per_ms);
 
         // Retry connection
-        const client = try core.ipc.Client.connect(socket_path);
-        self.conn = client.toConnection();
+        if (!self.connectChannels(socket_path)) {
+            return error.ConnectionRefused;
+        }
         try self.register();
     }
 
-    /// Register with ses - send session_id, session_name, and keepalive preference
-    fn register(self: *SesClient) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
+    /// Open both channels to SES.
+    fn connectChannels(self: *SesClient, socket_path: []const u8) bool {
+        // Channel 1: Control (0x01)
+        const ctl_client = core.ipc.Client.connect(socket_path) catch return false;
+        const ctl_fd = ctl_client.fd;
+        const ctl_handshake = [_]u8{wire.SES_HANDSHAKE_MUX_CTL};
+        wire.writeAll(ctl_fd, &ctl_handshake) catch {
+            posix.close(ctl_fd);
+            return false;
+        };
 
-        var buf: [256]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"register\",\"session_id\":\"{s}\",\"session_name\":\"{s}\",\"keepalive\":{}}}", .{
-            self.session_id,
-            self.session_name,
-            self.keepalive,
-        });
-        try conn.sendLine(msg);
+        // Channel 2: VT (0x02) + 32-byte session_id
+        const vt_client = core.ipc.Client.connect(socket_path) catch {
+            posix.close(ctl_fd);
+            return false;
+        };
+        const vt_fd = vt_client.fd;
+        const vt_handshake = [_]u8{wire.SES_HANDSHAKE_MUX_VT};
+        wire.writeAll(vt_fd, &vt_handshake) catch {
+            posix.close(ctl_fd);
+            posix.close(vt_fd);
+            return false;
+        };
+        // Send 32-byte hex session_id so SES can identify us.
+        wire.writeAll(vt_fd, &self.session_id) catch {
+            posix.close(ctl_fd);
+            posix.close(vt_fd);
+            return false;
+        };
 
-        // Wait for response
-        var resp_buf: [128]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        // Verify it's a successful registration
-        if (std.mem.indexOf(u8, line.?, "registered") == null) {
-            return error.RegistrationFailed;
-        }
+        self.ctl_fd = ctl_fd;
+        self.vt_fd = vt_fd;
+        mux.debugLog("ses channels connected: ctl_fd={d} vt_fd={d}", .{ ctl_fd, vt_fd });
+        return true;
     }
 
-    /// Update session info and re-register with ses (used after reattach)
+    /// Register with ses — send session_id, session_name, and keepalive preference.
+    fn register(self: *SesClient) !void {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        mux.debugLog("registering session={s} name={s}", .{ self.session_id[0..8], self.session_name });
+
+        var reg: wire.Register = .{
+            .session_id = self.session_id,
+            .keepalive = if (self.keepalive) 1 else 0,
+            .name_len = @intCast(self.session_name.len),
+        };
+        try wire.writeControlWithTrail(fd, .register, std.mem.asBytes(&reg), self.session_name);
+
+        // Wait for registered response.
+        const hdr = try wire.readControlHeader(fd);
+        const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (msg_type == .@"error") {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.RegistrationFailed;
+        }
+        if (msg_type != .registered) {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.UnexpectedResponse;
+        }
+        self.skipPayload(fd, hdr.payload_len);
+    }
+
+    /// Update session info and re-register with ses (used after reattach).
     pub fn updateSession(self: *SesClient, session_id: [32]u8, session_name: []const u8) !void {
         self.session_id = session_id;
         self.session_name = session_name;
         try self.register();
     }
 
-    /// Sync current mux state to ses (for crash recovery)
     /// Tell ses this mux is exiting normally.
-    ///
-    /// This avoids ses treating the disconnect as a crash (keepalive auto-detach).
     pub fn shutdown(self: *SesClient, preserve_sticky: bool) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"disconnect\",\"mode\":\"shutdown\",\"preserve_sticky\":{}}}", .{preserve_sticky});
-        // Best-effort: don't block on a reply (mux is exiting).
-        conn.sendLine(msg) catch {};
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        var msg: wire.Disconnect = .{
+            .mode = 0, // shutdown
+            .preserve_sticky = if (preserve_sticky) 1 else 0,
+        };
+        // Best-effort: don't block on a reply.
+        wire.writeControl(fd, .disconnect, std.mem.asBytes(&msg)) catch {};
     }
 
+    /// Sync current mux state to ses (for crash recovery).
     pub fn syncState(self: *SesClient, mux_state_json: []const u8) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        var msg: wire.SyncState = .{
+            .state_len = @intCast(mux_state_json.len),
+        };
+        try wire.writeControlWithTrail(fd, .sync_state, std.mem.asBytes(&msg), mux_state_json);
 
-        // Build message with mux state as escaped JSON string
-        const msg_size = 64 + mux_state_json.len * 2;
-        const msg_buf = self.allocator.alloc(u8, msg_size) catch return error.OutOfMemory;
-        defer self.allocator.free(msg_buf);
+        // Wait for ok response.
+        const hdr = try wire.readControlHeader(fd);
+        self.skipPayload(fd, hdr.payload_len);
+    }
 
-        var stream = std.io.fixedBufferStream(msg_buf);
-        var writer = stream.writer();
-        writer.writeAll("{\"type\":\"sync_state\",\"mux_state\":\"") catch return error.WriteError;
+    /// Create a new pane via ses.
+    /// Returns the pane UUID, pane_id (for VT routing), and pod PID.
+    pub fn createPane(
+        self: *SesClient,
+        shell: ?[]const u8,
+        cwd: ?[]const u8,
+        sticky_pwd: ?[]const u8,
+        sticky_key: ?u8,
+        _: ?[]const []const u8, // env (unused in binary protocol — pod inherits)
+        _: ?[]const []const u8, // extra_env (unused)
+    ) !struct { uuid: [32]u8, pane_id: u16, pid: posix.pid_t } {
+        const fd = self.ctl_fd orelse return error.NotConnected;
 
-        // Escape the JSON string
-        for (mux_state_json) |c| {
-            switch (c) {
-                '"' => writer.writeAll("\\\"") catch return error.WriteError,
-                '\\' => writer.writeAll("\\\\") catch return error.WriteError,
-                '\n' => writer.writeAll("\\n") catch return error.WriteError,
-                '\r' => writer.writeAll("\\r") catch return error.WriteError,
-                '\t' => writer.writeAll("\\t") catch return error.WriteError,
-                else => writer.writeByte(c) catch return error.WriteError,
+        const shell_bytes = shell orelse "";
+        const cwd_bytes = cwd orelse "";
+        const sticky_pwd_bytes = sticky_pwd orelse "";
+
+        var msg: wire.CreatePane = .{
+            .shell_len = @intCast(shell_bytes.len),
+            .cwd_len = @intCast(cwd_bytes.len),
+            .sticky_key = sticky_key orelse 0,
+            .sticky_pwd_len = @intCast(sticky_pwd_bytes.len),
+        };
+        const trails: []const []const u8 = &.{ shell_bytes, cwd_bytes, sticky_pwd_bytes };
+        mux.debugLog("createPane: shell={s} cwd={s}", .{ shell_bytes, cwd_bytes });
+        try wire.writeControlMsg(fd, .create_pane, std.mem.asBytes(&msg), trails);
+
+        // Read response.
+        const hdr = try wire.readControlHeader(fd);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type == .@"error") {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.SesError;
+        }
+        if (resp_type != .pane_created) {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.UnexpectedResponse;
+        }
+
+        const resp = try wire.readStruct(wire.PaneCreated, fd);
+        // Skip socket_path (we don't need it — VT goes through SES).
+        if (resp.socket_len > 0) {
+            var skip_buf: [512]u8 = undefined;
+            wire.readExact(fd, skip_buf[0..resp.socket_len]) catch {};
+        }
+
+        mux.debugLog("pane created: uuid={s} pane_id={d} pid={d}", .{ resp.uuid[0..8], resp.pane_id, resp.pid });
+        return .{
+            .uuid = resp.uuid,
+            .pane_id = resp.pane_id,
+            .pid = resp.pid,
+        };
+    }
+
+    /// Find a sticky pane (for pwd floats).
+    pub fn findStickyPane(self: *SesClient, pwd: []const u8, key: u8) !?struct { uuid: [32]u8, pane_id: u16, pid: posix.pid_t } {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+
+        var msg: wire.FindSticky = .{
+            .key = key,
+            .pwd_len = @intCast(pwd.len),
+        };
+        try wire.writeControlWithTrail(fd, .find_sticky, std.mem.asBytes(&msg), pwd);
+
+        const hdr = try wire.readControlHeader(fd);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type == .pane_not_found) {
+            self.skipPayload(fd, hdr.payload_len);
+            return null;
+        }
+        if (resp_type != .pane_found) {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.UnexpectedResponse;
+        }
+
+        const resp = try wire.readStruct(wire.PaneFound, fd);
+        // Skip socket_path.
+        if (resp.socket_len > 0) {
+            var skip_buf: [512]u8 = undefined;
+            wire.readExact(fd, skip_buf[0..@min(@as(usize, resp.socket_len), skip_buf.len)]) catch {};
+        }
+
+        return .{ .uuid = resp.uuid, .pane_id = resp.pane_id, .pid = resp.pid };
+    }
+
+    /// Orphan a pane (manual suspend).
+    pub fn orphanPane(self: *SesClient, uuid: [32]u8) !void {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        var msg: wire.PaneUuid = .{ .uuid = uuid };
+        try wire.writeControl(fd, .orphan_pane, std.mem.asBytes(&msg));
+
+        const hdr = try wire.readControlHeader(fd);
+        self.skipPayload(fd, hdr.payload_len);
+    }
+
+    /// Set sticky info on a pane.
+    pub fn setSticky(self: *SesClient, uuid: [32]u8, pwd: []const u8, key: u8) !void {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        var msg: wire.SetSticky = .{
+            .uuid = uuid,
+            .key = key,
+            .pwd_len = @intCast(pwd.len),
+        };
+        try wire.writeControlWithTrail(fd, .set_sticky, std.mem.asBytes(&msg), pwd);
+
+        const hdr = try wire.readControlHeader(fd);
+        self.skipPayload(fd, hdr.payload_len);
+    }
+
+    /// Kill a pane.
+    pub fn killPane(self: *SesClient, uuid: [32]u8) !void {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        var msg: wire.PaneUuid = .{ .uuid = uuid };
+        try wire.writeControl(fd, .kill_pane, std.mem.asBytes(&msg));
+
+        const hdr = try wire.readControlHeader(fd);
+        self.skipPayload(fd, hdr.payload_len);
+    }
+
+    /// Get pane CWD from ses (uses /proc on ses side).
+    pub fn getPaneCwd(self: *SesClient, uuid: [32]u8) ?[]u8 {
+        const fd = self.ctl_fd orelse return null;
+        var msg: wire.GetPaneCwd = .{ .uuid = uuid };
+        wire.writeControl(fd, .get_pane_cwd, std.mem.asBytes(&msg)) catch return null;
+
+        const hdr = wire.readControlHeader(fd) catch return null;
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type != .ok or hdr.payload_len < @sizeOf(wire.PaneCwd)) {
+            self.skipPayload(fd, hdr.payload_len);
+            return null;
+        }
+        const resp = wire.readStruct(wire.PaneCwd, fd) catch return null;
+        if (resp.cwd_len == 0) return null;
+        const buf = self.allocator.alloc(u8, resp.cwd_len) catch return null;
+        wire.readExact(fd, buf) catch {
+            self.allocator.free(buf);
+            return null;
+        };
+        return buf;
+    }
+
+    /// Ping ses to check if it's alive.
+    pub fn ping(self: *SesClient) !bool {
+        const fd = self.ctl_fd orelse return false;
+        try wire.writeControl(fd, .ping, &.{});
+
+        const hdr = wire.readControlHeader(fd) catch return false;
+        self.skipPayload(fd, hdr.payload_len);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        return resp_type == .pong;
+    }
+
+    /// Update pane name in ses.
+    pub fn updatePaneName(self: *SesClient, uuid: [32]u8, name: ?[]const u8) !void {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        const name_bytes = name orelse "";
+        var msg: wire.UpdatePaneName = .{
+            .uuid = uuid,
+            .name_len = @intCast(name_bytes.len),
+        };
+        try wire.writeControlWithTrail(fd, .update_pane_name, std.mem.asBytes(&msg), name_bytes);
+
+        const hdr = try wire.readControlHeader(fd);
+        self.skipPayload(fd, hdr.payload_len);
+    }
+
+    /// Update shell-provided pane metadata.
+    pub fn updatePaneShell(self: *SesClient, uuid: [32]u8, cmd: ?[]const u8, cwd: ?[]const u8, status: ?i32, duration_ms: ?u64, jobs: ?u16) !void {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        const cmd_bytes = cmd orelse "";
+        const cwd_bytes = cwd orelse "";
+        var msg: wire.UpdatePaneShell = .{
+            .uuid = uuid,
+            .status = status orelse 0,
+            .has_status = if (status != null) 1 else 0,
+            .duration_ms = if (duration_ms) |d| @intCast(d) else 0,
+            .has_duration = if (duration_ms != null) 1 else 0,
+            .jobs = jobs orelse 0,
+            .has_jobs = if (jobs != null) 1 else 0,
+            .cmd_len = @intCast(cmd_bytes.len),
+            .cwd_len = @intCast(cwd_bytes.len),
+        };
+        const trails: []const []const u8 = &.{ cmd_bytes, cwd_bytes };
+        try wire.writeControlMsg(fd, .update_pane_shell, std.mem.asBytes(&msg), trails);
+
+        const hdr = try wire.readControlHeader(fd);
+        self.skipPayload(fd, hdr.payload_len);
+    }
+
+    /// Pane type enum for auxiliary info.
+    pub const PaneType = enum { split, float };
+    pub const PaneAuxInfo = struct { created_from: ?[32]u8, focused_from: ?[32]u8 };
+    pub const PaneProcessInfo = struct { name: ?[]u8 = null, pid: ?i32 = null };
+
+    /// Update auxiliary pane info (synced from mux to ses).
+    /// In binary protocol, pane_info is tracked by SES via POD reports.
+    /// This is a best-effort no-op now (SES ignores update_pane_aux).
+    pub fn updatePaneAux(
+        self: *SesClient,
+        _: [32]u8,
+        _: bool,
+        _: bool,
+        _: PaneType,
+        _: ?[32]u8,
+        _: ?[32]u8,
+        _: ?struct { x: u16, y: u16 },
+        _: ?u8,
+        _: ?bool,
+        _: ?bool,
+        _: ?struct { cols: u16, rows: u16 },
+        _: ?[]const u8,
+        _: ?[]const u8,
+        _: ?posix.pid_t,
+        _: ?[]const u8,
+    ) !void {
+        _ = self;
+        // No-op in binary protocol — SES tracks pane state from POD.
+    }
+
+    /// Get auxiliary pane info — no-op in binary protocol (SES tracks via POD).
+    pub fn getPaneAux(_: *SesClient, _: [32]u8) !PaneAuxInfo {
+        return .{ .created_from = null, .focused_from = null };
+    }
+
+    /// Best-effort foreground process info for a pane.
+    /// Uses pane_info query.
+    pub fn getPaneProcess(self: *SesClient, uuid: [32]u8) ?PaneProcessInfo {
+        const fd = self.ctl_fd orelse return null;
+        var msg: wire.PaneUuid = .{ .uuid = uuid };
+        wire.writeControl(fd, .pane_info, std.mem.asBytes(&msg)) catch return null;
+
+        const hdr = wire.readControlHeader(fd) catch return null;
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type != .pane_info or hdr.payload_len < @sizeOf(wire.PaneInfoResp)) {
+            self.skipPayload(fd, hdr.payload_len);
+            return null;
+        }
+        const resp = wire.readStruct(wire.PaneInfoResp, fd) catch return null;
+        var out: PaneProcessInfo = .{};
+
+        // Read trailing name + fg_process + cwd.
+        if (resp.name_len > 0) {
+            var skip: [256]u8 = undefined;
+            wire.readExact(fd, skip[0..@min(@as(usize, resp.name_len), skip.len)]) catch return null;
+        }
+        if (resp.fg_len > 0) {
+            const buf = self.allocator.alloc(u8, resp.fg_len) catch {
+                self.skipPayload(fd, @as(u32, resp.fg_len) + @as(u32, resp.cwd_len));
+                return null;
+            };
+            wire.readExact(fd, buf) catch {
+                self.allocator.free(buf);
+                return null;
+            };
+            out.name = buf;
+        }
+        if (resp.cwd_len > 0) {
+            var skip: [4096]u8 = undefined;
+            wire.readExact(fd, skip[0..@min(@as(usize, resp.cwd_len), skip.len)]) catch {};
+        }
+        if (resp.fg_pid != 0) out.pid = resp.fg_pid;
+        return out;
+    }
+
+    /// Best-effort pane name.
+    pub fn getPaneName(self: *SesClient, uuid: [32]u8) ?[]u8 {
+        const fd = self.ctl_fd orelse return null;
+        var msg: wire.PaneUuid = .{ .uuid = uuid };
+        wire.writeControl(fd, .pane_info, std.mem.asBytes(&msg)) catch return null;
+
+        const hdr = wire.readControlHeader(fd) catch return null;
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type != .pane_info or hdr.payload_len < @sizeOf(wire.PaneInfoResp)) {
+            self.skipPayload(fd, hdr.payload_len);
+            return null;
+        }
+        const resp = wire.readStruct(wire.PaneInfoResp, fd) catch return null;
+        var result: ?[]u8 = null;
+
+        if (resp.name_len > 0) {
+            const buf = self.allocator.alloc(u8, resp.name_len) catch {
+                self.skipPayload(fd, @as(u32, resp.name_len) + @as(u32, resp.fg_len) + @as(u32, resp.cwd_len));
+                return null;
+            };
+            wire.readExact(fd, buf) catch {
+                self.allocator.free(buf);
+                return null;
+            };
+            result = buf;
+        }
+        // Skip remaining trailing data.
+        if (resp.fg_len > 0) {
+            var skip: [256]u8 = undefined;
+            wire.readExact(fd, skip[0..@min(@as(usize, resp.fg_len), skip.len)]) catch {};
+        }
+        if (resp.cwd_len > 0) {
+            var skip: [4096]u8 = undefined;
+            wire.readExact(fd, skip[0..@min(@as(usize, resp.cwd_len), skip.len)]) catch {};
+        }
+        return result;
+    }
+
+    /// Adopt an orphaned pane.
+    pub fn adoptPane(self: *SesClient, uuid: [32]u8) !struct { uuid: [32]u8, pane_id: u16, pid: posix.pid_t } {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        var msg: wire.PaneUuid = .{ .uuid = uuid };
+        try wire.writeControl(fd, .adopt_pane, std.mem.asBytes(&msg));
+
+        const hdr = try wire.readControlHeader(fd);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type == .@"error") {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.SesError;
+        }
+        if (resp_type != .pane_found) {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.UnexpectedResponse;
+        }
+
+        const resp = try wire.readStruct(wire.PaneFound, fd);
+        if (resp.socket_len > 0) {
+            var skip_buf: [512]u8 = undefined;
+            wire.readExact(fd, skip_buf[0..@min(@as(usize, resp.socket_len), skip_buf.len)]) catch {};
+        }
+        return .{ .uuid = uuid, .pane_id = resp.pane_id, .pid = resp.pid };
+    }
+
+    /// List orphaned panes.
+    pub fn listOrphanedPanes(self: *SesClient, out_buf: []OrphanedPaneInfo) !usize {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        try wire.writeControl(fd, .list_orphaned, &.{});
+
+        const hdr = try wire.readControlHeader(fd);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type != .orphaned_panes) {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.UnexpectedResponse;
+        }
+
+        const resp = try wire.readStruct(wire.OrphanedPanes, fd);
+        var count: usize = 0;
+        for (0..resp.pane_count) |_| {
+            const entry = wire.readStruct(wire.OrphanedPaneEntry, fd) catch break;
+            if (count < out_buf.len) {
+                out_buf[count] = .{ .uuid = entry.uuid, .pid = entry.pid };
+                count += 1;
             }
         }
-        writer.writeAll("\"}") catch return error.WriteError;
-
-        try conn.sendLine(stream.getWritten());
-
-        // Wait for response
-        var resp_buf: [128]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
+        return count;
     }
 
-    /// Start the ses daemon
+    /// Detach session — keeps panes grouped for later reattach.
+    pub fn detachSession(self: *SesClient, session_id: [32]u8, mux_state_json: []const u8) !void {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+
+        // Convert 32-char hex session_id to 16 binary bytes for the struct.
+        var msg: wire.Detach = .{
+            .session_id = session_id,
+            .state_len = @intCast(mux_state_json.len),
+        };
+        try wire.writeControlWithTrail(fd, .detach, std.mem.asBytes(&msg), mux_state_json);
+
+        const hdr = try wire.readControlHeader(fd);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type == .@"error") {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.DetachFailed;
+        }
+        self.skipPayload(fd, hdr.payload_len);
+    }
+
+    /// Result of reattaching a session.
+    pub const ReattachResult = struct {
+        mux_state_json: []const u8, // Owned — caller must free
+        pane_uuids: [][32]u8, // Owned — caller must free
+    };
+
+    /// Reattach to a detached session.
+    pub fn reattachSession(self: *SesClient, session_id: []const u8) !?ReattachResult {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+
+        var msg: wire.Reattach = .{
+            .id_len = @intCast(session_id.len),
+        };
+        try wire.writeControlWithTrail(fd, .reattach, std.mem.asBytes(&msg), session_id);
+
+        const hdr = try wire.readControlHeader(fd);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type == .@"error") {
+            self.skipPayload(fd, hdr.payload_len);
+            return null;
+        }
+        if (resp_type != .session_reattached) {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.UnexpectedResponse;
+        }
+
+        const resp = try wire.readStruct(wire.SessionReattached, fd);
+
+        // Read mux_state_json.
+        const mux_state = self.allocator.alloc(u8, resp.state_len) catch return error.OutOfMemory;
+        errdefer self.allocator.free(mux_state);
+        try wire.readExact(fd, mux_state);
+
+        // Read pane UUIDs (each 32 bytes).
+        var pane_uuids = self.allocator.alloc([32]u8, resp.pane_count) catch return error.OutOfMemory;
+        errdefer self.allocator.free(pane_uuids);
+        for (0..resp.pane_count) |i| {
+            try wire.readExact(fd, &pane_uuids[i]);
+        }
+
+        return .{
+            .mux_state_json = mux_state,
+            .pane_uuids = pane_uuids,
+        };
+    }
+
+    /// List detached sessions.
+    pub fn listSessions(self: *SesClient, out_buf: []DetachedSessionInfo) !usize {
+        const fd = self.ctl_fd orelse return error.NotConnected;
+        try wire.writeControl(fd, .list_sessions, &.{});
+
+        const hdr = try wire.readControlHeader(fd);
+        const resp_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (resp_type != .sessions_list) {
+            self.skipPayload(fd, hdr.payload_len);
+            return error.UnexpectedResponse;
+        }
+
+        const resp = try wire.readStruct(wire.SessionsList, fd);
+        var count: usize = 0;
+        for (0..resp.session_count) |_| {
+            const entry = wire.readStruct(wire.SessionEntry, fd) catch break;
+            var info: DetachedSessionInfo = undefined;
+            info.session_id = entry.session_id;
+            info.pane_count = entry.pane_count;
+            // Read name.
+            const name_len = @min(@as(usize, entry.name_len), 32);
+            if (entry.name_len > 0) {
+                var name_buf: [32]u8 = undefined;
+                wire.readExact(fd, name_buf[0..name_len]) catch break;
+                @memcpy(info.session_name[0..name_len], name_buf[0..name_len]);
+                info.session_name_len = name_len;
+                // Skip excess name bytes.
+                if (entry.name_len > 32) {
+                    self.skipPayloadU16(fd, entry.name_len - 32);
+                }
+            } else {
+                info.session_name_len = 0;
+            }
+            if (count < out_buf.len) {
+                out_buf[count] = info;
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    /// Start the ses daemon.
     fn startSes(self: *SesClient) !void {
-        // Fork and exec hexe ses daemon
         var args_list: std.ArrayList([]const u8) = .empty;
         defer args_list.deinit(self.allocator);
 
@@ -179,810 +658,45 @@ pub const SesClient = struct {
             std.debug.print("Failed to start ses daemon: {}\n", .{err});
             return err;
         };
-        // Don't wait - it daemonizes itself
         _ = child.wait() catch {};
     }
 
-    /// Check if connected to ses
+    /// Check if connected to ses.
     pub fn isConnected(self: *SesClient) bool {
-        return self.conn != null;
+        return self.ctl_fd != null;
     }
 
-    /// Create a new pane via ses.
-    /// Returns the pane UUID and the pod socket path (owned; caller frees).
-    pub fn createPane(
-        self: *SesClient,
-        shell: ?[]const u8,
-        cwd: ?[]const u8,
-        sticky_pwd: ?[]const u8,
-        sticky_key: ?u8,
-        env: ?[]const []const u8,
-        extra_env: ?[]const []const u8,
-    ) !struct { uuid: [32]u8, socket_path: []u8, pid: posix.pid_t } {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        // Build request JSON
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        var writer = buf.writer(self.allocator);
-
-        try writer.writeAll("{\"type\":\"create_pane\"");
-        if (shell) |s| {
-            try writer.print(",\"shell\":\"{s}\"", .{s});
-        }
-        if (cwd) |dir| {
-            try writer.print(",\"cwd\":\"{s}\"", .{dir});
-        }
-        if (sticky_pwd) |pwd| {
-            try writer.print(",\"sticky_pwd\":\"{s}\"", .{pwd});
-        }
-        if (sticky_key) |key| {
-            try writer.print(",\"sticky_key\":\"{c}\"", .{key});
-        }
-        if (env) |vars| {
-            try writer.writeAll(",\"env\":[");
-            for (vars, 0..) |entry, i| {
-                if (i > 0) try writer.writeAll(",");
-                try writer.print("\"{s}\"", .{entry});
-            }
-            try writer.writeAll("]");
-        }
-        if (extra_env) |vars| {
-            try writer.writeAll(",\"extra_env\":[");
-            for (vars, 0..) |entry, i| {
-                if (i > 0) try writer.writeAll(",");
-                try writer.print("\"{s}\"", .{entry});
-            }
-            try writer.writeAll("]");
-        }
-        try writer.writeAll("}");
-
-        try conn.sendLine(buf.items);
-
-        // Receive response
-        var resp_buf: [1024]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch return error.InvalidResponse;
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        const msg_type = (root.get("type") orelse return error.InvalidResponse).string;
-
-        if (std.mem.eql(u8, msg_type, "error")) return error.SesError;
-        if (!std.mem.eql(u8, msg_type, "pane_created")) return error.UnexpectedResponse;
-
-        const uuid_str = (root.get("uuid") orelse return error.InvalidResponse).string;
-        const pid = (root.get("pid") orelse return error.InvalidResponse).integer;
-        const socket_str = (root.get("socket") orelse return error.InvalidResponse).string;
-
-        var uuid: [32]u8 = undefined;
-        if (uuid_str.len != 32) return error.InvalidUuid;
-        @memcpy(&uuid, uuid_str[0..32]);
-
-        const socket_owned = try self.allocator.dupe(u8, socket_str);
-
-        return .{
-            .uuid = uuid,
-            .socket_path = socket_owned,
-            .pid = @intCast(pid),
-        };
+    /// Get the VT channel fd (for polling in the event loop).
+    pub fn getVtFd(self: *SesClient) ?posix.fd_t {
+        return self.vt_fd;
     }
 
-    /// Find a sticky pane (for pwd floats).
-    /// Returns pod socket path (owned; caller frees).
-    pub fn findStickyPane(self: *SesClient, pwd: []const u8, key: u8) !?struct { uuid: [32]u8, socket_path: []u8, pid: posix.pid_t } {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [512]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"find_sticky\",\"pwd\":\"{s}\",\"key\":\"{c}\"}}", .{ pwd, key });
-        try conn.sendLine(msg);
-
-        var resp_buf: [1024]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch return error.InvalidResponse;
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        const msg_type = (root.get("type") orelse return error.InvalidResponse).string;
-
-        if (std.mem.eql(u8, msg_type, "pane_not_found")) return null;
-        if (!std.mem.eql(u8, msg_type, "pane_found")) return error.UnexpectedResponse;
-
-        const uuid_str = (root.get("uuid") orelse return error.InvalidResponse).string;
-        const pid = (root.get("pid") orelse return error.InvalidResponse).integer;
-        const socket_str = (root.get("socket") orelse return error.InvalidResponse).string;
-
-        if (uuid_str.len != 32) return error.InvalidUuid;
-        var uuid: [32]u8 = undefined;
-        @memcpy(&uuid, uuid_str[0..32]);
-
-        const socket_owned = try self.allocator.dupe(u8, socket_str);
-
-        return .{ .uuid = uuid, .socket_path = socket_owned, .pid = @intCast(pid) };
+    /// Get the control channel fd (for polling async messages).
+    pub fn getCtlFd(self: *SesClient) ?posix.fd_t {
+        return self.ctl_fd;
     }
 
-    /// Orphan a pane (manual suspend)
-    pub fn orphanPane(self: *SesClient, uuid: [32]u8) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
-        var buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"orphan_pane\",\"uuid\":\"{s}\"}}", .{uuid});
-        try conn.sendLine(msg);
-
-        // Wait for OK response
-        var resp_buf: [256]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-    }
-
-    /// Set sticky info on a pane (for sticky floats before orphaning)
-    pub fn setSticky(self: *SesClient, uuid: [32]u8, pwd: []const u8, key: u8) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [512]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"set_sticky\",\"uuid\":\"{s}\",\"pwd\":\"{s}\",\"key\":\"{c}\"}}", .{ uuid, pwd, key });
-        try conn.sendLine(msg);
-
-        // Wait for OK response
-        var resp_buf: [256]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-    }
-
-    /// Kill a pane
-    pub fn killPane(self: *SesClient, uuid: [32]u8) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"kill_pane\",\"uuid\":\"{s}\"}}", .{uuid});
-        try conn.sendLine(msg);
-
-        // Wait for OK response
-        var resp_buf: [256]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-    }
-
-    /// Pane auxiliary info returned from getPaneAux
-    pub const PaneAuxInfo = struct {
-        created_from: ?[32]u8,
-        focused_from: ?[32]u8,
-    };
-
-    pub const PaneProcessInfo = struct {
-        name: ?[]u8 = null,
-        pid: ?i32 = null,
-    };
-
-    pub const PaneNameInfo = struct {
-        name: ?[]u8 = null,
-    };
-
-    /// Get auxiliary pane info (created_from, focused_from) from ses
-    pub fn getPaneAux(self: *SesClient, uuid: [32]u8) !PaneAuxInfo {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid});
-        try conn.sendLine(msg);
-
-        // Wait for response
-        var resp_buf: [2048]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        // Parse JSON response
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch {
-            return error.InvalidResponse;
-        };
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        if (root.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                return error.PaneNotFound;
-            }
-        }
-
-        var info: PaneAuxInfo = .{
-            .created_from = null,
-            .focused_from = null,
-        };
-
-        if (root.get("created_from")) |cf| {
-            if (cf == .string and cf.string.len == 32) {
-                var created: [32]u8 = undefined;
-                @memcpy(&created, cf.string[0..32]);
-                info.created_from = created;
-            }
-        }
-
-        if (root.get("focused_from")) |ff| {
-            if (ff == .string and ff.string.len == 32) {
-                var focused: [32]u8 = undefined;
-                @memcpy(&focused, ff.string[0..32]);
-                info.focused_from = focused;
-            }
-        }
-
-        return info;
-    }
-
-    /// Best-effort foreground process info for a pane.
-    ///
-    /// Uses `pane_info` and prefers `active_process`/`active_pid` when present.
-    /// Returns owned strings that the caller must free.
-    pub fn getPaneProcess(self: *SesClient, uuid: [32]u8) ?PaneProcessInfo {
-        const conn = &(self.conn orelse return null);
-
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid}) catch return null;
-        conn.sendLine(msg) catch return null;
-
-        var resp_buf: [4096]u8 = undefined;
-        const line = conn.recvLine(&resp_buf) catch return null;
-        if (line == null) return null;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch return null;
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        if (root.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) return null;
-        }
-
-        var out: PaneProcessInfo = .{};
-
-        // Prefer active_process/active_pid if present.
-        if (root.get("active_process")) |v| {
-            if (v == .string and v.string.len > 0) {
-                out.name = self.allocator.dupe(u8, v.string) catch null;
-            }
-        }
-        if (root.get("active_pid")) |v| {
-            if (v == .integer) out.pid = @intCast(v.integer);
-        }
-
-        // Fall back to fg_process/fg_pid.
-        if (out.name == null) {
-            if (root.get("fg_process")) |v| {
-                if (v == .string and v.string.len > 0) {
-                    out.name = self.allocator.dupe(u8, v.string) catch null;
-                }
-            }
-        }
-        if (out.pid == null) {
-            if (root.get("fg_pid")) |v| {
-                if (v == .integer) out.pid = @intCast(v.integer);
-            }
-        }
-
-        return out;
-    }
-
-    /// Best-effort pane name (mux metadata).
-    /// Returns an owned string that the caller must free.
-    pub fn getPaneName(self: *SesClient, uuid: [32]u8) ?[]u8 {
-        const conn = &(self.conn orelse return null);
-
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"pane_info\",\"uuid\":\"{s}\"}}", .{uuid}) catch return null;
-        conn.sendLine(msg) catch return null;
-
-        var resp_buf: [4096]u8 = undefined;
-        const line = conn.recvLine(&resp_buf) catch return null;
-        if (line == null) return null;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch return null;
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        if (root.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) return null;
-        }
-        if (root.get("name")) |v| {
-            if (v == .string and v.string.len > 0) {
-                return self.allocator.dupe(u8, v.string) catch null;
-            }
-        }
-        return null;
-    }
-
-    pub fn updatePaneName(self: *SesClient, uuid: [32]u8, name: ?[]const u8) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [1024]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buf);
-        var w = stream.writer();
-
-        try w.print("{{\"type\":\"update_pane_name\",\"uuid\":\"{s}\",\"name\":", .{uuid});
-        if (name) |n| {
-            try w.writeByte('"');
-            try writeJsonEscaped(w, n);
-            try w.writeByte('"');
-        } else {
-            try w.writeAll("null");
-        }
-        try w.writeAll("}");
-
-        try conn.sendLine(stream.getWritten());
-
-        // Wait for OK response.
-        var resp_buf: [256]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-    }
-
-    fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
-        for (value) |ch| {
-            switch (ch) {
-                '"' => try writer.writeAll("\\\""),
-                '\\' => try writer.writeAll("\\\\"),
-                '\n' => try writer.writeAll("\\n"),
-                '\r' => try writer.writeAll("\\r"),
-                '\t' => try writer.writeAll("\\t"),
-                else => {
-                    if (ch < 0x20) {
-                        try writer.writeByte(' ');
-                    } else {
-                        try writer.writeByte(ch);
-                    }
-                },
-            }
+    fn skipPayload(self: *SesClient, fd: posix.fd_t, len: u32) void {
+        _ = self;
+        var remaining: usize = len;
+        var buf: [4096]u8 = undefined;
+        while (remaining > 0) {
+            const chunk = @min(remaining, buf.len);
+            wire.readExact(fd, buf[0..chunk]) catch return;
+            remaining -= chunk;
         }
     }
 
-    /// Get current working directory from /proc/<pid>/cwd via ses
-    /// Returns an owned slice that the caller must free with the allocator.
-    pub fn getPaneCwd(self: *SesClient, uuid: [32]u8) ?[]u8 {
-        const conn = &(self.conn orelse return null);
-
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"get_pane_cwd\",\"uuid\":\"{s}\"}}", .{uuid}) catch return null;
-        conn.sendLine(msg) catch return null;
-
-        // Wait for response
-        var resp_buf: [std.fs.max_path_bytes + 128]u8 = undefined;
-        const line = conn.recvLine(&resp_buf) catch return null;
-        if (line == null) return null;
-
-        // Parse JSON response
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch return null;
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        if (root.get("cwd")) |cwd| {
-            if (cwd == .string) {
-                // Duplicate the string since parsed will be freed
-                return self.allocator.dupe(u8, cwd.string) catch return null;
-            }
+    fn skipPayloadU16(_: *SesClient, fd: posix.fd_t, len: u16) void {
+        var remaining: usize = len;
+        var buf: [4096]u8 = undefined;
+        while (remaining > 0) {
+            const chunk = @min(remaining, buf.len);
+            wire.readExact(fd, buf[0..chunk]) catch return;
+            remaining -= chunk;
         }
-        return null;
-    }
-
-    /// Ping ses to check if it's alive
-    pub fn ping(self: *SesClient) !bool {
-        const conn = &(self.conn orelse return false);
-
-        try conn.sendLine("{\"type\":\"ping\"}");
-
-        var resp_buf: [64]u8 = undefined;
-        const line = conn.recvLine(&resp_buf) catch return false;
-        if (line == null) return false;
-
-        return std.mem.indexOf(u8, line.?, "pong") != null;
-    }
-
-    /// Pane type enum for auxiliary info
-    pub const PaneType = enum {
-        split,
-        float,
-    };
-
-    /// Update auxiliary pane info (synced from mux to ses)
-    pub fn updatePaneAux(
-        self: *SesClient,
-        uuid: [32]u8,
-        is_float: bool,
-        is_focused: bool,
-        pane_type: PaneType,
-        created_from: ?[32]u8,
-        focused_from: ?[32]u8,
-        cursor_pos: ?struct { x: u16, y: u16 },
-        cursor_style: ?u8,
-        cursor_visible: ?bool,
-        in_alt_screen: ?bool,
-        size: ?struct { cols: u16, rows: u16 },
-        cwd: ?[]const u8,
-        fg_process: ?[]const u8,
-        fg_pid: ?posix.pid_t,
-        layout_path: ?[]const u8,
-    ) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [1024]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buf);
-        var writer = stream.writer();
-
-        const pane_type_str = switch (pane_type) {
-            .split => "split",
-            .float => "float",
-        };
-
-        try writer.print("{{\"type\":\"update_pane_aux\",\"uuid\":\"{s}\",\"is_float\":{},\"is_focused\":{},\"pane_type\":\"{s}\"", .{
-            uuid,
-            is_float,
-            is_focused,
-            pane_type_str,
-        });
-
-        if (created_from) |cf| {
-            try writer.print(",\"created_from\":\"{s}\"", .{cf});
-        } else {
-            try writer.writeAll(",\"created_from\":null");
-        }
-
-        if (focused_from) |ff| {
-            try writer.print(",\"focused_from\":\"{s}\"", .{ff});
-        } else {
-            try writer.writeAll(",\"focused_from\":null");
-        }
-
-        if (cursor_pos) |pos| {
-            try writer.print(",\"cursor_x\":{d},\"cursor_y\":{d}", .{ pos.x, pos.y });
-        }
-
-        if (cursor_style) |style| {
-            try writer.print(",\"cursor_style\":{d}", .{style});
-        }
-        if (cursor_visible) |visible| {
-            try writer.print(",\"cursor_visible\":{}", .{visible});
-        }
-        if (in_alt_screen) |alt| {
-            try writer.print(",\"alt_screen\":{}", .{alt});
-        }
-
-        if (size) |s| {
-            try writer.print(",\"cols\":{d},\"rows\":{d}", .{ s.cols, s.rows });
-        }
-
-        if (cwd) |c| {
-            try writer.print(",\"cwd\":\"{s}\"", .{c});
-        }
-
-        if (fg_process) |p| {
-            try writer.print(",\"fg_process\":\"{s}\"", .{p});
-        }
-
-        if (fg_pid) |pid| {
-            try writer.print(",\"fg_pid\":{d}", .{pid});
-        }
-
-        if (layout_path) |path| {
-            try writer.print(",\"layout_path\":\"{s}\"", .{path});
-        }
-
-        try writer.writeAll("}");
-
-        try conn.sendLine(stream.getWritten());
-
-        // Wait for OK response
-        var resp_buf: [256]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-    }
-
-    /// Update shell-provided pane metadata (last command, status, duration).
-    pub fn updatePaneShell(self: *SesClient, uuid: [32]u8, cmd: ?[]const u8, cwd: ?[]const u8, status: ?i32, duration_ms: ?u64, jobs: ?u16) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [2048]u8 = undefined;
-        var stream = std.io.fixedBufferStream(&buf);
-        var writer = stream.writer();
-
-        try writer.print("{{\"type\":\"update_pane_shell\",\"uuid\":\"{s}\"", .{uuid});
-        if (cmd) |c| {
-            try writer.writeAll(",\"cmd\":\"");
-            for (c) |ch| {
-                switch (ch) {
-                    '"' => try writer.writeAll("\\\""),
-                    '\\' => try writer.writeAll("\\\\"),
-                    '\n' => try writer.writeAll("\\n"),
-                    '\r' => try writer.writeAll("\\r"),
-                    '\t' => try writer.writeAll("\\t"),
-                    else => {
-                        if (ch < 0x20) {
-                            try writer.writeByte(' ');
-                        } else {
-                            try writer.writeByte(ch);
-                        }
-                    },
-                }
-            }
-            try writer.writeAll("\"");
-        }
-        if (cwd) |c| {
-            try writer.writeAll(",\"cwd\":\"");
-            for (c) |ch| {
-                switch (ch) {
-                    '"' => try writer.writeAll("\\\""),
-                    '\\' => try writer.writeAll("\\\\"),
-                    '\n' => try writer.writeAll("\\n"),
-                    '\r' => try writer.writeAll("\\r"),
-                    '\t' => try writer.writeAll("\\t"),
-                    else => {
-                        if (ch < 0x20) {
-                            try writer.writeByte(' ');
-                        } else {
-                            try writer.writeByte(ch);
-                        }
-                    },
-                }
-            }
-            try writer.writeAll("\"");
-        }
-        if (status) |s| {
-            try writer.print(",\"status\":{d}", .{s});
-        }
-        if (duration_ms) |d| {
-            try writer.print(",\"duration_ms\":{d}", .{d});
-        }
-        if (jobs) |j| {
-            try writer.print(",\"jobs\":{d}", .{j});
-        }
-        try writer.writeAll("}");
-
-        try conn.sendLine(stream.getWritten());
-
-        var resp_buf: [256]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-    }
-
-    /// Adopt an orphaned pane
-    pub fn adoptPane(self: *SesClient, uuid: [32]u8) !struct { uuid: [32]u8, socket_path: []u8, pid: posix.pid_t } {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        var buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"adopt_pane\",\"uuid\":\"{s}\"}}", .{uuid});
-        try conn.sendLine(msg);
-
-        var resp_buf: [1024]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch return error.InvalidResponse;
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        const msg_type = (root.get("type") orelse return error.InvalidResponse).string;
-        if (std.mem.eql(u8, msg_type, "error")) return error.SesError;
-        if (!std.mem.eql(u8, msg_type, "pane_found")) return error.UnexpectedResponse;
-
-        const pid = (root.get("pid") orelse return error.InvalidResponse).integer;
-        const socket_str = (root.get("socket") orelse return error.InvalidResponse).string;
-        const socket_owned = try self.allocator.dupe(u8, socket_str);
-
-        return .{ .uuid = uuid, .socket_path = socket_owned, .pid = @intCast(pid) };
-    }
-
-    /// List orphaned panes
-    pub fn listOrphanedPanes(self: *SesClient, out_buf: []OrphanedPaneInfo) !usize {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        try conn.sendLine("{\"type\":\"list_orphaned\"}");
-
-        var resp_buf: [4096]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        // Parse response JSON
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch {
-            return error.InvalidResponse;
-        };
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        const msg_type = (root.get("type") orelse return error.InvalidResponse).string;
-
-        if (!std.mem.eql(u8, msg_type, "orphaned_panes")) {
-            return error.UnexpectedResponse;
-        }
-
-        const panes = (root.get("panes") orelse return error.InvalidResponse).array;
-        var count: usize = 0;
-
-        for (panes.items) |pane_val| {
-            if (count >= out_buf.len) break;
-            const pane = pane_val.object;
-
-            const uuid_str = (pane.get("uuid") orelse continue).string;
-            if (uuid_str.len != 32) continue;
-
-            var info: OrphanedPaneInfo = undefined;
-            @memcpy(&info.uuid, uuid_str[0..32]);
-            info.pid = @intCast((pane.get("pid") orelse continue).integer);
-
-            out_buf[count] = info;
-            count += 1;
-        }
-
-        return count;
-    }
-
-    /// Detach session - keeps panes grouped for later reattach
-    /// Sends full mux state JSON for storage
-    /// Returns session_id (hex string)
-    /// Detach session with a specific session ID (mux UUID)
-    /// The session_id should be a 32-char hex string (the mux's UUID)
-    pub fn detachSession(self: *SesClient, session_id: [32]u8, mux_state_json: []const u8) !void {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        // Build message with session_id and mux state as escaped JSON string
-        // {"type":"detach_session","session_id":"<uuid>","mux_state":"<escaped_json>"}
-        // Allocate buffer for the full message (doubled for escaping)
-        const msg_size = 128 + mux_state_json.len * 2;
-        const msg_buf = self.allocator.alloc(u8, msg_size) catch return error.OutOfMemory;
-        defer self.allocator.free(msg_buf);
-
-        var stream = std.io.fixedBufferStream(msg_buf);
-        var writer = stream.writer();
-        writer.print("{{\"type\":\"detach_session\",\"session_id\":\"{s}\",\"mux_state\":\"", .{session_id}) catch return error.WriteError;
-        // Escape the JSON string
-        for (mux_state_json) |c| {
-            switch (c) {
-                '"' => writer.writeAll("\\\"") catch return error.WriteError,
-                '\\' => writer.writeAll("\\\\") catch return error.WriteError,
-                '\n' => writer.writeAll("\\n") catch return error.WriteError,
-                '\r' => writer.writeAll("\\r") catch return error.WriteError,
-                '\t' => writer.writeAll("\\t") catch return error.WriteError,
-                else => writer.writeByte(c) catch return error.WriteError,
-            }
-        }
-        writer.writeAll("\"}") catch return error.WriteError;
-
-        try conn.sendLine(stream.getWritten());
-
-        var resp_buf: [256]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        // Parse response
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch {
-            return error.InvalidResponse;
-        };
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        const msg_type = (root.get("type") orelse return error.InvalidResponse).string;
-
-        if (std.mem.eql(u8, msg_type, "error")) {
-            return error.DetachFailed;
-        }
-
-        if (!std.mem.eql(u8, msg_type, "session_detached")) {
-            return error.UnexpectedResponse;
-        }
-    }
-
-    /// Result of reattaching a session
-    pub const ReattachResult = struct {
-        mux_state_json: []const u8, // Owned - caller must free with allocator
-        pane_uuids: [][32]u8, // Owned - caller must free
-    };
-
-    /// Reattach to a detached session
-    /// Returns the full mux state and list of pane UUIDs to adopt
-    pub fn reattachSession(self: *SesClient, session_id: []const u8) !?ReattachResult {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        // Build request
-        var buf: [128]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"reattach\",\"session_id\":\"{s}\"}}", .{session_id});
-        try conn.sendLine(msg);
-
-        // Response can be large, allocate dynamically
-        var resp_buf: [65536]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        // Parse response
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch {
-            return error.InvalidResponse;
-        };
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        const msg_type = (root.get("type") orelse return error.InvalidResponse).string;
-
-        if (std.mem.eql(u8, msg_type, "error")) {
-            return null;
-        }
-
-        if (!std.mem.eql(u8, msg_type, "session_reattached")) {
-            return error.UnexpectedResponse;
-        }
-
-        // Get mux state (it's a JSON string that was escaped in the response)
-        const mux_state_str = (root.get("mux_state") orelse return error.InvalidResponse).string;
-        // Copy to owned memory
-        const mux_state_json = self.allocator.dupe(u8, mux_state_str) catch return error.OutOfMemory;
-        errdefer self.allocator.free(mux_state_json);
-
-        // Get pane UUIDs
-        const panes_array = (root.get("panes") orelse return error.InvalidResponse).array;
-        var pane_uuids = self.allocator.alloc([32]u8, panes_array.items.len) catch return error.OutOfMemory;
-        errdefer self.allocator.free(pane_uuids);
-
-        for (panes_array.items, 0..) |pane_val, i| {
-            const uuid_str = pane_val.string;
-            if (uuid_str.len == 32) {
-                @memcpy(&pane_uuids[i], uuid_str[0..32]);
-            }
-        }
-
-        return .{
-            .mux_state_json = mux_state_json,
-            .pane_uuids = pane_uuids,
-        };
-    }
-
-    /// List detached sessions
-    pub fn listSessions(self: *SesClient, out_buf: []DetachedSessionInfo) !usize {
-        const conn = &(self.conn orelse return error.NotConnected);
-
-        try conn.sendLine("{\"type\":\"list_sessions\"}");
-
-        var resp_buf: [4096]u8 = undefined;
-        const line = try conn.recvLine(&resp_buf);
-        if (line == null) return error.ConnectionClosed;
-
-        // Parse response
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line.?, .{}) catch {
-            return error.InvalidResponse;
-        };
-        defer parsed.deinit();
-
-        const root = parsed.value.object;
-        const msg_type = (root.get("type") orelse return error.InvalidResponse).string;
-
-        if (!std.mem.eql(u8, msg_type, "sessions")) {
-            return error.UnexpectedResponse;
-        }
-
-        const sessions = (root.get("sessions") orelse return error.InvalidResponse).array;
-        var count: usize = 0;
-
-        for (sessions.items) |sess_val| {
-            if (count >= out_buf.len) break;
-            const sess = sess_val.object;
-
-            const sid_str = (sess.get("session_id") orelse continue).string;
-            if (sid_str.len != 32) continue;
-
-            var info: DetachedSessionInfo = undefined;
-            @memcpy(&info.session_id, sid_str[0..32]);
-            info.pane_count = @intCast((sess.get("pane_count") orelse continue).integer);
-
-            // Get session name
-            if (sess.get("session_name")) |name_val| {
-                const name = name_val.string;
-                const name_len = @min(name.len, 32);
-                @memcpy(info.session_name[0..name_len], name[0..name_len]);
-                info.session_name_len = name_len;
-            } else {
-                info.session_name_len = 0;
-            }
-
-            out_buf[count] = info;
-            count += 1;
-        }
-
-        return count;
     }
 };
 

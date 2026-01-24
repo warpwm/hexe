@@ -9,11 +9,19 @@ const c = @cImport({
 const core = @import("core");
 const pod_protocol = core.pod_protocol;
 const pod_meta = core.pod_meta;
+const wire = core.wire;
+
+var pod_debug: bool = false;
+
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!pod_debug) return;
+    std.debug.print("[pod] " ++ fmt ++ "\n", args);
+}
 
 const PodUplink = struct {
     allocator: std.mem.Allocator,
     uuid: [32]u8,
-    conn: ?core.ipc.Connection = null,
+    fd: ?posix.fd_t = null,
     last_sent_ms: i64 = 0,
     last_cwd: ?[]u8 = null,
     last_fg_process: ?[]u8 = null,
@@ -24,7 +32,7 @@ const PodUplink = struct {
     }
 
     pub fn deinit(self: *PodUplink) void {
-        if (self.conn) |*conn| conn.close();
+        if (self.fd) |fd| posix.close(fd);
         if (self.last_cwd) |s| self.allocator.free(s);
         if (self.last_fg_process) |s| self.allocator.free(s);
         self.* = undefined;
@@ -60,52 +68,84 @@ const PodUplink = struct {
 
         if (!self.ensureConnected()) return;
 
-        var buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        const fd = self.fd.?;
 
-        w.writeAll("{\"type\":\"pod_meta\",\"pane_uuid\":\"") catch return;
-        w.writeAll(&self.uuid) catch return;
-        w.writeAll("\"") catch return;
+        debugLog("uplink tick: sending updates", .{});
 
-        if (proc_cwd) |s| {
-            w.writeAll(",\"cwd\":\"") catch return;
-            writeJsonEscaped(w, s) catch return;
-            w.writeAll("\"") catch return;
-        }
-        if (fg_name) |s| {
-            w.writeAll(",\"fg_process\":\"") catch return;
-            writeJsonEscaped(w, s) catch return;
-            w.writeAll("\"") catch return;
-        }
-        if (fg_pid) |p| {
-            w.print(",\"fg_pid\":{d}", .{p}) catch return;
+        // Send CwdChanged if cwd is available.
+        if (proc_cwd) |cwd_str| {
+            var cwd_msg: wire.CwdChanged = .{
+                .uuid = self.uuid,
+                .cwd_len = @intCast(@min(cwd_str.len, std.math.maxInt(u16))),
+            };
+            const trails = [_][]const u8{cwd_str[0..cwd_msg.cwd_len]};
+            wire.writeControlMsg(fd, .cwd_changed, std.mem.asBytes(&cwd_msg), &trails) catch {
+                self.disconnect();
+                return;
+            };
         }
 
-        w.writeAll("}") catch return;
-
-        self.conn.?.sendLine(fbs.getWritten()) catch {
-            self.conn.?.close();
-            self.conn = null;
-        };
+        // Send FgChanged if foreground process info is available.
+        if (fg_name) |name_str| {
+            var fg_msg: wire.FgChanged = .{
+                .uuid = self.uuid,
+                .pid = fg_pid orelse 0,
+                .name_len = @intCast(@min(name_str.len, std.math.maxInt(u16))),
+            };
+            const trails = [_][]const u8{name_str[0..fg_msg.name_len]};
+            wire.writeControlMsg(fd, .fg_changed, std.mem.asBytes(&fg_msg), &trails) catch {
+                self.disconnect();
+                return;
+            };
+        }
     }
 
     fn ensureConnected(self: *PodUplink) bool {
-        if (self.conn != null) return true;
+        if (self.fd != null) return true;
 
         const ses_path = core.ipc.getSesSocketPath(self.allocator) catch return false;
         defer self.allocator.free(ses_path);
 
-        var client = core.ipc.Client.connect(ses_path) catch return false;
-        self.conn = client.toConnection();
+        const client = core.ipc.Client.connect(ses_path) catch return false;
+        const fd = client.fd;
 
-        // Best-effort: identify this connection to SES.
-        var buf: [128]u8 = undefined;
-        const hello = std.fmt.bufPrint(&buf, "{{\"type\":\"pod_register\",\"pane_uuid\":\"{s}\"}}", .{self.uuid[0..]}) catch {
-            return true;
+        // Binary handshake: send 0x03 + 16 raw UUID bytes.
+        var handshake: [17]u8 = undefined;
+        handshake[0] = wire.SES_HANDSHAKE_POD_CTL;
+        // Convert 32-char hex UUID to 16 binary bytes.
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            const hi: u8 = hexVal(self.uuid[i * 2]) orelse {
+                posix.close(fd);
+                return false;
+            };
+            const lo: u8 = hexVal(self.uuid[i * 2 + 1]) orelse {
+                posix.close(fd);
+                return false;
+            };
+            handshake[1 + i] = (hi << 4) | lo;
+        }
+        wire.writeAll(fd, &handshake) catch {
+            posix.close(fd);
+            return false;
         };
-        self.conn.?.sendLine(hello) catch {};
+
+        self.fd = fd;
+        debugLog("uplink connected fd={d}", .{fd});
         return true;
+    }
+
+    fn disconnect(self: *PodUplink) void {
+        debugLog("uplink disconnected", .{});
+        if (self.fd) |fd| posix.close(fd);
+        self.fd = null;
+    }
+
+    fn hexVal(ch: u8) ?u8 {
+        if (ch >= '0' and ch <= '9') return ch - '0';
+        if (ch >= 'a' and ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' and ch <= 'F') return ch - 'A' + 10;
+        return null;
     }
 };
 
@@ -264,13 +304,8 @@ pub fn run(args: PodArgs) !void {
         created_alias_path = createAliasSymlink(allocator, args.name.?, args.socket_path) catch null;
     }
 
-    if (args.debug) {
-        if (args.name) |n| {
-            std.debug.print("[pod] started uuid={s} name={s} socket={s}\n", .{ args.uuid[0..@min(args.uuid.len, 8)], n, args.socket_path });
-        } else {
-            std.debug.print("[pod] started uuid={s} socket={s}\n", .{ args.uuid[0..@min(args.uuid.len, 8)], args.socket_path });
-        }
-    }
+    pod_debug = args.debug;
+    debugLog("started uuid={s} socket={s} name={s}", .{ args.uuid[0..@min(args.uuid.len, 8)], args.socket_path, args.name orelse "(none)" });
 
     if (args.emit_ready) {
         // IMPORTANT: write handshake to stdout (ses reads stdout).
@@ -655,16 +690,20 @@ const Pod = struct {
             // Accept new connection.
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 if (self.server.tryAccept() catch null) |conn| {
-                    // Non-blocking peek at first byte to distinguish connection type.
-                    // SHP sends a control frame (type=5) immediately after connecting.
-                    // MUX connects silently and waits for backlog replay.
+                    // Peek first byte to distinguish connection type.
                     var peek_byte: [1]u8 = undefined;
                     const peeked = posix.read(conn.fd, &peek_byte) catch 0;
 
-                    if (peeked > 0 and peek_byte[0] == @intFromEnum(pod_protocol.FrameType.control)) {
-                        // Control frame from SHP - read payload and forward to SES.
-                        self.handleControlConnection(conn, &peek_byte);
+                    if (peeked > 0 and peek_byte[0] == wire.POD_HANDSHAKE_SES_VT) {
+                        // SES VT channel (③) — treat as main client.
+                        debugLog("accept: SES VT client fd={d}", .{conn.fd});
+                        self.acceptVtClient(conn, backlog_tmp);
+                    } else if (peeked > 0 and peek_byte[0] == wire.POD_HANDSHAKE_SHP_CTL) {
+                        // SHP binary control (⑤) — read binary control messages.
+                        debugLog("accept: SHP ctl fd={d}", .{conn.fd});
+                        self.handleBinaryShpConnection(conn);
                     } else if (self.client == null) {
+                        debugLog("accept: legacy client fd={d}", .{conn.fd});
                         // No existing client - this is the main mux connection.
                         setBlocking(conn.fd);
                         self.client = conn;
@@ -806,12 +845,6 @@ const Pod = struct {
                     self.pty.setSize(cols, rows) catch {};
                 }
             },
-            .control => {
-                // Control frame (shell event) - forward to SES.
-                if (frame.payload.len > 0) {
-                    self.forwardToSes(frame.payload);
-                }
-            },
             else => {},
         }
     }
@@ -819,86 +852,82 @@ const Pod = struct {
     /// Handle a control connection from SHP.
     /// Reads the rest of the control frame (header byte already consumed),
     /// extracts the JSON payload, and forwards it to SES.
-    fn handleControlConnection(self: *Pod, conn: core.IpcConnection, first_byte: *const [1]u8) void {
-        _ = first_byte; // Already consumed as type byte
-        var header_rest: [4]u8 = undefined;
-        var header_read: usize = 0;
+    /// Accept a VT client (SES or legacy MUX) — replays backlog, streams output.
+    fn acceptVtClient(self: *Pod, conn: core.IpcConnection, backlog_tmp: []u8) void {
+        debugLog("acceptVtClient: fd={d} replacing={}", .{ conn.fd, self.client != null });
+        // Replace existing client if any.
+        if (self.client) |*old| old.close();
 
-        // Read the 4-byte length (blocking-ish: poll briefly then read).
-        var poll_fd: [1]posix.pollfd = .{.{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 }};
-        _ = posix.poll(&poll_fd, 100) catch {};
-        if (poll_fd[0].revents & posix.POLL.IN == 0) {
+        setBlocking(conn.fd);
+        self.client = conn;
+        self.reader.reset();
+
+        // Replay backlog.
+        const n = self.backlog.copyOut(backlog_tmp);
+        var off: usize = 0;
+        while (off < n) {
+            const chunk = @min(@as(usize, 16 * 1024), n - off);
+            pod_protocol.writeFrame(&self.client.?, .output, backlog_tmp[off .. off + chunk]) catch {};
+            off += chunk;
+        }
+        pod_protocol.writeFrame(&self.client.?, .backlog_end, &[_]u8{}) catch {};
+
+        self.backlog.clear();
+        self.pty_paused = false;
+    }
+
+    /// Handle a binary SHP control connection (channel ⑤).
+    /// Reads one ShpShellEvent from SHP and forwards as binary shell_event on POD uplink.
+    fn handleBinaryShpConnection(self: *Pod, conn: core.IpcConnection) void {
+        debugLog("shp connection fd={d}", .{conn.fd});
+        // Read the binary control header.
+        const hdr = wire.readControlHeader(conn.fd) catch {
+            var tmp = conn;
+            tmp.close();
+            return;
+        };
+
+        const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+        if (msg_type != .shp_shell_event or hdr.payload_len < @sizeOf(wire.ShpShellEvent)) {
             var tmp = conn;
             tmp.close();
             return;
         }
 
-        header_read = posix.read(conn.fd, &header_rest) catch 0;
-        if (header_read < 4) {
+        // Read the fixed struct.
+        const evt = wire.readStruct(wire.ShpShellEvent, conn.fd) catch {
+            var tmp = conn;
+            tmp.close();
+            return;
+        };
+
+        // Read trailing variable data (cmd + cwd).
+        var trail_buf: [8192]u8 = undefined;
+        const trail_len: usize = @as(usize, evt.cmd_len) + @as(usize, evt.cwd_len);
+        if (trail_len > trail_buf.len) {
             var tmp = conn;
             tmp.close();
             return;
         }
-
-        const payload_len = std.mem.readInt(u32, &header_rest, .big);
-        if (payload_len == 0 or payload_len > 8192) {
-            var tmp = conn;
-            tmp.close();
-            return;
-        }
-
-        // Read the JSON payload.
-        var payload_buf: [8192]u8 = undefined;
-        var total: usize = 0;
-        while (total < payload_len) {
-            _ = posix.poll(&poll_fd, 100) catch break;
-            const n = posix.read(conn.fd, payload_buf[total..payload_len]) catch break;
-            if (n == 0) break;
-            total += n;
+        if (trail_len > 0) {
+            wire.readExact(conn.fd, trail_buf[0..trail_len]) catch {
+                var tmp = conn;
+                tmp.close();
+                return;
+            };
         }
 
         var tmp = conn;
         tmp.close();
 
-        if (total < payload_len) return;
-
-        // Forward the shell event to SES with our pane UUID injected.
-        self.forwardToSes(payload_buf[0..payload_len]);
+        // Forward as binary shell_event on the POD uplink (channel ④).
+        if (!self.uplink.ensureConnected()) return;
+        const uplink_fd = self.uplink.fd orelse return;
+        wire.writeControlWithTrail(uplink_fd, .shell_event, std.mem.asBytes(&evt), trail_buf[0..trail_len]) catch {
+            self.uplink.disconnect();
+        };
     }
 
-    /// Forward a JSON control message to SES daemon.
-    /// Connects to ses.sock, sends the message as a JSON line, and closes.
-    fn forwardToSes(self: *Pod, payload: []const u8) void {
-        // Construct ses socket path from the socket directory.
-        const ses_path = core.ipc.getSesSocketPath(self.allocator) catch return;
-        defer self.allocator.free(ses_path);
-
-        var client = core.ipc.Client.connect(ses_path) catch return;
-        defer client.close();
-        var conn = client.toConnection();
-
-        // The payload is already a complete JSON object from SHP.
-        // Inject/override the pane_uuid field to ensure it matches this pod.
-        // Build: {"type":"shell_event","pane_uuid":"<our-uuid>", ...rest of fields}
-        var buf: [8192 + 128]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
-        w.writeAll("{\"type\":\"shell_event\",\"pane_uuid\":\"") catch return;
-        w.writeAll(&self.uuid) catch return;
-        w.writeAll("\"") catch return;
-
-        // Parse the incoming JSON to extract fields (skip the opening brace).
-        // Find first comma after opening brace to append remaining fields.
-        if (std.mem.indexOfScalar(u8, payload, ',')) |comma_idx| {
-            w.writeAll(payload[comma_idx..]) catch return;
-        } else {
-            // No extra fields, just close the object.
-            w.writeAll("}") catch return;
-        }
-
-        const msg = fbs.getWritten();
-        conn.sendLine(msg) catch {};
-    }
 
     fn lastOsc7Cwd(self: *Pod) ?[]const u8 {
         // We do not currently run a VT parser inside the pod process, so

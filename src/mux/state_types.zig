@@ -60,6 +60,5 @@ pub const Tab = struct {
 };
 
 pub const PendingFloatRequest = struct {
-    fd: posix.fd_t,
     result_path: ?[]u8,
 };

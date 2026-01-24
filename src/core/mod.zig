@@ -4,6 +4,7 @@ pub const pty = @import("pty.zig");
 pub const vt = @import("vt.zig");
 pub const config = @import("config.zig");
 pub const ipc = @import("ipc.zig");
+pub const wire = @import("wire.zig");
 pub const pod_protocol = @import("pod_protocol.zig");
 pub const pod_meta = @import("pod_meta.zig");
 pub const lua_runtime = @import("lua_runtime.zig");

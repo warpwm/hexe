@@ -1,10 +1,15 @@
 const std = @import("std");
 const posix = std.posix;
+const core = @import("core");
+const wire = core.wire;
+const pod_protocol = core.pod_protocol;
 
 const terminal = @import("terminal.zig");
 
 const State = @import("state.zig").State;
+const Pane = @import("pane.zig").Pane;
 
+const mux = @import("main.zig");
 const loop_input = @import("loop_input.zig");
 const loop_ipc = @import("loop_ipc.zig");
 const loop_render = @import("loop_render.zig");
@@ -117,45 +122,50 @@ pub fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Build poll list: stdin + all pane PTYs.
+        // Build poll list: stdin + all local pane PTYs.
         var fd_count: usize = 1;
         poll_fds[0] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 };
 
         var pane_it = state.currentLayout().splitIterator();
         while (pane_it.next()) |pane| {
-            if (fd_count < poll_fds.len) {
-                poll_fds[fd_count] = .{ .fd = pane.*.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-                fd_count += 1;
+            if (pane.*.hasPollableFd()) {
+                if (fd_count < poll_fds.len) {
+                    poll_fds[fd_count] = .{ .fd = pane.*.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+                    fd_count += 1;
+                }
             }
         }
 
-        // Add floats.
+        // Add local floats (pod floats get data via VT channel).
         for (state.floats.items) |pane| {
+            if (pane.hasPollableFd()) {
+                if (fd_count < poll_fds.len) {
+                    poll_fds[fd_count] = .{ .fd = pane.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+                    fd_count += 1;
+                }
+            }
+        }
+
+        // Add SES VT channel fd (multiplexed output for all pod panes).
+        var ses_vt_fd_idx: ?usize = null;
+        if (state.ses_client.getVtFd()) |vt_fd| {
             if (fd_count < poll_fds.len) {
-                poll_fds[fd_count] = .{ .fd = pane.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+                ses_vt_fd_idx = fd_count;
+                poll_fds[fd_count] = .{ .fd = vt_fd, .events = posix.POLL.IN, .revents = 0 };
                 fd_count += 1;
             }
         }
 
-        // Add ses connection fd if connected.
+        // Add SES control channel fd (async messages: notifications, shell events).
         var ses_fd_idx: ?usize = null;
-        if (state.ses_client.conn) |conn| {
+        if (state.ses_client.getCtlFd()) |ctl_fd| {
             if (fd_count < poll_fds.len) {
                 ses_fd_idx = fd_count;
-                poll_fds[fd_count] = .{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 };
+                poll_fds[fd_count] = .{ .fd = ctl_fd, .events = posix.POLL.IN, .revents = 0 };
                 fd_count += 1;
             }
         }
 
-        // Add IPC server fd for incoming connections.
-        var ipc_fd_idx: ?usize = null;
-        if (state.ipc_server) |srv| {
-            if (fd_count < poll_fds.len) {
-                ipc_fd_idx = fd_count;
-                poll_fds[fd_count] = .{ .fd = srv.fd, .events = posix.POLL.IN, .revents = 0 };
-                fd_count += 1;
-            }
-        }
 
         // Calculate poll timeout - wait for next frame, status update, or input.
         const now = std.time.milliTimestamp();
@@ -304,17 +314,52 @@ pub fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Handle ses messages.
-        if (ses_fd_idx) |sidx| {
-            if (poll_fds[sidx].revents & posix.POLL.IN != 0) {
-                loop_ipc.handleSesMessage(state, &buffer);
+        // Handle SES VT channel (multiplexed pod output for all pod panes).
+        if (ses_vt_fd_idx) |vidx| {
+            if (poll_fds[vidx].revents & posix.POLL.IN != 0) {
+                const vt_fd = state.ses_client.getVtFd().?;
+                // Read as many frames as available without blocking.
+                var vt_frames: usize = 0;
+                while (vt_frames < 64) : (vt_frames += 1) {
+                    const hdr = wire.readMuxVtHeader(vt_fd) catch break;
+                    if (hdr.len > buffer.len) {
+                        // Frame too large — skip it.
+                        var remaining: usize = hdr.len;
+                        while (remaining > 0) {
+                            const chunk = @min(remaining, buffer.len);
+                            wire.readExact(vt_fd, buffer[0..chunk]) catch break;
+                            remaining -= chunk;
+                        }
+                        continue;
+                    }
+                    if (hdr.len > 0) {
+                        wire.readExact(vt_fd, buffer[0..hdr.len]) catch break;
+                    }
+
+                    if (state.findPaneByPaneId(hdr.pane_id)) |pane| {
+                        if (hdr.frame_type == @intFromEnum(pod_protocol.FrameType.output)) {
+                            mux.debugLog("vt recv: pane_id={d} output len={d}", .{ hdr.pane_id, hdr.len });
+                            pane.feedPodOutput(buffer[0..hdr.len]);
+                            pane.vt.invalidateRenderState();
+                            state.needs_render = true;
+                        } else if (hdr.frame_type == @intFromEnum(pod_protocol.FrameType.backlog_end)) {
+                            mux.debugLog("vt recv: pane_id={d} backlog_end", .{hdr.pane_id});
+                            // Backlog replay finished — force full redraw.
+                            pane.vt.invalidateRenderState();
+                            state.needs_render = true;
+                            state.force_full_render = true;
+                        }
+                    } else {
+                        mux.debugLog("vt recv: unknown pane_id={d}", .{hdr.pane_id});
+                    }
+                }
             }
         }
 
-        // Handle IPC connections (for --notify / ad-hoc floats).
-        if (ipc_fd_idx) |iidx| {
-            if (poll_fds[iidx].revents & posix.POLL.IN != 0) {
-                loop_ipc.handleIpcConnection(state, &buffer);
+        // Handle ses control messages.
+        if (ses_fd_idx) |sidx| {
+            if (poll_fds[sidx].revents & posix.POLL.IN != 0) {
+                loop_ipc.handleSesMessage(state, &buffer);
             }
         }
 
