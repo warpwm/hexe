@@ -316,28 +316,10 @@ pub const State = struct {
     }
 
     pub fn deinit(self: *State) void {
-        // Determine whether panes should be preserved for reattach.
-        // When keepalive is true (default), closing the terminal should behave
-        // like a detach: panes stay alive in ses for later reattach.
-        // When keepalive is false, panes are killed on exit.
-        const preserve_for_reattach = !self.detach_mode and self.ses_client.isConnected() and self.ses_client.keepalive;
-        const should_kill_panes = !self.detach_mode and self.ses_client.isConnected() and !self.ses_client.keepalive;
-
-        if (preserve_for_reattach) {
-            // Sync latest state to ses so the detached session has current layout.
-            // ses uses client.last_mux_state when auto-detaching on disconnect.
-            self.syncStateToSes();
-        }
-
+        // When exiting normally (not detach), tell SES to kill our panes.
+        // When detaching, panes stay alive for later reattach.
         if (!self.detach_mode and self.ses_client.isConnected()) {
-            // Persist sticky float metadata.
-            for (self.floats.items) |pane| {
-                if (pane.sticky and pane.float_key != 0) {
-                    if (pane.getPwd()) |cwd| {
-                        self.ses_client.setSticky(pane.uuid, cwd, pane.float_key) catch {};
-                    }
-                }
-            }
+            self.ses_client.shutdown(false) catch {};
         }
 
         // Free shell metadata.
@@ -362,32 +344,12 @@ pub const State = struct {
 
         // Deinit floats.
         for (self.floats.items) |pane| {
-            if (should_kill_panes) {
-                if (pane.sticky) {
-                    if (pane.float_key != 0) {
-                        if (pane.getPwd()) |cwd| {
-                            self.ses_client.setSticky(pane.uuid, cwd, pane.float_key) catch {};
-                        }
-                    }
-                    self.ses_client.orphanPane(pane.uuid) catch {};
-                } else {
-                    self.ses_client.killPane(pane.uuid) catch {};
-                }
-            }
-            // When preserve_for_reattach: do nothing. All floats (sticky or not)
-            // stay in client.pane_uuids so ses includes them in the detached session.
             pane.deinit();
             self.allocator.destroy(pane);
         }
         self.floats.deinit(self.allocator);
 
         for (self.tabs.items) |*tab| {
-            if (should_kill_panes) {
-                var pane_it = tab.layout.splits.valueIterator();
-                while (pane_it.next()) |pane_ptr| {
-                    self.ses_client.killPane(pane_ptr.*.uuid) catch {};
-                }
-            }
             tab.deinit();
         }
         self.tabs.deinit(self.allocator);

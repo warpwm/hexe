@@ -25,6 +25,7 @@ const Backend = union(enum) {
     pod: struct {
         pane_id: u16,
         vt_fd: posix.fd_t, // shared MUX VT channel fd
+        dead: bool = false,
     },
 };
 
@@ -769,7 +770,7 @@ pub const Pane = struct {
                 }
                 break :blk true;
             },
-            .pod => true,
+            .pod => |pod| !pod.dead,
         };
     }
 

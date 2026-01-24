@@ -48,6 +48,9 @@ pub fn handleSesMessage(state: *State, buffer: []u8) void {
         .float_request => {
             handleFloatRequest(state, fd, hdr.payload_len, buffer);
         },
+        .pane_exited => {
+            handlePaneExited(state, fd, hdr.payload_len, buffer);
+        },
         else => {
             // Unknown message — skip payload.
             skipPayload(fd, hdr.payload_len, buffer);
@@ -572,6 +575,41 @@ fn handleFloatRequest(state: *State, fd: posix.fd_t, payload_len: u32, buffer: [
         const stored_path = if (result_path_slice.len > 0) state.allocator.dupe(u8, result_path_slice) catch null else null;
         state.pending_float_requests.put(new_uuid, .{ .result_path = stored_path }) catch {};
     }
+}
+
+fn handlePaneExited(state: *State, fd: posix.fd_t, payload_len: u32, buffer: []u8) void {
+    if (payload_len < @sizeOf(wire.PaneUuid)) {
+        skipPayload(fd, payload_len, buffer);
+        return;
+    }
+    const pu = wire.readStruct(wire.PaneUuid, fd) catch return;
+    mux.debugLog("pane_exited: uuid={s}", .{pu.uuid[0..8]});
+
+    // Mark the pane as dead in all tabs and floats.
+    for (state.tabs.items) |*tab| {
+        var it = tab.layout.splits.valueIterator();
+        while (it.next()) |pane_ptr| {
+            if (std.mem.eql(u8, &pane_ptr.*.uuid, &pu.uuid)) {
+                switch (pane_ptr.*.backend) {
+                    .pod => |*pod| {
+                        pod.dead = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+    for (state.floats.items) |pane| {
+        if (std.mem.eql(u8, &pane.uuid, &pu.uuid)) {
+            switch (pane.backend) {
+                .pod => |*pod| {
+                    pod.dead = true;
+                },
+                else => {},
+            }
+        }
+    }
+    state.needs_render = true;
 }
 
 fn skipPayload(fd: posix.fd_t, len: u32, buffer: []u8) void {

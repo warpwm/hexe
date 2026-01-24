@@ -419,15 +419,29 @@ pub const Server = struct {
 
     fn removePodVtFd(self: *Server, fd: posix.fd_t) void {
         ses.debugLog("remove pod_vt fd={d}", .{fd});
-        if (self.ses_state.pod_vt_to_pane_id.fetchRemove(fd)) |kv| {
+        const pane_id = if (self.ses_state.pod_vt_to_pane_id.fetchRemove(fd)) |kv| blk: {
             _ = self.ses_state.pane_id_to_pod_vt.remove(kv.value);
-        }
-        // Clear from pane.
-        var pane_iter = self.ses_state.panes.valueIterator();
-        while (pane_iter.next()) |pane| {
+            break :blk kv.value;
+        } else null;
+
+        // Clear from pane and notify MUX.
+        var pane_iter = self.ses_state.panes.iterator();
+        while (pane_iter.next()) |entry| {
+            const pane = entry.value_ptr;
             if (pane.pod_vt_fd) |vt_fd| {
                 if (vt_fd == fd) {
                     @constCast(pane).pod_vt_fd = null;
+                    // Notify the owning MUX that this pane exited.
+                    if (pane.attached_to) |client_id| {
+                        if (self.ses_state.getClient(client_id)) |client| {
+                            if (client.mux_ctl_fd) |ctl_fd| {
+                                const uuid = entry.key_ptr.*;
+                                ses.debugLog("pane_exited: uuid={s} pane_id={?d}", .{ uuid[0..8], pane_id });
+                                var msg = wire.PaneUuid{ .uuid = uuid };
+                                wire.writeControl(ctl_fd, .pane_exited, std.mem.asBytes(&msg)) catch {};
+                            }
+                        }
+                    }
                     return;
                 }
             }

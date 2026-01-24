@@ -363,6 +363,16 @@ pub fn runMainLoop(state: *State) !void {
             }
         }
 
+        // Check for dead pod panes (no per-pane fd to detect HUP).
+        {
+            var pod_pane_it = state.currentLayout().splitIterator();
+            while (pod_pane_it.next()) |pane| {
+                if (!pane.*.hasPollableFd() and !pane.*.isAlive()) {
+                    dead_splits.append(allocator, pane.*.id) catch {};
+                }
+            }
+        }
+
         // Handle stdin.
         if (poll_fds[0].revents & posix.POLL.IN != 0) {
             const n = posix.read(posix.STDIN_FILENO, &buffer) catch break;

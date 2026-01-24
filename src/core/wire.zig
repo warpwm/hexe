@@ -76,6 +76,7 @@ pub const MsgType = enum(u16) {
     float_request = 0x012C,
     float_created = 0x012D,
     float_result = 0x012E,
+    pane_exited = 0x012F,
 
     // Channel ④ — POD → SES control
     cwd_changed = 0x0400,
