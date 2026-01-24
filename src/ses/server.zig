@@ -75,6 +75,16 @@ pub const Server = struct {
                 self.ses_state.dirty = false;
                 last_save = now_ms;
             }
+            // Add any newly created pod_vt fds to the poll set.
+            for (self.ses_state.pending_poll_fds.items) |new_fd| {
+                poll_fds.append(page_alloc, .{
+                    .fd = new_fd,
+                    .events = posix.POLL.IN,
+                    .revents = 0,
+                }) catch {};
+            }
+            self.ses_state.pending_poll_fds.clearRetainingCapacity();
+
             // Reset revents
             for (poll_fds.items) |*pfd| {
                 pfd.revents = 0;
@@ -178,8 +188,6 @@ pub const Server = struct {
     }
 
     /// Dispatch a newly accepted connection based on its first (handshake) byte.
-    /// Binary protocol connections send a handshake byte immediately.
-    /// Legacy JSON connections start with '{' (0x7B).
     fn dispatchNewConnection(self: *Server, conn: ipc.Connection, alloc: std.mem.Allocator, poll_fds: *std.ArrayList(posix.pollfd)) void {
         // Non-blocking peek at first byte.
         var peek: [1]u8 = undefined;

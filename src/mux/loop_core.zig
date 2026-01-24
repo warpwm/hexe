@@ -321,7 +321,7 @@ pub fn runMainLoop(state: *State) !void {
                 // Read as many frames as available without blocking.
                 var vt_frames: usize = 0;
                 while (vt_frames < 64) : (vt_frames += 1) {
-                    const hdr = wire.readMuxVtHeader(vt_fd) catch break;
+                    const hdr = wire.tryReadMuxVtHeader(vt_fd) catch break;
                     if (hdr.len > buffer.len) {
                         // Frame too large — skip it.
                         var remaining: usize = hdr.len;

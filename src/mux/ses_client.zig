@@ -43,35 +43,39 @@ pub const SesClient = struct {
     }
 
     /// Connect to the ses daemon, starting it if necessary.
-    /// Opens two channels: control (0x01) and VT (0x02).
+    /// Opens CTL channel, registers, then opens VT channel.
     pub fn connect(self: *SesClient) !void {
         const socket_path = try core.ipc.getSesSocketPath(self.allocator);
         defer self.allocator.free(socket_path);
 
         // Try to connect to existing daemon first
-        if (self.connectChannels(socket_path)) {
+        if (self.connectCtl(socket_path)) {
             self.just_started_daemon = false;
-            try self.register();
-            return;
+        } else {
+            // Daemon not running, start it
+            try self.startSes();
+            self.just_started_daemon = true;
+
+            // Wait for daemon to be ready
+            std.Thread.sleep(200 * std.time.ns_per_ms);
+
+            // Retry connection
+            if (!self.connectCtl(socket_path)) {
+                return error.ConnectionRefused;
+            }
         }
 
-        // Daemon not running, start it
-        try self.startSes();
-        self.just_started_daemon = true;
+        // Register on CTL channel first, so SES knows our session_id.
+        try self.register();
 
-        // Wait for daemon to be ready
-        std.Thread.sleep(200 * std.time.ns_per_ms);
-
-        // Retry connection
-        if (!self.connectChannels(socket_path)) {
+        // Now open VT channel — SES can match our session_id.
+        if (!self.connectVt(socket_path)) {
             return error.ConnectionRefused;
         }
-        try self.register();
     }
 
-    /// Open both channels to SES.
-    fn connectChannels(self: *SesClient, socket_path: []const u8) bool {
-        // Channel 1: Control (0x01)
+    /// Open the control channel to SES.
+    fn connectCtl(self: *SesClient, socket_path: []const u8) bool {
         const ctl_client = core.ipc.Client.connect(socket_path) catch return false;
         const ctl_fd = ctl_client.fd;
         const ctl_handshake = [_]u8{wire.SES_HANDSHAKE_MUX_CTL};
@@ -79,29 +83,39 @@ pub const SesClient = struct {
             posix.close(ctl_fd);
             return false;
         };
+        self.ctl_fd = ctl_fd;
+        mux.debugLog("ses ctl connected: fd={d}", .{ctl_fd});
+        return true;
+    }
 
-        // Channel 2: VT (0x02) + 32-byte session_id
-        const vt_client = core.ipc.Client.connect(socket_path) catch {
-            posix.close(ctl_fd);
+    /// Open the VT data channel to SES.
+    fn connectVt(self: *SesClient, socket_path: []const u8) bool {
+        const vt_client = core.ipc.Client.connect(socket_path) catch return false;
+        const vt_fd = vt_client.fd;
+
+        // Set non-blocking — the VT fd is polled in the event loop, must not block.
+        const O_NONBLOCK: usize = 0o4000;
+        const flags = posix.fcntl(vt_fd, posix.F.GETFL, 0) catch {
+            posix.close(vt_fd);
             return false;
         };
-        const vt_fd = vt_client.fd;
+        _ = posix.fcntl(vt_fd, posix.F.SETFL, flags | O_NONBLOCK) catch {
+            posix.close(vt_fd);
+            return false;
+        };
+
         const vt_handshake = [_]u8{wire.SES_HANDSHAKE_MUX_VT};
         wire.writeAll(vt_fd, &vt_handshake) catch {
-            posix.close(ctl_fd);
             posix.close(vt_fd);
             return false;
         };
-        // Send 32-byte hex session_id so SES can identify us.
+        // Send 32-byte hex session_id so SES can match us to the registered client.
         wire.writeAll(vt_fd, &self.session_id) catch {
-            posix.close(ctl_fd);
             posix.close(vt_fd);
             return false;
         };
-
-        self.ctl_fd = ctl_fd;
         self.vt_fd = vt_fd;
-        mux.debugLog("ses channels connected: ctl_fd={d} vt_fd={d}", .{ ctl_fd, vt_fd });
+        mux.debugLog("ses vt connected: fd={d}", .{vt_fd});
         return true;
     }
 

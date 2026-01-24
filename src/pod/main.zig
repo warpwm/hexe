@@ -161,25 +161,6 @@ fn optIntEql(comptime T: type, a: ?T, b: ?T) bool {
     return a.? == b.?;
 }
 
-fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (ch < 0x20) {
-                    try writer.writeByte(' ');
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
-        }
-    }
-}
-
 fn readProcCwd(allocator: std.mem.Allocator, pid: posix.pid_t) !?[]u8 {
     if (pid <= 0) return null;
     var path_buf: [64]u8 = undefined;
@@ -582,7 +563,6 @@ const Pod = struct {
     client: ?core.IpcConnection = null,
     backlog: RingBuffer,
     reader: pod_protocol.Reader,
-    input_reader: pod_protocol.Reader,
     pty_paused: bool = false,
 
     uplink: PodUplink,
@@ -615,9 +595,6 @@ const Pod = struct {
         var reader = try pod_protocol.Reader.init(allocator, pod_protocol.MAX_FRAME_LEN);
         errdefer reader.deinit(allocator);
 
-        var input_reader = try pod_protocol.Reader.init(allocator, pod_protocol.MAX_FRAME_LEN);
-        errdefer input_reader.deinit(allocator);
-
         return .{
             .allocator = allocator,
             .uuid = uuid,
@@ -625,7 +602,6 @@ const Pod = struct {
             .server = server,
             .backlog = backlog,
             .reader = reader,
-            .input_reader = input_reader,
             .uplink = PodUplink.init(allocator, uuid),
         };
     }
@@ -638,7 +614,6 @@ const Pod = struct {
         self.pty.close();
         self.backlog.deinit(self.allocator);
         self.reader.deinit(self.allocator);
-        self.input_reader.deinit(self.allocator);
         self.uplink.deinit();
     }
 
@@ -646,7 +621,7 @@ const Pod = struct {
         var poll_fds: [3]posix.pollfd = undefined;
         var buf = try self.allocator.alloc(u8, pod_protocol.MAX_FRAME_LEN);
         defer self.allocator.free(buf);
-        var backlog_tmp = try self.allocator.alloc(u8, pod_protocol.MAX_FRAME_LEN);
+        const backlog_tmp = try self.allocator.alloc(u8, pod_protocol.MAX_FRAME_LEN);
         defer self.allocator.free(backlog_tmp);
 
         var last_meta_ms: i64 = 0;
@@ -702,50 +677,13 @@ const Pod = struct {
                         // SHP binary control (⑤) — read binary control messages.
                         debugLog("accept: SHP ctl fd={d}", .{conn.fd});
                         self.handleBinaryShpConnection(conn);
-                    } else if (self.client == null) {
-                        debugLog("accept: legacy client fd={d}", .{conn.fd});
-                        // No existing client - this is the main mux connection.
-                        setBlocking(conn.fd);
-                        self.client = conn;
-
-                        // Reset the frame reader to discard any partial state left
-                        // from the previous connection.
-                        self.reader.reset();
-
-                        // If we peeked a byte (unusual - MUX sent before backlog),
-                        // feed it to the reader.
-                        if (peeked > 0) {
-                            self.reader.feed(peek_byte[0..1], @ptrCast(self), podFrameCallback);
-                        }
-
-                        // Replay backlog.
-                        const n = self.backlog.copyOut(backlog_tmp);
-                        var off: usize = 0;
-                        while (off < n) {
-                            const chunk = @min(@as(usize, 16 * 1024), n - off);
-                            pod_protocol.writeFrame(&self.client.?, .output, backlog_tmp[off .. off + chunk]) catch {};
-                            off += chunk;
-                        }
-                        pod_protocol.writeFrame(&self.client.?, .backlog_end, &[_]u8{}) catch {};
-
-                        // Backlog has been delivered. Clear it so we can resume
-                        // capturing new output without dropping.
-                        self.backlog.clear();
-                        self.pty_paused = false;
+                    } else if (peeked > 0 and peek_byte[0] == wire.POD_HANDSHAKE_AUX_INPUT) {
+                        // Auxiliary input (e.g., hexe pod send) — inject frames without replacing client.
+                        debugLog("accept: aux input fd={d}", .{conn.fd});
+                        self.handleAuxInput(conn);
                     } else {
-                        // Aux binary input connection (e.g., hexe mux send).
-                        var input_buf: [4096]u8 = undefined;
-                        var total: usize = 0;
-                        if (peeked > 0) {
-                            input_buf[0] = peek_byte[0];
-                            total = 1;
-                        }
-                        const n = posix.read(conn.fd, input_buf[total..]) catch 0;
-                        total += n;
-                        if (total > 0) {
-                            self.input_reader.reset();
-                            self.input_reader.feed(input_buf[0..total], @ptrCast(self), podFrameCallback);
-                        }
+                        // Unknown handshake — reject.
+                        debugLog("accept: unknown handshake 0x{x:0>2} fd={d}", .{ if (peeked > 0) peek_byte[0] else @as(u8, 0), conn.fd });
                         var tmp_conn = conn;
                         tmp_conn.close();
                     }
@@ -849,10 +787,7 @@ const Pod = struct {
         }
     }
 
-    /// Handle a control connection from SHP.
-    /// Reads the rest of the control frame (header byte already consumed),
-    /// extracts the JSON payload, and forwards it to SES.
-    /// Accept a VT client (SES or legacy MUX) — replays backlog, streams output.
+    /// Accept a VT client — replays backlog, then streams live output.
     fn acceptVtClient(self: *Pod, conn: core.IpcConnection, backlog_tmp: []u8) void {
         debugLog("acceptVtClient: fd={d} replacing={}", .{ conn.fd, self.client != null });
         // Replace existing client if any.
@@ -928,6 +863,41 @@ const Pod = struct {
         };
     }
 
+    /// Handle auxiliary input connection (e.g., `hexe pod send`).
+    /// Reads pod_protocol frames and writes input directly to the PTY
+    /// without replacing the main VT client.
+    fn handleAuxInput(self: *Pod, conn: core.IpcConnection) void {
+        setBlocking(conn.fd);
+        var buf: [4096]u8 = undefined;
+        // Read available data and parse frames.
+        const n = posix.read(conn.fd, &buf) catch {
+            var tmp = conn;
+            tmp.close();
+            return;
+        };
+        if (n > 0) {
+            // Parse pod_protocol frames from the data.
+            var off: usize = 0;
+            while (off + 5 <= n) {
+                const frame_type_byte = buf[off];
+                const payload_len = std.mem.readInt(u32, buf[off + 1 ..][0..4], .big);
+                off += 5;
+                if (payload_len > n - off) break;
+                if (frame_type_byte == @intFromEnum(pod_protocol.FrameType.input)) {
+                    _ = self.pty.write(buf[off .. off + payload_len]) catch {};
+                } else if (frame_type_byte == @intFromEnum(pod_protocol.FrameType.resize)) {
+                    if (payload_len >= 4) {
+                        const cols = std.mem.readInt(u16, buf[off..][0..2], .big);
+                        const rows = std.mem.readInt(u16, buf[off + 2 ..][0..4][0..2], .big);
+                        self.pty.setSize(cols, rows) catch {};
+                    }
+                }
+                off += payload_len;
+            }
+        }
+        var tmp = conn;
+        tmp.close();
+    }
 
     fn lastOsc7Cwd(self: *Pod) ?[]const u8 {
         // We do not currently run a VT parser inside the pod process, so

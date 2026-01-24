@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core");
 const ipc = core.ipc;
+const wire = core.wire;
 const pod_protocol = core.pod_protocol;
 const tty = @import("tty.zig");
 
@@ -26,6 +27,10 @@ pub fn runPodAttach(
         return err;
     };
     defer client.close();
+
+    // Send handshake byte to identify as VT client.
+    const handshake = [_]u8{wire.POD_HANDSHAKE_SES_VT};
+    wire.writeAll(client.fd, &handshake) catch return;
 
     var conn = client.toConnection();
 

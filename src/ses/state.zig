@@ -280,6 +280,8 @@ pub const SesState = struct {
     next_pane_id: u16 = 1,
     pane_id_to_pod_vt: std.AutoHashMap(u16, posix.fd_t),
     pod_vt_to_pane_id: std.AutoHashMap(posix.fd_t, u16),
+    /// Fds that need to be added to the server poll set (populated by connectPodVt).
+    pending_poll_fds: std.ArrayList(posix.fd_t),
 
     pub fn init(_: std.mem.Allocator) SesState {
         // Always use page_allocator to avoid GPA issues after fork/daemonization
@@ -294,6 +296,7 @@ pub const SesState = struct {
             .dirty = false,
             .pane_id_to_pod_vt = std.AutoHashMap(u16, posix.fd_t).init(page_alloc),
             .pod_vt_to_pane_id = std.AutoHashMap(posix.fd_t, u16).init(page_alloc),
+            .pending_poll_fds = .empty,
         };
     }
 
@@ -332,6 +335,9 @@ pub const SesState = struct {
         // Populate routing tables.
         self.pane_id_to_pod_vt.put(pane_id, fd) catch {};
         self.pod_vt_to_pane_id.put(fd, pane_id) catch {};
+
+        // Queue fd for poll set addition by the server loop.
+        self.pending_poll_fds.append(self.allocator, fd) catch {};
 
         ses.debugLog("connectPodVt: pane_id={d} fd={d}", .{ pane_id, fd });
     }

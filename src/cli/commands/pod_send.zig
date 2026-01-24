@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core");
 const ipc = core.ipc;
+const wire = core.wire;
 const pod_protocol = core.pod_protocol;
 const pod_meta = core.pod_meta;
 
@@ -58,6 +59,10 @@ pub fn runPodSend(
         return err;
     };
     defer client.close();
+
+    // Send handshake byte for auxiliary input.
+    const handshake = [_]u8{wire.POD_HANDSHAKE_AUX_INPUT};
+    wire.writeAll(client.fd, &handshake) catch return;
 
     var conn = client.toConnection();
     try pod_protocol.writeFrame(&conn, .input, data_buf[0..data_len]);

@@ -28,8 +28,8 @@ const Backend = union(enum) {
     },
 };
 
-/// A Pane is a ghostty VT that receives bytes from either a local PTY
-/// (legacy mode) or via the SES VT channel (pod-backed, persistent scrollback).
+/// A Pane is a ghostty VT that receives bytes via the SES VT channel
+/// (pod-backed, persistent scrollback).
 pub const Pane = struct {
     allocator: std.mem.Allocator = undefined,
     id: u16 = 0,

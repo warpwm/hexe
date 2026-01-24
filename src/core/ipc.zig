@@ -128,40 +128,6 @@ pub const Connection = struct {
         }
     }
 
-    /// Receive data without file descriptor
-    pub fn recv(self: *Connection, buf: []u8) !usize {
-        return posix.read(self.fd, buf);
-    }
-
-    /// Send a line (data + newline)
-    pub fn sendLine(self: *Connection, data: []const u8) !void {
-        try self.send(data);
-        try self.send("\n");
-    }
-
-    /// Receive a line (up to newline, newline not included in result)
-    pub fn recvLine(self: *Connection, buf: []u8) !?[]const u8 {
-        var i: usize = 0;
-        while (i < buf.len) {
-            const n = posix.read(self.fd, buf[i .. i + 1]) catch |err| {
-                if (err == error.WouldBlock) {
-                    if (i == 0) return null;
-                    continue;
-                }
-                return err;
-            };
-            if (n == 0) {
-                if (i == 0) return null;
-                return buf[0..i];
-            }
-            if (buf[i] == '\n') {
-                return buf[0..i];
-            }
-            i += 1;
-        }
-        return buf[0..i];
-    }
-
     /// Send data along with a file descriptor using SCM_RIGHTS
     pub fn sendWithFd(self: *Connection, data: []const u8, fd_to_send: posix.fd_t) !void {
         var iov: c.struct_iovec = .{
@@ -407,13 +373,6 @@ pub fn isSesRunning(allocator: std.mem.Allocator) bool {
     var client = Client.connect(path) catch return false;
     client.close();
     return true;
-}
-
-/// Get a mux socket path for a given UUID
-pub fn getMuxSocketPath(allocator: std.mem.Allocator, uuid: []const u8) ![]const u8 {
-    const dir = try getSocketDir(allocator);
-    defer allocator.free(dir);
-    return std.fmt.allocPrint(allocator, "{s}/mux-{s}.sock", .{ dir, uuid });
 }
 
 /// Get a pod socket path for a given pane UUID

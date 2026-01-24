@@ -20,6 +20,8 @@ pub const SES_HANDSHAKE_CLI: u8 = 0x04;
 pub const POD_HANDSHAKE_SES_VT: u8 = 0x01;
 /// Sent by SHP to POD to open the shell control channel (⑤).
 pub const POD_HANDSHAKE_SHP_CTL: u8 = 0x02;
+/// Sent by CLI tools (pod send/attach) for auxiliary input (no backlog, no replace).
+pub const POD_HANDSHAKE_AUX_INPUT: u8 = 0x03;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Control message types — carried inside ControlHeader on channels ①④⑤.
@@ -607,6 +609,26 @@ pub fn writeMuxVt(fd: posix.fd_t, pane_id: u16, frame_type: u8, payload: []const
 pub fn readMuxVtHeader(fd: posix.fd_t) !MuxVtHeader {
     var buf: [@sizeOf(MuxVtHeader)]u8 = undefined;
     try readExact(fd, &buf);
+    return std.mem.bytesToValue(MuxVtHeader, &buf);
+}
+
+/// Non-blocking variant: returns error.WouldBlock if no data available.
+/// Once the first byte arrives, spin-waits for the remaining header bytes.
+pub fn tryReadMuxVtHeader(fd: posix.fd_t) !MuxVtHeader {
+    var buf: [@sizeOf(MuxVtHeader)]u8 = undefined;
+    // First byte: propagate WouldBlock (no frame available).
+    const first = posix.read(fd, buf[0..1]) catch |err| return err;
+    if (first == 0) return error.ConnectionClosed;
+    // Remaining bytes: spin-wait (frame is in-flight from SES).
+    var off: usize = 1;
+    while (off < buf.len) {
+        const n = posix.read(fd, buf[off..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 0) return error.ConnectionClosed;
+        off += n;
+    }
     return std.mem.bytesToValue(MuxVtHeader, &buf);
 }
 
