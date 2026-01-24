@@ -1,30 +1,34 @@
 const std = @import("std");
 const posix = std.posix;
+const core = @import("core");
+const lua_runtime = core.lua_runtime;
+const LuaRuntime = core.LuaRuntime;
 const segment = @import("segment.zig");
 const segments_mod = @import("segments/mod.zig");
 const Style = @import("style.zig").Style;
 
-// JSON structures for config parsing
-const JsonOutput = struct {
-    style: ?[]const u8 = null,
-    format: ?[]const u8 = null,
+const bash_init = @import("shell/bash.zig");
+const zsh_init = @import("shell/zsh.zig");
+const fish_init = @import("shell/fish.zig");
+
+// Config structures for Lua parsing
+const OutputDef = struct {
+    style: []const u8,
+    format: []const u8,
 };
 
-const JsonModule = struct {
+const ModuleDef = struct {
     name: []const u8,
-    priority: ?i64 = null,
-    outputs: ?[]const JsonOutput = null,
-    command: ?[]const u8 = null,
-    when: ?[]const u8 = null,
+    priority: i64,
+    outputs: []const OutputDef,
+    command: ?[]const u8,
+    when: ?core.WhenDef,
 };
 
-const JsonPrompt = struct {
-    left: ?[]const JsonModule = null,
-    right: ?[]const JsonModule = null,
-};
-
-const JsonConfig = struct {
-    prompt: ?JsonPrompt = null,
+const ShpConfig = struct {
+    left: []const ModuleDef,
+    right: []const ModuleDef,
+    has_config: bool,
 };
 
 /// Arguments for shp commands
@@ -37,6 +41,11 @@ pub const PopArgs = struct {
     right: bool = false,
     shell: ?[]const u8 = null,
     jobs: i64 = 0,
+
+    // shell-event extended fields
+    shell_phase: ?[]const u8 = null,
+    shell_running: bool = false,
+    shell_started_at: i64 = 0,
 };
 
 /// Entry point for shp - can be called directly from unified CLI
@@ -141,242 +150,11 @@ fn printInit(shell: []const u8, no_comms: bool) !void {
     const stdout = std.fs.File.stdout();
 
     if (std.mem.eql(u8, shell, "bash")) {
-        try stdout.writeAll(
-            \\# Hexe prompt initialization for Bash
-            \\__shp_precmd() {
-            \\    local exit_status=$?
-            \\    local duration=0
-            \\    if [[ -n "$__shp_start" ]]; then
-            \\        duration=$(( $(date +%s%3N) - __shp_start ))
-            \\    fi
-            \\    PS1="$(hexe shp prompt --status=$exit_status --duration=$duration --jobs=$(jobs -p 2>/dev/null | wc -l)) "
-            \\    unset __shp_start
-            \\}
-            \\
-            \\__shp_preexec() {
-            \\    __shp_start=$(date +%s%3N)
-            \\}
-            \\
-            \\trap '__shp_preexec' DEBUG
-            \\PROMPT_COMMAND="__shp_precmd"
-            \\
-        );
-
-        if (!no_comms) {
-            try stdout.writeAll(
-                \\# Hexe shell->mux communication hooks (Bash)
-                \\__hexe_exit_intent() {
-                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || return 0
-                \\    hexe com exit-intent >/dev/null 2>/dev/null
-                \\    return $?
-                \\}
-                \\
-                \\__hexe_preexec() {
-                \\    __hexe_start=$(date +%s%3N)
-                \\}
-                \\
-                \\__hexe_precmd() {
-                \\    local exit_status=$?
-                \\    local duration=0
-                \\    if [[ -n "$__hexe_start" ]]; then
-                \\        duration=$(( $(date +%s%3N) - __hexe_start ))
-                \\    fi
-                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || { unset __hexe_start; return 0; }
-                \\    # OSC 7 cwd sync
-                \\    printf '\\e]7;file://%s%s\\a' "${HOSTNAME:-localhost}" "$PWD" 2>/dev/null
-                \\    local hist="$(history 1 2>/dev/null)"
-                \\    local cmd="$hist"
-                \\    if [[ $hist =~ ^[[:space:]]*[0-9]+[[:space:]]*(.*)$ ]]; then
-                \\        cmd="${BASH_REMATCH[1]}"
-                \\    fi
-                \\    local jobs_count=$(jobs -p 2>/dev/null | wc -l)
-                \\    hexe com shell-event --cmd="$cmd" --status=$exit_status --duration=$duration --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
-                \\    unset __hexe_start
-                \\}
-                \\
-                \\exit() {
-                \\    case $- in *i*) ;; *) builtin exit "$@" ;; esac
-                \\    __hexe_exit_intent || return 0
-                \\    builtin exit "$@"
-                \\}
-                \\
-                \\logout() {
-                \\    case $- in *i*) ;; *) builtin logout "$@" ;; esac
-                \\    __hexe_exit_intent || return 0
-                \\    builtin logout "$@"
-                \\}
-                \\
-                \\__hexe_ctrl_d() {
-                \\    if [[ -z "$READLINE_LINE" ]]; then
-                \\        __hexe_exit_intent || { READLINE_LINE=""; READLINE_POINT=0; return; }
-                \\        builtin exit
-                \\    fi
-                \\}
-                \\
-                \\bind -x '"\C-d":__hexe_ctrl_d'
-                \\
-                \\# Extend existing timing hooks with comms.
-                \\PROMPT_COMMAND="__shp_precmd;__hexe_precmd"
-                \\trap '__shp_preexec;__hexe_preexec' DEBUG
-                \\
-            );
-        }
+        try bash_init.printInit(stdout, no_comms);
     } else if (std.mem.eql(u8, shell, "zsh")) {
-        try stdout.writeAll(
-            \\# Hexe prompt initialization for Zsh
-            \\__shp_precmd() {
-            \\    local exit_status=$?
-            \\    local duration=0
-            \\    if [[ -n "$__shp_start" ]]; then
-            \\        duration=$(( $(date +%s%3N) - __shp_start ))
-            \\    fi
-            \\    PROMPT="$(hexe shp prompt --shell=zsh --status=$exit_status --duration=$duration --jobs=${(M)#jobstates}) "
-            \\    RPROMPT="$(hexe shp prompt --shell=zsh --right --status=$exit_status)"
-            \\    unset __shp_start
-            \\}
-            \\
-            \\__shp_preexec() {
-            \\    __shp_start=$(date +%s%3N)
-            \\}
-            \\
-            \\autoload -Uz add-zsh-hook
-            \\add-zsh-hook precmd __shp_precmd
-            \\add-zsh-hook preexec __shp_preexec
-            \\ZLE_RPROMPT_INDENT=0
-            \\
-        );
-
-        if (!no_comms) {
-            try stdout.writeAll(
-                \\# Hexe shell->mux communication hooks (Zsh)
-                \\__hexe_last_cmd=""
-                \\__hexe_start=""
-                \\
-                \\__hexe_exit_intent() {
-                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || return 0
-                \\    hexe com exit-intent >/dev/null 2>/dev/null
-                \\    return $?
-                \\}
-                \\
-                \\__hexe_preexec_capture() {
-                \\    __hexe_last_cmd="$1"
-                \\    __hexe_start=$(date +%s%3N)
-                \\}
-                \\
-                \\__hexe_precmd_send() {
-                \\    local exit_status=$?
-                \\    local duration=0
-                \\    if [[ -n "$__hexe_start" ]]; then
-                \\        duration=$(( $(date +%s%3N) - __hexe_start ))
-                \\    fi
-                \\    [[ -n "$HEXE_MUX_SOCKET" && -n "$HEXE_PANE_UUID" ]] || { unset __hexe_start; return 0; }
-                \\    # OSC 7 cwd sync
-                \\    printf '\\e]7;file://%s%s\\a' "${HOST:-localhost}" "$PWD" 2>/dev/null
-                \\    hexe com shell-event --cmd="$__hexe_last_cmd" --status=$exit_status --duration=$duration --cwd="$PWD" --jobs=${(M)#jobstates} >/dev/null 2>/dev/null
-                \\    unset __hexe_start
-                \\}
-                \\
-                \\__hexe_accept_line() {
-                \\    if [[ "$BUFFER" == "exit" || "$BUFFER" == "logout" ]]; then
-                \\        __hexe_exit_intent || { BUFFER=""; zle reset-prompt; return 0; }
-                \\    fi
-                \\    zle .accept-line
-                \\}
-                \\zle -N accept-line __hexe_accept_line
-                \\
-                \\__hexe_ctrl_d() {
-                \\    if [[ -z "$BUFFER" ]]; then
-                \\        __hexe_exit_intent || { BUFFER=""; zle reset-prompt; return 0; }
-                \\        zle .send-eof
-                \\        return
-                \\    fi
-                \\    zle .delete-char
-                \\}
-                \\zle -N __hexe_ctrl_d
-                \\bindkey '^D' __hexe_ctrl_d
-                \\
-                \\autoload -Uz add-zsh-hook
-                \\add-zsh-hook preexec __hexe_preexec_capture
-                \\add-zsh-hook precmd __hexe_precmd_send
-                \\
-            );
-        }
+        try zsh_init.printInit(stdout, no_comms);
     } else if (std.mem.eql(u8, shell, "fish")) {
-        try stdout.writeAll(
-            \\# Hexe prompt initialization for Fish
-            \\function fish_prompt
-            \\    set -l exit_status $status
-            \\    set -l duration (math $CMD_DURATION)
-            \\    set -l jobs (count (jobs -p))
-            \\    hexe shp prompt --status=$exit_status --duration=$duration --jobs=$jobs
-            \\    echo -n " "
-            \\end
-            \\
-            \\function fish_right_prompt
-            \\    hexe shp prompt --right
-            \\end
-            \\
-        );
-
-        if (!no_comms) {
-            try stdout.writeAll(
-                \\# Hexe shell->mux communication hooks (Fish)
-                \\function __hexe_exit_intent
-                \\    if not status is-interactive
-                \\        return 0
-                \\    end
-                \\    if not set -q HEXE_MUX_SOCKET
-                \\        return 0
-                \\    end
-                \\    if not set -q HEXE_PANE_UUID
-                \\        return 0
-                \\    end
-                \\    hexe com exit-intent >/dev/null 2>/dev/null
-                \\    return $status
-                \\end
-                \\
-                \\function exit
-                \\    __hexe_exit_intent; or return 0
-                \\    builtin exit $argv
-                \\end
-                \\
-                \\function logout
-                \\    exit $argv
-                \\end
-                \\
-                \\function __hexe_ctrl_d
-                \\    set -l line (commandline)
-                \\    if test -z "$line"
-                \\        __hexe_exit_intent; or begin
-                \\            commandline ""
-                \\            commandline -f repaint
-                \\            return
-                \\        end
-                \\        exit
-                \\    end
-                \\    commandline -f delete-char
-                \\end
-                \\bind \cd __hexe_ctrl_d
-                \\
-                \\function __hexe_fish_postexec --on-event fish_postexec
-                \\    if not status is-interactive
-                \\        return
-                \\    end
-                \\    if not set -q HEXE_MUX_SOCKET
-                \\        return
-                \\    end
-                \\    if not set -q HEXE_PANE_UUID
-                \\        return
-                \\    end
-                \\    set -l cmdline (string join " " -- $argv)
-                \\    # OSC 7 cwd sync
-                \\    printf '\\e]7;file://%s%s\\a' "$hostname" "$PWD" 2>/dev/null
-                \\    set -l jobs_count (count (jobs -p))
-                \\    hexe com shell-event --cmd="$cmdline" --status=$status --duration=$CMD_DURATION --cwd="$PWD" --jobs=$jobs_count >/dev/null 2>/dev/null
-                \\end
-                \\
-            );
-        }
+        try fish_init.printInit(stdout, no_comms);
     } else {
         var buf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Unknown shell: {s}\nSupported shells: bash, zsh, fish\n", .{shell}) catch return;
@@ -408,6 +186,7 @@ fn renderPrompt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     // Get environment info
     ctx.cwd = std.posix.getenv("PWD") orelse "";
     ctx.home = std.posix.getenv("HOME");
+    ctx.now_ms = @intCast(std.time.milliTimestamp());
 
     // Get terminal width from COLUMNS env var or default
     if (posix.getenv("COLUMNS")) |cols| {
@@ -429,23 +208,44 @@ fn renderPrompt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const is_zsh = std.mem.eql(u8, shell, "zsh");
 
     // Try to load config
-    const config = loadConfig(allocator);
-    defer if (config) |c| c.deinit();
+    var config = loadConfig(allocator);
+    defer deinitShpConfig(&config, allocator);
 
-    if (config) |cfg| {
-        if (cfg.value.prompt) |prompt| {
-            const modules = if (is_right) prompt.right else prompt.left;
-            if (modules) |mods| {
-                if (mods.len > 0) {
-                    try renderModulesSimple(&ctx, mods, stdout, is_zsh);
-                    return;
-                }
-            }
+    if (config.has_config) {
+        const modules = if (is_right) config.right else config.left;
+        if (modules.len > 0) {
+            try renderModulesSimple(&ctx, modules, stdout, is_zsh);
+            return;
         }
     }
 
     // Fallback to defaults if no config
     try renderDefaultPrompt(&ctx, is_right, stdout, is_zsh);
+}
+
+fn deinitShpConfig(config: *ShpConfig, allocator: std.mem.Allocator) void {
+    if (!config.has_config) return;
+    deinitModules(config.left, allocator);
+    deinitModules(config.right, allocator);
+    if (config.left.len > 0) allocator.free(config.left);
+    if (config.right.len > 0) allocator.free(config.right);
+    config.* = .{ .left = &[_]ModuleDef{}, .right = &[_]ModuleDef{}, .has_config = false };
+}
+
+fn deinitModules(mods: []const ModuleDef, allocator: std.mem.Allocator) void {
+    for (mods) |m| {
+        allocator.free(m.name);
+        if (m.command) |c| allocator.free(c);
+        if (m.when) |w| {
+            var ww = w;
+            ww.deinit(allocator);
+        }
+        for (m.outputs) |o| {
+            allocator.free(o.style);
+            allocator.free(o.format);
+        }
+        if (m.outputs.len > 0) allocator.free(m.outputs);
+    }
 }
 
 fn renderDefaultPrompt(ctx: *segment.Context, is_right: bool, stdout: std.fs.File, is_zsh: bool) !void {
@@ -476,32 +276,248 @@ fn writeSegment(stdout: std.fs.File, seg: segment.Segment, is_zsh: bool) !void {
     }
 }
 
-fn loadConfig(allocator: std.mem.Allocator) ?std.json.Parsed(JsonConfig) {
-    const path = getConfigPath(allocator) catch return null;
-    defer allocator.free(path);
+fn evalLuaWhen(runtime: *LuaRuntime, ctx: *segment.Context, code: []const u8) bool {
+    // Provide ctx as a global table.
+    runtime.lua.createTable(0, 6);
+    _ = runtime.lua.pushString(ctx.cwd);
+    runtime.lua.setField(-2, "cwd");
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
+    if (ctx.exit_status) |st| {
+        runtime.lua.pushInteger(st);
+        runtime.lua.setField(-2, "exit_status");
+    }
+    if (ctx.cmd_duration_ms) |d| {
+        runtime.lua.pushInteger(@intCast(d));
+        runtime.lua.setField(-2, "cmd_duration_ms");
+    }
+    runtime.lua.pushInteger(ctx.jobs);
+    runtime.lua.setField(-2, "jobs");
+    runtime.lua.pushInteger(ctx.terminal_width);
+    runtime.lua.setField(-2, "terminal_width");
+    runtime.lua.setGlobal("ctx");
 
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
-    defer allocator.free(content); // Safe now since we use alloc_always
+    const code_z = runtime.allocator.dupeZ(u8, code) catch return false;
+    defer runtime.allocator.free(code_z);
 
-    return std.json.parseFromSlice(JsonConfig, allocator, content, .{
-        .allocate = .alloc_always, // Force allocation of strings so we can free content
-    }) catch null;
+    // Load and execute chunk. Must return boolean.
+    runtime.lua.loadString(code_z) catch return false;
+    runtime.lua.protectedCall(.{ .args = 0, .results = 1 }) catch {
+        runtime.lua.pop(1);
+        return false;
+    };
+    defer runtime.lua.pop(1);
+
+    if (runtime.lua.typeOf(-1) == .boolean) {
+        return runtime.lua.toBoolean(-1);
+    }
+    return false;
 }
 
-fn getConfigPath(allocator: std.mem.Allocator) ![]const u8 {
-    const config_home = posix.getenv("XDG_CONFIG_HOME");
-    if (config_home) |ch| {
-        return std.fmt.allocPrint(allocator, "{s}/hexe/shp.json", .{ch});
+fn evalPromptWhen(allocator: std.mem.Allocator, lua_rt: *?LuaRuntime, ctx: *segment.Context, when: core.WhenDef) bool {
+    if (when.any) |clauses| {
+        for (clauses) |c| {
+            if (evalPromptWhenClause(allocator, lua_rt, ctx, c)) return true;
+        }
+        return false;
+    }
+    return evalPromptWhenClause(allocator, lua_rt, ctx, when);
+}
+
+fn evalPromptWhenClause(allocator: std.mem.Allocator, lua_rt: *?LuaRuntime, ctx: *segment.Context, when: core.WhenDef) bool {
+    if (when.lua) |lua_code| {
+        if (lua_rt.* == null) {
+            lua_rt.* = LuaRuntime.init(allocator) catch null;
+        }
+        if (lua_rt.* == null) return false;
+        if (!evalLuaWhen(&lua_rt.*.?, ctx, lua_code)) return false;
     }
 
-    const home = posix.getenv("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.config/hexe/shp.json", .{home});
+    if (when.bash) |bash_code| {
+        const res = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "/bin/bash", "-lc", bash_code },
+        }) catch return false;
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+        const ok = switch (res.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+
+    return true;
 }
 
-fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdout: std.fs.File, is_zsh: bool) !void {
+fn loadConfig(allocator: std.mem.Allocator) ShpConfig {
+    var config = ShpConfig{
+        .left = &[_]ModuleDef{},
+        .right = &[_]ModuleDef{},
+        .has_config = false,
+    };
+
+    const path = lua_runtime.getConfigPath(allocator, "config.lua") catch return config;
+    defer allocator.free(path);
+
+    var runtime = LuaRuntime.init(allocator) catch {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("shp: failed to initialize Lua\n") catch {};
+        return config;
+    };
+    defer runtime.deinit();
+
+    runtime.setHexeSection("shp");
+
+    runtime.loadConfig(path) catch |err| {
+        switch (err) {
+            error.FileNotFound => {
+                // Silent - missing config is fine
+            },
+            else => {
+                const stderr = std.fs.File.stderr();
+                stderr.writeAll("shp: config error") catch {};
+                if (runtime.last_error) |msg| {
+                    stderr.writeAll(": ") catch {};
+                    stderr.writeAll(msg) catch {};
+                }
+                stderr.writeAll("\n") catch {};
+            },
+        }
+        return config;
+    };
+
+    // Access the "shp" section of the config table
+    if (!runtime.pushTable(-1, "shp")) {
+        return config;
+    }
+    defer runtime.pop();
+
+    config.has_config = true;
+
+    // Parse prompt.left and prompt.right
+    if (runtime.pushTable(-1, "prompt")) {
+        config.left = parseModules(&runtime, allocator, "left");
+        config.right = parseModules(&runtime, allocator, "right");
+        runtime.pop();
+    }
+
+    return config;
+}
+
+fn parseModules(runtime: *LuaRuntime, allocator: std.mem.Allocator, key: [:0]const u8) []const ModuleDef {
+    if (!runtime.pushTable(-1, key)) {
+        return &[_]ModuleDef{};
+    }
+    defer runtime.pop();
+
+    var list = std.ArrayList(ModuleDef).empty;
+    const len = runtime.getArrayLen(-1);
+
+    for (1..len + 1) |i| {
+        if (runtime.pushArrayElement(-1, i)) {
+            if (parseModule(runtime, allocator)) |mod| {
+                list.append(allocator, mod) catch {};
+            }
+            runtime.pop();
+        }
+    }
+
+    return list.toOwnedSlice(allocator) catch &[_]ModuleDef{};
+}
+
+fn parseModule(runtime: *LuaRuntime, allocator: std.mem.Allocator) ?ModuleDef {
+    const name = runtime.getStringAlloc(-1, "name") orelse return null;
+
+    const when_ty = runtime.fieldType(-1, "when");
+    if (when_ty != .nil and when_ty != .table) {
+        const stderr = std.fs.File.stderr();
+        stderr.writeAll("shp: module 'when' must be a table\n") catch {};
+        allocator.free(name);
+        return null;
+    }
+
+    return ModuleDef{
+        .name = name,
+        .priority = runtime.getInt(i64, -1, "priority") orelse 50,
+        .outputs = parseOutputs(runtime, allocator),
+        .command = runtime.getStringAlloc(-1, "command"),
+        .when = parseWhenPrompt(runtime, allocator),
+    };
+}
+
+fn parseWhenPrompt(runtime: *LuaRuntime, allocator: std.mem.Allocator) ?core.WhenDef {
+    const ty = runtime.fieldType(-1, "when");
+    if (ty == .nil) return null;
+    if (ty != .table) return null;
+
+    if (!runtime.pushTable(-1, "when")) return null;
+    defer runtime.pop();
+
+    // Strict: prompt does not allow hexe.* providers.
+    if (runtime.fieldType(-1, "hexe") != .nil or
+        runtime.fieldType(-1, "hexe.shp") != .nil or
+        runtime.fieldType(-1, "hexe.mux") != .nil or
+        runtime.fieldType(-1, "hexe.ses") != .nil or
+        runtime.fieldType(-1, "hexe.pod") != .nil)
+    {
+        return null;
+    }
+
+    var when: core.WhenDef = .{};
+    when.bash = runtime.getStringAlloc(-1, "bash");
+    when.lua = runtime.getStringAlloc(-1, "lua");
+    // hexe is not supported for prompt.
+    _ = allocator;
+    return when;
+}
+
+fn parseOutputs(runtime: *LuaRuntime, allocator: std.mem.Allocator) []const OutputDef {
+    if (!runtime.pushTable(-1, "outputs")) {
+        return &[_]OutputDef{};
+    }
+    defer runtime.pop();
+
+    var list = std.ArrayList(OutputDef).empty;
+    const len = runtime.getArrayLen(-1);
+
+    for (1..len + 1) |i| {
+        if (runtime.pushArrayElement(-1, i)) {
+            const style = if (runtime.getString(-1, "style")) |s|
+                allocator.dupe(u8, s) catch {
+                    runtime.pop();
+                    continue;
+                }
+            else
+                allocator.dupe(u8, "") catch {
+                    runtime.pop();
+                    continue;
+                };
+
+            const format = if (runtime.getString(-1, "format")) |s|
+                allocator.dupe(u8, s) catch {
+                    allocator.free(style);
+                    runtime.pop();
+                    continue;
+                }
+            else
+                allocator.dupe(u8, "$output") catch {
+                    allocator.free(style);
+                    runtime.pop();
+                    continue;
+                };
+
+            list.append(allocator, .{ .style = style, .format = format }) catch {
+                allocator.free(style);
+                allocator.free(format);
+            };
+            runtime.pop();
+        }
+    }
+
+    return list.toOwnedSlice(allocator) catch &[_]OutputDef{};
+}
+
+fn renderModulesSimple(ctx: *segment.Context, modules: []const ModuleDef, stdout: std.fs.File, is_zsh: bool) !void {
     const alloc = std.heap.page_allocator;
 
     // Known built-in segments that return null when they have nothing to show
@@ -509,6 +525,7 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
 
     const ModuleResult = struct {
         when_passed: bool = true,
+        when_lua_passed: bool = true,
         output: ?[]const u8 = null,
         width: u16 = 0,
         should_render: bool = true,
@@ -518,32 +535,27 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
     var results: [32]ModuleResult = [_]ModuleResult{.{}} ** 32;
     const mod_count = @min(modules.len, 32);
 
+    // Evaluate all `when` on the main thread.
+    // This avoids Lua VM thread-safety issues and keeps semantics simple.
+    var lua_rt: ?LuaRuntime = null;
+    defer if (lua_rt) |*rt| rt.deinit();
+
+    for (modules[0..mod_count], 0..) |mod, i| {
+        if (mod.when) |w| {
+            results[i].when_passed = evalPromptWhen(alloc, &lua_rt, ctx, w);
+        }
+    }
+
     // Thread function for running a module's commands
     const ThreadContext = struct {
-        mod: *const JsonModule,
+        mod: *const ModuleDef,
         result: *ModuleResult,
         alloc: std.mem.Allocator,
     };
 
     const thread_fn = struct {
         fn run(tctx: ThreadContext) void {
-            // Check 'when' condition
-            if (tctx.mod.when) |when_cmd| {
-                const when_result = std.process.Child.run(.{
-                    .allocator = tctx.alloc,
-                    .argv = &.{ "/bin/bash", "-c", when_cmd },
-                }) catch {
-                    tctx.result.when_passed = false;
-                    return;
-                };
-                tctx.alloc.free(when_result.stdout);
-                tctx.alloc.free(when_result.stderr);
-                tctx.result.when_passed = switch (when_result.term) {
-                    .Exited => |code| code == 0,
-                    else => false,
-                };
-                if (!tctx.result.when_passed) return;
-            }
+            if (!tctx.result.when_passed) return;
 
             // Run command
             if (tctx.mod.command) |cmd| {
@@ -630,11 +642,8 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
         results[i].output = output_text;
 
         // Calculate width from outputs
-        if (mod.outputs) |outputs| {
-            for (outputs) |out| {
-                const format = out.format orelse "$output";
-                results[i].width += calcFormatWidth(format, output_text);
-            }
+        for (mod.outputs) |out| {
+            results[i].width += calcFormatWidth(out.format, output_text);
         }
     }
 
@@ -652,10 +661,10 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
     // Sort by priority (insertion sort - small array)
     for (1..mod_count) |i| {
         const key = priority_order[i];
-        const key_priority = modules[key].priority orelse 50;
+        const key_priority = modules[key].priority;
         var j: usize = i;
         while (j > 0) {
-            const prev_priority = modules[priority_order[j - 1]].priority orelse 50;
+            const prev_priority = modules[priority_order[j - 1]].priority;
             if (prev_priority <= key_priority) break;
             priority_order[j] = priority_order[j - 1];
             j -= 1;
@@ -680,19 +689,16 @@ fn renderModulesSimple(ctx: *segment.Context, modules: []const JsonModule, stdou
 
         const output_text = results[i].output orelse "";
 
-        if (mod.outputs) |outputs| {
-            for (outputs) |out| {
-                const style = Style.parse(out.style orelse "");
-                const format = out.format orelse "$output";
+        for (mod.outputs) |out| {
+            const style = Style.parse(out.style);
 
-                try writeStyleDirect(stdout, style, is_zsh);
-                try writeFormat(stdout, format, output_text);
+            try writeStyleDirect(stdout, style, is_zsh);
+            try writeFormat(stdout, out.format, output_text);
 
-                if (!style.isEmpty()) {
-                    if (is_zsh) try stdout.writeAll("%{");
-                    try stdout.writeAll("\x1b[0m");
-                    if (is_zsh) try stdout.writeAll("%}");
-                }
+            if (!style.isEmpty()) {
+                if (is_zsh) try stdout.writeAll("%{");
+                try stdout.writeAll("\x1b[0m");
+                if (is_zsh) try stdout.writeAll("%}");
             }
         }
     }

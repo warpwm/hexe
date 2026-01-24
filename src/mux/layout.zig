@@ -127,9 +127,19 @@ pub const Layout = struct {
                     return pane;
                 };
 
-                // Use pod from ses
-                defer ses.allocator.free(result.socket_path);
-                try pane.initWithPod(self.allocator, id, self.x, self.y, self.width, self.height, result.socket_path, result.uuid);
+                // Use pod from ses — VT data routed through SES VT channel.
+                const vt_fd = ses.getVtFd() orelse {
+                    try pane.init(self.allocator, id, self.x, self.y, self.width, self.height);
+                    pane.focused = true;
+                    self.focused_split_id = id;
+                    try self.splits.put(id, pane);
+                    self.configurePaneNotifications(pane);
+                    const node2 = try self.allocator.create(LayoutNode);
+                    node2.* = .{ .pane = id };
+                    self.root = node2;
+                    return pane;
+                };
+                try pane.initWithPod(self.allocator, id, self.x, self.y, self.width, self.height, result.pane_id, vt_fd, result.uuid);
                 pane.focused = true;
                 self.focused_split_id = id;
                 try self.splits.put(id, pane);
@@ -181,8 +191,11 @@ pub const Layout = struct {
         if (self.ses_client) |ses| {
             if (ses.isConnected()) {
                 if (ses.createPane(null, cwd, null, null, null, null)) |result| {
-                    defer ses.allocator.free(result.socket_path);
-                    try new_pane.initWithPod(self.allocator, new_id, new_x, new_y, new_width, new_height, result.socket_path, result.uuid);
+                    if (ses.getVtFd()) |vt_fd| {
+                        try new_pane.initWithPod(self.allocator, new_id, new_x, new_y, new_width, new_height, result.pane_id, vt_fd, result.uuid);
+                    } else {
+                        try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
+                    }
                 } else |_| {
                     // Fall back to local spawn
                     try new_pane.init(self.allocator, new_id, new_x, new_y, new_width, new_height);
@@ -270,6 +283,90 @@ pub const Layout = struct {
                         self.layoutNode(split.first, x, y, w, first_h);
                         self.layoutNode(split.second, x, y + first_h + 1, w, second_h);
                     },
+                }
+            },
+        }
+    }
+
+    /// Remove nodes from the tree that reference pane IDs not in `splits`.
+    /// This handles the case where some pods died during detach and their
+    /// panes couldn't be recreated on reattach. Without pruning, the tree
+    /// allocates space for non-existent panes, corrupting the layout.
+    pub fn pruneDeadNodes(self: *Layout) void {
+        if (self.root) |root| {
+            const result = self.pruneNode(root);
+            if (result.dead) {
+                // Entire tree is dead
+                self.freeNode(root);
+                self.root = null;
+            } else if (result.replacement) |replacement| {
+                // Root was a split where one side died
+                self.root = replacement;
+                self.allocator.destroy(root);
+            }
+        }
+        // Ensure focused_split_id points to a live pane
+        if (!self.splits.contains(self.focused_split_id)) {
+            var it = self.splits.keyIterator();
+            if (it.next()) |first_id| {
+                self.focused_split_id = first_id.*;
+                if (self.splits.get(first_id.*)) |pane| {
+                    pane.focused = true;
+                }
+            }
+        }
+    }
+
+    const PruneResult = struct {
+        dead: bool, // This node references only dead panes
+        replacement: ?*LayoutNode, // If non-null, replace this node with this
+    };
+
+    fn pruneNode(self: *Layout, node: *LayoutNode) PruneResult {
+        switch (node.*) {
+            .pane => |id| {
+                if (self.splits.contains(id)) {
+                    return .{ .dead = false, .replacement = null };
+                } else {
+                    return .{ .dead = true, .replacement = null };
+                }
+            },
+            .split => |split| {
+                const first_result = self.pruneNode(split.first);
+                const second_result = self.pruneNode(split.second);
+
+                if (first_result.dead and second_result.dead) {
+                    // Both children dead - this whole subtree is dead
+                    self.freeNode(split.first);
+                    self.freeNode(split.second);
+                    return .{ .dead = true, .replacement = null };
+                } else if (first_result.dead) {
+                    // First child dead - replace this split with second child
+                    self.freeNode(split.first);
+                    if (second_result.replacement) |repl| {
+                        self.allocator.destroy(split.second);
+                        return .{ .dead = false, .replacement = repl };
+                    }
+                    return .{ .dead = false, .replacement = split.second };
+                } else if (second_result.dead) {
+                    // Second child dead - replace this split with first child
+                    self.freeNode(split.second);
+                    if (first_result.replacement) |repl| {
+                        self.allocator.destroy(split.first);
+                        return .{ .dead = false, .replacement = repl };
+                    }
+                    return .{ .dead = false, .replacement = split.first };
+                } else {
+                    // Both alive - apply any child replacements in-place
+                    if (first_result.replacement) |repl| {
+                        self.allocator.destroy(split.first);
+                        node.split.first = repl;
+                    }
+                    if (second_result.replacement) |repl| {
+                        self.allocator.destroy(split.second);
+                        node.split.second = repl;
+                    }
+                    return .{ .dead = false, .replacement = null };
                 }
             },
         }

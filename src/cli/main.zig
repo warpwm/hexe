@@ -6,9 +6,48 @@ const mux = @import("mux");
 const ses = @import("ses");
 const pod = @import("pod");
 const shp = @import("shp");
-const com = @import("commands/com.zig");
+const cli_cmds = @import("commands/com.zig");
+
+const c = @cImport({
+    @cInclude("stdlib.h");
+});
 
 const print = std.debug.print;
+
+fn setEnvVar(key: []const u8, value: []const u8) void {
+    if (key.len == 0 or value.len == 0) return;
+    const key_z = std.heap.c_allocator.dupeZ(u8, key) catch return;
+    defer std.heap.c_allocator.free(key_z);
+    const value_z = std.heap.c_allocator.dupeZ(u8, value) catch return;
+    defer std.heap.c_allocator.free(value_z);
+    _ = c.setenv(key_z.ptr, value_z.ptr, 1);
+}
+
+fn hasInstanceEnv() bool {
+    if (std.posix.getenv("HEXE_INSTANCE")) |v| {
+        return v.len > 0;
+    }
+    return false;
+}
+
+fn setInstanceFromCli(name: []const u8) void {
+    if (name.len == 0) return;
+    setEnvVar("HEXE_INSTANCE", name);
+}
+
+fn setTestOnlyEnv() void {
+    setEnvVar("HEXE_TEST_ONLY", "1");
+}
+
+fn setGeneratedTestInstance() void {
+    const uuid = ipc.generateUuid();
+    var buf: [16]u8 = undefined;
+    @memcpy(buf[0..5], "test-");
+    @memcpy(buf[5..13], uuid[0..8]);
+    setEnvVar("HEXE_INSTANCE", buf[0..13]);
+    setTestOnlyEnv();
+    print("test instance: {s}\n", .{buf[0..13]});
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -23,53 +62,26 @@ pub fn main() !void {
     defer parser.deinit();
 
     // Top-level subcommands only
-    const com_cmd = try parser.newCommand("com", "Communication with sessions and panes");
     const ses_cmd = try parser.newCommand("ses", "Session daemon management");
-    const pod_cmd = try parser.newCommand("pod", "Per-pane PTY daemon (internal)");
+    const pod_cmd = try parser.newCommand("pod", "Per-pane PTY daemon");
     const mux_cmd = try parser.newCommand("mux", "Terminal multiplexer");
     const shp_cmd = try parser.newCommand("shp", "Shell prompt renderer");
     const pop_cmd = try parser.newCommand("pop", "Popup overlays");
-
-    // COM subcommands
-    const com_list = try com_cmd.newCommand("list", "List all sessions and panes");
-    const com_list_details = try com_list.flag("d", "details", null);
-
-    const com_info = try com_cmd.newCommand("info", "Show current pane info");
-    const com_info_uuid = try com_info.string("u", "uuid", null);
-    const com_info_creator = try com_info.flag("c", "creator", null);
-    const com_info_last = try com_info.flag("l", "last", null);
-
-    const com_notify = try com_cmd.newCommand("notify", "Send notification");
-    const com_notify_uuid = try com_notify.string("u", "uuid", null);
-    const com_notify_creator = try com_notify.flag("c", "creator", null);
-    const com_notify_last = try com_notify.flag("l", "last", null);
-    const com_notify_broadcast = try com_notify.flag("b", "broadcast", null);
-    const com_notify_msg = try com_notify.stringPositional(null);
-
-    const com_send = try com_cmd.newCommand("send", "Send keystrokes to pane");
-    const com_send_uuid = try com_send.string("u", "uuid", null);
-    const com_send_creator = try com_send.flag("c", "creator", null);
-    const com_send_last = try com_send.flag("l", "last", null);
-    const com_send_broadcast = try com_send.flag("b", "broadcast", null);
-    const com_send_enter = try com_send.flag("e", "enter", null);
-    const com_send_ctrl = try com_send.string("C", "ctrl", null);
-    const com_send_text = try com_send.stringPositional(null);
-
-    const com_exit_intent = try com_cmd.newCommand("exit-intent", "Ask mux permission before shell exits");
-
-    const com_shell_event = try com_cmd.newCommand("shell-event", "Send shell command metadata to mux/ses");
-    const com_shell_event_cmd = try com_shell_event.string("", "cmd", null);
-    const com_shell_event_status = try com_shell_event.int("", "status", null);
-    const com_shell_event_duration = try com_shell_event.int("", "duration", null);
-    const com_shell_event_cwd = try com_shell_event.string("", "cwd", null);
-    const com_shell_event_jobs = try com_shell_event.int("", "jobs", null);
 
     // SES subcommands
     const ses_daemon = try ses_cmd.newCommand("daemon", "Start the session daemon");
     const ses_daemon_fg = try ses_daemon.flag("f", "foreground", null);
     const ses_daemon_dbg = try ses_daemon.flag("d", "debug", null);
     const ses_daemon_log = try ses_daemon.string("L", "logfile", null);
-    _ = try ses_cmd.newCommand("info", "Show daemon info");
+    const ses_daemon_instance = try ses_daemon.string("I", "instance", null);
+    const ses_daemon_test_only = try ses_daemon.flag("T", "test-only", null);
+
+    const ses_status = try ses_cmd.newCommand("status", "Show daemon info");
+    const ses_status_instance = try ses_status.string("I", "instance", null);
+
+    const ses_list = try ses_cmd.newCommand("list", "List all sessions and panes");
+    const ses_list_details = try ses_list.flag("d", "details", null);
+    const ses_list_instance = try ses_list.string("I", "instance", null);
 
     // POD subcommands (mostly for ses-internal use)
     const pod_daemon = try pod_cmd.newCommand("daemon", "Start a per-pane pod daemon");
@@ -78,20 +90,69 @@ pub fn main() !void {
     const pod_daemon_socket = try pod_daemon.string("s", "socket", null);
     const pod_daemon_shell = try pod_daemon.string("S", "shell", null);
     const pod_daemon_cwd = try pod_daemon.string("C", "cwd", null);
+    const pod_daemon_labels = try pod_daemon.string("", "labels", null);
+    const pod_daemon_write_meta = try pod_daemon.flag("", "write-meta", null);
+    const pod_daemon_no_write_meta = try pod_daemon.flag("", "no-write-meta", null);
+    const pod_daemon_write_alias = try pod_daemon.flag("", "write-alias", null);
     const pod_daemon_fg = try pod_daemon.flag("f", "foreground", null);
     const pod_daemon_dbg = try pod_daemon.flag("d", "debug", null);
     const pod_daemon_log = try pod_daemon.string("L", "logfile", null);
+    const pod_daemon_instance = try pod_daemon.string("I", "instance", null);
+    const pod_daemon_test_only = try pod_daemon.flag("T", "test-only", null);
+
+    const pod_list = try pod_cmd.newCommand("list", "List discoverable pods (from .meta)");
+    const pod_list_where = try pod_list.string("", "where", null);
+    const pod_list_probe = try pod_list.flag("", "probe", null);
+    const pod_list_alive = try pod_list.flag("", "alive", null);
+
+    const pod_new = try pod_cmd.newCommand("new", "Create a standalone pod (spawns pod daemon)");
+    const pod_new_name = try pod_new.string("n", "name", null);
+    const pod_new_shell = try pod_new.string("S", "shell", null);
+    const pod_new_cwd = try pod_new.string("C", "cwd", null);
+    const pod_new_labels = try pod_new.string("", "labels", null);
+    const pod_new_alias = try pod_new.flag("", "alias", null);
+    const pod_new_dbg = try pod_new.flag("d", "debug", null);
+    const pod_new_log = try pod_new.string("L", "logfile", null);
+    const pod_new_instance = try pod_new.string("I", "instance", null);
+    const pod_new_test_only = try pod_new.flag("T", "test-only", null);
+
+    const pod_send = try pod_cmd.newCommand("send", "Send input to a pod (by uuid/name/socket)");
+    const pod_send_uuid = try pod_send.string("u", "uuid", null);
+    const pod_send_name = try pod_send.string("n", "name", null);
+    const pod_send_socket = try pod_send.string("s", "socket", null);
+    const pod_send_enter = try pod_send.flag("e", "enter", null);
+    const pod_send_ctrl = try pod_send.string("C", "ctrl", null);
+    const pod_send_text = try pod_send.stringPositional(null);
+
+    const pod_attach = try pod_cmd.newCommand("attach", "Attach to a pod (raw tty)");
+    const pod_attach_uuid = try pod_attach.string("u", "uuid", null);
+    const pod_attach_name = try pod_attach.string("n", "name", null);
+    const pod_attach_socket = try pod_attach.string("s", "socket", null);
+    const pod_attach_detach = try pod_attach.string("", "detach", null);
+
+    const pod_kill = try pod_cmd.newCommand("kill", "Kill a pod by uuid/name");
+    const pod_kill_uuid = try pod_kill.string("u", "uuid", null);
+    const pod_kill_name = try pod_kill.string("n", "name", null);
+    const pod_kill_signal = try pod_kill.string("s", "signal", null);
+    const pod_kill_force = try pod_kill.flag("f", "force", null);
+
+    const pod_gc = try pod_cmd.newCommand("gc", "Garbage-collect stale pod metadata");
+    const pod_gc_dry = try pod_gc.flag("n", "dry-run", null);
+
 
     // MUX subcommands
     const mux_new = try mux_cmd.newCommand("new", "Create new multiplexer session");
     const mux_new_name = try mux_new.string("n", "name", null);
     const mux_new_dbg = try mux_new.flag("d", "debug", null);
     const mux_new_log = try mux_new.string("L", "logfile", null);
+    const mux_new_instance = try mux_new.string("I", "instance", null);
+    const mux_new_test_only = try mux_new.flag("T", "test-only", null);
 
     const mux_attach = try mux_cmd.newCommand("attach", "Attach to existing session");
     const mux_attach_name = try mux_attach.stringPositional(null);
     const mux_attach_dbg = try mux_attach.flag("d", "debug", null);
     const mux_attach_log = try mux_attach.string("L", "logfile", null);
+    const mux_attach_instance = try mux_attach.string("I", "instance", null);
 
     const mux_float = try mux_cmd.newCommand("float", "Spawn a transient float pane");
     const mux_float_uuid = try mux_float.string("u", "uuid", null);
@@ -102,6 +163,34 @@ pub fn main() !void {
     const mux_float_pass_env = try mux_float.flag("", "pass-env", null);
     const mux_float_extra_env = try mux_float.string("", "extra-env", null);
     const mux_float_isolated = try mux_float.flag("", "isolated", null);
+    const mux_float_instance = try mux_float.string("I", "instance", null);
+
+    const mux_notify = try mux_cmd.newCommand("notify", "Send notification");
+    const mux_notify_uuid = try mux_notify.string("u", "uuid", null);
+    const mux_notify_creator = try mux_notify.flag("c", "creator", null);
+    const mux_notify_last = try mux_notify.flag("l", "last", null);
+    const mux_notify_broadcast = try mux_notify.flag("b", "broadcast", null);
+    const mux_notify_msg = try mux_notify.stringPositional(null);
+    const mux_notify_instance = try mux_notify.string("I", "instance", null);
+
+    const mux_send = try mux_cmd.newCommand("send", "Send keystrokes to pane");
+    const mux_send_uuid = try mux_send.string("u", "uuid", null);
+    const mux_send_creator = try mux_send.flag("c", "creator", null);
+    const mux_send_last = try mux_send.flag("l", "last", null);
+    const mux_send_broadcast = try mux_send.flag("b", "broadcast", null);
+    const mux_send_enter = try mux_send.flag("e", "enter", null);
+    const mux_send_ctrl = try mux_send.string("C", "ctrl", null);
+    const mux_send_text = try mux_send.stringPositional(null);
+    const mux_send_instance = try mux_send.string("I", "instance", null);
+
+    const mux_info = try mux_cmd.newCommand("info", "Show information about a pane");
+    const mux_info_uuid = try mux_info.string("u", "uuid", null);
+    const mux_info_creator = try mux_info.flag("c", "creator", null);
+    const mux_info_last = try mux_info.flag("l", "last", null);
+    const mux_info_instance = try mux_info.string("I", "instance", null);
+
+    const mux_focus = try mux_cmd.newCommand("focus", "Move focus to adjacent pane");
+    const mux_focus_dir = try mux_focus.stringPositional(null);
 
     // POP subcommands
     const shp_prompt = try shp_cmd.newCommand("prompt", "Render shell prompt");
@@ -114,6 +203,25 @@ pub fn main() !void {
     const shp_init = try shp_cmd.newCommand("init", "Print shell initialization script");
     const shp_init_shell = try shp_init.stringPositional(null);
     const shp_init_no_comms = try shp_init.flag("", "no-comms", null);
+
+    const shp_exit_intent = try shp_cmd.newCommand("exit-intent", "Ask mux permission before shell exits");
+
+    const shp_shell_event = try shp_cmd.newCommand("shell-event", "Send shell command metadata to the current mux");
+    const shp_shell_event_cmd = try shp_shell_event.string("", "cmd", null);
+    const shp_shell_event_status = try shp_shell_event.int("", "status", null);
+    const shp_shell_event_duration = try shp_shell_event.int("", "duration", null);
+    const shp_shell_event_cwd = try shp_shell_event.string("", "cwd", null);
+    const shp_shell_event_jobs = try shp_shell_event.int("", "jobs", null);
+    const shp_shell_event_phase = try shp_shell_event.string("", "phase", null);
+    const shp_shell_event_running = try shp_shell_event.flag("", "running", null);
+    const shp_shell_event_started_at = try shp_shell_event.int("", "started-at", null);
+
+    const shp_spinner = try shp_cmd.newCommand("spinner", "Render a spinner/animation frame");
+    const shp_spinner_name = try shp_spinner.stringPositional(null);
+    const shp_spinner_width = try shp_spinner.int("w", "width", null);
+    const shp_spinner_interval = try shp_spinner.int("i", "interval", null);
+    const shp_spinner_hold = try shp_spinner.int("H", "hold", null);
+    const shp_spinner_loop = try shp_spinner.flag("l", "loop", null);
 
     // POP subcommands
     const pop_notify = try pop_cmd.newCommand("notify", "Show notification");
@@ -134,7 +242,6 @@ pub fn main() !void {
 
     // Check for help flag manually to avoid argonaut segfault
     var has_help = false;
-    var found_com = false;
     var found_ses = false;
     var found_pod = false;
     var found_mux = false;
@@ -143,8 +250,11 @@ pub fn main() !void {
     var found_notify = false;
     var found_daemon = false;
     var found_info = false;
+    var found_status = false;
     var found_new = false;
     var found_attach = false;
+    var found_kill = false;
+    var found_gc = false;
     var found_float = false;
     var found_prompt = false;
     var found_init = false;
@@ -152,23 +262,29 @@ pub fn main() !void {
     var found_confirm = false;
     var found_choose = false;
     var found_send = false;
+    var found_focus = false;
     var found_exit_intent = false;
     var found_shell_event = false;
+    var found_spinner = false;
 
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) has_help = true;
-        if (std.mem.eql(u8, arg, "com")) found_com = true;
         if (std.mem.eql(u8, arg, "ses")) found_ses = true;
         if (std.mem.eql(u8, arg, "pod")) found_pod = true;
         if (std.mem.eql(u8, arg, "mux")) found_mux = true;
         if (std.mem.eql(u8, arg, "shp")) found_shp = true;
         if (std.mem.eql(u8, arg, "list")) found_list = true;
         if (std.mem.eql(u8, arg, "info")) found_info = true;
+        if (std.mem.eql(u8, arg, "status")) found_status = true;
         if (std.mem.eql(u8, arg, "notify")) found_notify = true;
         if (std.mem.eql(u8, arg, "daemon")) found_daemon = true;
+        if (std.mem.eql(u8, arg, "list")) found_list = true;
+        if (std.mem.eql(u8, arg, "new")) found_new = true;
         if (std.mem.eql(u8, arg, "info")) found_info = true;
         if (std.mem.eql(u8, arg, "new")) found_new = true;
         if (std.mem.eql(u8, arg, "attach")) found_attach = true;
+        if (std.mem.eql(u8, arg, "kill")) found_kill = true;
+        if (std.mem.eql(u8, arg, "gc")) found_gc = true;
         if (std.mem.eql(u8, arg, "float")) found_float = true;
         if (std.mem.eql(u8, arg, "prompt")) found_prompt = true;
         if (std.mem.eql(u8, arg, "init")) found_init = true;
@@ -176,40 +292,69 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "confirm")) found_confirm = true;
         if (std.mem.eql(u8, arg, "choose")) found_choose = true;
         if (std.mem.eql(u8, arg, "send")) found_send = true;
+        if (std.mem.eql(u8, arg, "attach")) found_attach = true;
+        if (std.mem.eql(u8, arg, "focus")) found_focus = true;
         if (std.mem.eql(u8, arg, "exit-intent")) found_exit_intent = true;
         if (std.mem.eql(u8, arg, "shell-event")) found_shell_event = true;
+        if (std.mem.eql(u8, arg, "spinner")) found_spinner = true;
     }
 
-    if (has_help) {
-        // Show help for the most specific command found (manual strings to avoid argonaut crash)
-        if (found_com and found_send) {
-            print("Usage: hexe com send [OPTIONS] [text]\n\nSend keystrokes to pane (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all attached panes\n  -e, --enter        Append Enter key after text\n  -C, --ctrl <char>  Send Ctrl+<char> (e.g., -C c for Ctrl+C)\n", .{});
-        } else if (found_com and found_exit_intent) {
-            print("Usage: hexe com exit-intent\n\nAsk the current mux session whether the shell should be allowed to exit.\nIntended for shell keybindings (exit/Ctrl+D) to avoid last-pane death.\n\nExit codes: 0=allow, 1=deny\n", .{});
-        } else if (found_com and found_shell_event) {
-            print("Usage: hexe com shell-event [--cmd <TEXT>] [--status <N>] [--duration <MS>] [--cwd <PATH>] [--jobs <N>]\n\nSend shell command metadata to the current mux session.\nUsed by shell integration to power statusbar + `hexe com info`.\n\nNotes:\n  - No-op outside a mux session\n  - If mux is unreachable, exits 0\n", .{});
-        } else if (found_com and found_notify) {
-            print("Usage: hexe com notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>  Target specific mux or pane\n  -c, --creator      Send to pane that created current pane\n  -l, --last         Send to previously focused pane\n  -b, --broadcast    Broadcast to all muxes\n", .{});
-        } else if (found_com and found_info) {
-            print("Usage: hexe com info [OPTIONS]\n\nShow information about a pane\n\nOptions:\n  -u, --uuid <UUID>  Query specific pane by UUID (works from anywhere)\n  -c, --creator      Print only the creator pane UUID\n  -l, --last         Print only the last focused pane UUID\n\nWithout --uuid, queries current pane (requires running inside mux)\n", .{});
-        } else if (found_com and found_list) {
-            print("Usage: hexe com list [OPTIONS]\n\nList all sessions and panes\n\nOptions:\n  -d, --details  Show extra details\n", .{});
+        if (has_help) {
+            // Show help for the most specific command found (manual strings to avoid argonaut crash)
+            if (found_mux and found_focus) {
+                print(
+                    "Usage: hexe mux focus <dir>\n\nMove focus to adjacent pane in the mux. Intended for editor integration (nvim).\n\nDirs: left, right, up, down\n\nRequires running inside mux (HEXE_PANE_UUID)\n",
+                    .{},
+                );
+            } else
+            if (found_mux and found_send) {
+                print("Usage: hexe mux send [OPTIONS] [text]\n\nSend keystrokes to pane (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>        Target specific pane\n  -c, --creator            Send to pane that created current pane\n  -l, --last               Send to previously focused pane\n  -b, --broadcast          Broadcast to all attached panes\n  -e, --enter              Append Enter key after text\n  -C, --ctrl <char>        Send Ctrl+<char> (e.g., -C c for Ctrl+C)\n  -I, --instance <NAME>    Target a specific instance\n", .{});
+            } else if (found_mux and found_notify) {
+                print("Usage: hexe mux notify [OPTIONS] <message>\n\nSend notification (defaults to current pane if inside mux)\n\nOptions:\n  -u, --uuid <UUID>        Target specific mux or pane\n  -c, --creator            Send to pane that created current pane\n  -l, --last               Send to previously focused pane\n  -b, --broadcast          Broadcast to all muxes\n  -I, --instance <NAME>    Target a specific instance\n", .{});
+            } else if (found_mux and found_info) {
+                print("Usage: hexe mux info [OPTIONS]\n\nShow information about a pane\n\nOptions:\n  -u, --uuid <UUID>        Query specific pane by UUID (works from anywhere)\n  -c, --creator            Print only the creator pane UUID\n  -l, --last               Print only the last focused pane UUID\n  -I, --instance <NAME>    Target a specific instance\n\nWithout --uuid, queries current pane (requires running inside mux)\n", .{});
+            } else if (found_pod and found_list) {
+                print("Usage: hexe pod list [OPTIONS]\n\nList discoverable pods by scanning pod-*.meta in the hexe socket dir.\n\nOptions:\n      --where <LUA>   Lua predicate (return boolean). Variable: pod\n      --probe         Probe sockets (best-effort)\n      --alive         Only show pods whose socket is connectable (implies --probe)\n", .{});
+            } else if (found_pod and found_new) {
+                print("Usage: hexe pod new [OPTIONS]\n\nCreate a standalone pod and print a JSON line once ready.\n\nOptions:\n  -n, --name <NAME>         Pod name (also used for ps/alias)\n  -S, --shell <CMD>         Shell/command to run (default: $SHELL)\n  -C, --cwd <DIR>           Working directory\n      --labels <a,b,c>      Comma-separated labels\n      --alias               Create pod@<name>.sock alias symlink\n  -d, --debug               Enable debug output\n  -L, --logfile <PATH>      Log debug output to PATH\n  -I, --instance <NAME>     Run under instance namespace\n  -T, --test-only           Mark as test-only (requires instance)\n", .{});
+            } else if (found_ses and found_list) {
+                print("Usage: hexe ses list [OPTIONS]\n\nList all sessions and panes\n\nOptions:\n  -d, --details           Show extra details\n  -I, --instance <NAME>   Target a specific instance\n", .{});
+        } else if (found_ses and found_status) {
+            print("Usage: hexe ses status [OPTIONS]\n\nShow daemon status and socket path\n\nOptions:\n  -I, --instance <NAME>   Target a specific instance\n", .{});
+        } else if (found_shp and found_exit_intent) {
+            print("Usage: hexe shp exit-intent\n\nAsk the current mux session whether the shell should be allowed to exit.\nIntended for shell keybindings (exit/Ctrl+D) to avoid last-pane death.\n\nExit codes: 0=allow, 1=deny\n", .{});
+        } else if (found_shp and found_shell_event) {
+            print(
+                "Usage: hexe shp shell-event [--cmd <TEXT>] [--cwd <PATH>] [--jobs <N>] [--phase <start|end>] [--running] [--started-at <MS>] [--status <N>] [--duration <MS>]\n\nSend shell command metadata to the current mux session.\nUsed by shell integration to power statusbar + `hexe mux info`.\n\nNotes:\n  - No-op outside a mux session\n  - If mux is unreachable, exits 0\n",
+                .{},
+            );
         } else if (found_ses and found_daemon) {
-            print("Usage: hexe ses daemon [OPTIONS]\n\nStart the session daemon\n\nOptions:\n  -f, --foreground     Run in foreground (don't daemonize)\n  -d, --debug          Enable debug output\n  -L, --logfile <PATH> Log debug output to PATH\n", .{});
-        } else if (found_ses and found_info) {
-            print("Usage: hexe ses info\n\nShow daemon status and socket path\n", .{});
-        } else if (found_pod and found_daemon) {
-            print("Usage: hexe pod daemon [OPTIONS]\n\nStart a per-pane pod daemon (normally launched by ses)\n\nOptions:\n  -u, --uuid <UUID>     Pane UUID (32 hex chars)\n  -n, --name <NAME>     Human-friendly pane name (for `ps`)\n  -s, --socket <PATH>   Pod unix socket path\n  -S, --shell <CMD>     Shell/command to run\n  -C, --cwd <DIR>       Working directory\n  -f, --foreground      Run in foreground (prints pod_ready JSON)\n  -d, --debug           Enable debug output\n  -L, --logfile <PATH>  Log debug output to PATH\n", .{});
-        } else if (found_mux and found_new) {
-            print("Usage: hexe mux new [OPTIONS]\n\nCreate new multiplexer session\n\nOptions:\n  -n, --name <NAME>     Session name\n  -d, --debug           Enable debug output\n  -L, --logfile <PATH>  Log debug output to PATH\n", .{});
+            print("Usage: hexe ses daemon [OPTIONS]\n\nStart the session daemon\n\nOptions:\n  -f, --foreground        Run in foreground (don't daemonize)\n  -d, --debug             Enable debug output\n  -L, --logfile <PATH>    Log debug output to PATH\n  -I, --instance <NAME>   Run under instance namespace\n  -T, --test-only         Mark as test-only (requires instance)\n", .{});
+            } else if (found_pod and found_daemon) {
+                print("Usage: hexe pod daemon [OPTIONS]\n\nStart a per-pane pod daemon (normally launched by ses)\n\nOptions:\n  -u, --uuid <UUID>            Pane UUID (32 hex chars)\n  -n, --name <NAME>            Human-friendly pane name (for `ps`)\n  -s, --socket <PATH>          Pod unix socket path\n  -S, --shell <CMD>            Shell/command to run\n  -C, --cwd <DIR>              Working directory\n      --labels <a,b,c>         Comma-separated labels for discovery\n      --no-write-meta           Disable writing pod-<uuid>.meta\n      --write-alias             Create pod@<name>.sock alias symlink\n  -f, --foreground             Run in foreground (prints pod_ready JSON)\n  -d, --debug                  Enable debug output\n  -L, --logfile <PATH>         Log debug output to PATH\n  -I, --instance <NAME>        Run under instance namespace\n  -T, --test-only              Mark as test-only (requires instance)\n", .{});
+            } else if (found_pod and found_send) {
+                print("Usage: hexe pod send [OPTIONS] [text]\n\nSend input to a pod without ses/mux.\n\nOptions:\n  -u, --uuid <UUID>        Target pod by UUID (32 hex chars)\n  -n, --name <NAME>        Target pod by name (via pod-*.meta scan)\n  -s, --socket <PATH>      Target pod by explicit socket path\n  -e, --enter              Append Enter key\n  -C, --ctrl <char>        Send Ctrl+<char> (e.g., -C c for Ctrl+C)\n", .{});
+            } else if (found_pod and found_attach) {
+                print("Usage: hexe pod attach [OPTIONS]\n\nInteractive attach to a pod socket (raw tty).\n\nOptions:\n  -u, --uuid <UUID>        Target pod by UUID (32 hex chars)\n  -n, --name <NAME>        Target pod by name (via pod-*.meta scan)\n  -s, --socket <PATH>      Target pod by explicit socket path\n      --detach <key>       Detach prefix Ctrl+<key> (default: b), then press 'd'\n", .{});
+            } else if (found_pod and found_kill) {
+                print("Usage: hexe pod kill [OPTIONS]\n\nKill a pod process (reads pid from pod-*.meta).\n\nOptions:\n  -u, --uuid <UUID>        Target pod by UUID\n  -n, --name <NAME>        Target pod by name (newest created_at wins)\n  -s, --signal <SIG>       TERM|KILL|INT|HUP (default: TERM)\n  -f, --force              Follow with SIGKILL\n", .{});
+            } else if (found_pod and found_gc) {
+                print("Usage: hexe pod gc [--dry-run]\n\nDelete stale pod-*.meta and broken pod@*.sock aliases.\n\nOptions:\n  -n, --dry-run            Only print what would be deleted\n", .{});
+            } else if (found_mux and found_new) {
+                print("Usage: hexe mux new [OPTIONS]\n\nCreate new multiplexer session\n\nOptions:\n  -n, --name <NAME>        Session name\n  -d, --debug              Enable debug output\n  -L, --logfile <PATH>     Log debug output to PATH\n  -I, --instance <NAME>    Use instance namespace\n  -T, --test-only          Create an isolated test instance\n", .{});
         } else if (found_mux and found_attach) {
-            print("Usage: hexe mux attach [OPTIONS] <name>\n\nAttach to existing session by name or UUID prefix\n\nOptions:\n  -d, --debug           Enable debug output\n  -L, --logfile <PATH>  Log debug output to PATH\n", .{});
+            print("Usage: hexe mux attach [OPTIONS] <name>\n\nAttach to existing session by name or UUID prefix\n\nOptions:\n  -d, --debug              Enable debug output\n  -L, --logfile <PATH>     Log debug output to PATH\n  -I, --instance <NAME>    Target a specific instance\n", .{});
         } else if (found_mux and found_float) {
-            print("Usage: hexe mux float [OPTIONS]\n\nSpawn a transient float pane (blocking)\n\nOptions:\n  -u, --uuid <UUID>            Target mux UUID (optional if inside mux)\n  -c, --command <COMMAND>      Command to run in the float\n      --title <TEXT>           Border title for the float\n      --cwd <PATH>             Working directory for the float\n      --result-file <PATH>     Read selection from PATH after exit\n      --pass-env               Send current environment to the pod\n      --extra-env <KEY=VAL,..>  Extra environment variables (comma-separated)\n      --isolated               Run command with filesystem/cgroup isolation\n", .{});
+            print("Usage: hexe mux float [OPTIONS]\n\nSpawn a transient float pane (blocking)\n\nOptions:\n  -u, --uuid <UUID>             Target mux UUID (optional if inside mux)\n  -c, --command <COMMAND>       Command to run in the float\n      --title <TEXT>            Border title for the float\n      --cwd <PATH>              Working directory for the float\n      --result-file <PATH>      Read selection from PATH after exit\n      --pass-env                Send current environment to the pod\n      --extra-env <KEY=VAL,..>   Extra environment variables (comma-separated)\n      --isolated                Run command with filesystem/cgroup isolation\n  -I, --instance <NAME>         Target a specific instance\n", .{});
         } else if (found_shp and found_prompt) {
             print("Usage: hexe shp prompt [OPTIONS]\n\nRender shell prompt\n\nOptions:\n  -s, --status <N>    Exit status of last command\n  -d, --duration <N>  Duration of last command in ms\n  -r, --right         Render right prompt\n  -S, --shell <SHELL> Shell type (bash, zsh, fish)\n  -j, --jobs <N>      Number of background jobs\n", .{});
         } else if (found_shp and found_init) {
             print("Usage: hexe shp init <shell> [--no-comms]\n\nPrint shell initialization script\n\nSupported shells: bash, zsh, fish\n\nOptions:\n      --no-comms  Disable shell->mux communication hooks\n", .{});
+        } else if (found_shp and found_spinner) {
+            print(
+                "Usage: hexe shp spinner <name> [OPTIONS]\n\nRender a spinner frame (or animate it in-place).\n\nOptions:\n  -w, --width <N>       Frame width (default: 8)\n  -i, --interval <MS>   Frame step in ms (default: 75)\n  -H, --hold <N>        Hold frames at each end (default: 9)\n  -l, --loop            Animate continuously until Ctrl+C\n\nAvailable spinners:\n  knight_rider\n",
+                .{},
+            );
         } else if (found_pop and found_notify) {
             print("Usage: hexe pop notify [OPTIONS] <message>\n\nShow notification\n\nOptions:\n  -u, --uuid <UUID>     Target mux/tab/pane UUID\n  -t, --timeout <MS>    Duration in milliseconds (default: 3000)\n", .{});
         } else if (found_pop and found_confirm) {
@@ -218,18 +363,16 @@ pub fn main() !void {
             print("Usage: hexe pop choose [OPTIONS] <message>\n\nSelect from options (blocking)\n\nOptions:\n  -u, --uuid <UUID>      Target mux/tab/pane UUID\n  -t, --timeout <MS>     Auto-cancel after milliseconds\n  -i, --items <ITEMS>    Comma-separated list of options\n\nExit codes: 0=selected (index on stdout), 1=cancelled/timeout\n", .{});
         } else if (found_pop) {
             print("Usage: hexe pop <command>\n\nPopup overlays\n\nCommands:\n  notify   Show notification\n  confirm  Yes/No dialog\n  choose   Select from options\n", .{});
-        } else if (found_com) {
-            print("Usage: hexe com <command>\n\nCommunication with sessions and panes\n\nCommands:\n  list         List all sessions and panes\n  info         Show current pane info\n  notify       Send notification\n  send         Send keystrokes to pane\n  exit-intent  Ask mux permission before shell exits\n  shell-event  Send shell metadata to mux\n", .{});
         } else if (found_ses) {
-            print("Usage: hexe ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  info    Show daemon info\n", .{});
+            print("Usage: hexe ses <command>\n\nSession daemon management\n\nCommands:\n  daemon  Start the session daemon\n  status  Show daemon info\n  list    List sessions and panes\n", .{});
         } else if (found_pod) {
-            print("Usage: hexe pod <command>\n\nPer-pane PTY daemon (internal)\n\nCommands:\n  daemon  Start a per-pane pod daemon\n", .{});
+            print("Usage: hexe pod <command>\n\nPer-pane PTY daemon\n\nCommands:\n  daemon  Start a per-pane pod daemon\n  new     Create a standalone pod\n  list    List discoverable pods\n  send    Send input to a pod\n  attach  Attach to a pod\n  kill    Kill a pod\n  gc      Clean stale pod metadata\n", .{});
         } else if (found_mux) {
-            print("Usage: hexe mux <command>\n\nTerminal multiplexer\n\nCommands:\n  new     Create new multiplexer session\n  attach  Attach to existing session\n  float   Spawn a transient float pane\n", .{});
+            print("Usage: hexe mux <command>\n\nTerminal multiplexer\n\nCommands:\n  new     Create new multiplexer session\n  attach  Attach to existing session\n  float   Spawn a transient float pane\n  notify  Send notification\n  send    Send keystrokes to pane\n  info    Show pane info\n", .{});
         } else if (found_shp) {
-            print("Usage: hexe shp <command>\n\nShell prompt renderer\n\nCommands:\n  prompt  Render shell prompt\n  init    Print shell initialization script\n", .{});
+            print("Usage: hexe shp <command>\n\nShell prompt renderer\n\nCommands:\n  prompt       Render shell prompt\n  init         Print shell initialization script\n  exit-intent  Ask mux permission before shell exits\n  shell-event  Send shell metadata to mux\n  spinner      Render/animate a spinner\n", .{});
         } else {
-            print("Usage: hexe <command>\n\nHexe terminal multiplexer\n\nCommands:\n  com  Communication with sessions and panes\n  ses  Session daemon management\n  pod  Per-pane PTY daemon (internal)\n  mux  Terminal multiplexer\n  shp  Shell prompt renderer\n  pop  Popup overlays\n", .{});
+            print("Usage: hexe <command>\n\nHexe terminal multiplexer\n\nCommands:\n  ses  Session daemon management\n  pod  Per-pane PTY daemon (internal)\n  mux  Terminal multiplexer\n  shp  Shell prompt renderer\n  pop  Popup overlays\n", .{});
         }
         return;
     }
@@ -251,9 +394,6 @@ pub fn main() !void {
             } else if (ses_cmd.happened) {
                 const help = try ses_cmd.usage(null);
                 print("{s}\n", .{help});
-            } else if (com_cmd.happened) {
-                const help = try com_cmd.usage(null);
-                print("{s}\n", .{help});
             } else {
                 const help = try parser.usage(null);
                 print("{s}\n", .{help});
@@ -264,34 +404,34 @@ pub fn main() !void {
     };
 
     // Route to handlers
-    if (com_cmd.happened) {
-        if (com_list.happened) {
-            try com.runList(allocator, com_list_details.*);
-        } else if (com_info.happened) {
-            try com.runInfo(allocator, com_info_uuid.*, com_info_creator.*, com_info_last.*);
-        } else if (com_notify.happened) {
-            try com.runNotify(allocator, com_notify_uuid.*, com_notify_creator.*, com_notify_last.*, com_notify_broadcast.*, com_notify_msg.*);
-        } else if (com_send.happened) {
-            try com.runSend(allocator, com_send_uuid.*, com_send_creator.*, com_send_last.*, com_send_broadcast.*, com_send_enter.*, com_send_ctrl.*, com_send_text.*);
-        } else if (com_exit_intent.happened) {
-            try com.runExitIntent(allocator);
-        } else if (com_shell_event.happened) {
-            try com.runShellEvent(allocator, com_shell_event_cmd.*, com_shell_event_status.*, com_shell_event_duration.*, com_shell_event_cwd.*, com_shell_event_jobs.*);
-        }
-    } else if (ses_cmd.happened) {
-        // Check which ses subcommand
-        for (ses_cmd.commands.items) |cmd| {
-            if (cmd.happened) {
-                if (std.mem.eql(u8, cmd.name, "daemon")) {
-                    try runSesDaemon(ses_daemon_fg.*, ses_daemon_dbg.*, ses_daemon_log.*);
-                } else if (std.mem.eql(u8, cmd.name, "info")) {
-                    try runSesInfo(allocator);
+    if (ses_cmd.happened) {
+        if (ses_daemon.happened) {
+            if (ses_daemon_instance.*.len > 0) setInstanceFromCli(ses_daemon_instance.*);
+            if (ses_daemon_test_only.*) {
+                setTestOnlyEnv();
+                if (!hasInstanceEnv()) {
+                    print("Error: --test-only requires --instance or HEXE_INSTANCE\n", .{});
+                    return;
                 }
-                return;
             }
+            try runSesDaemon(ses_daemon_fg.*, ses_daemon_dbg.*, ses_daemon_log.*);
+        } else if (ses_status.happened) {
+            if (ses_status_instance.*.len > 0) setInstanceFromCli(ses_status_instance.*);
+            try runSesStatus(allocator);
+        } else if (ses_list.happened) {
+            if (ses_list_instance.*.len > 0) setInstanceFromCli(ses_list_instance.*);
+            try cli_cmds.runList(allocator, ses_list_details.*);
         }
     } else if (pod_cmd.happened) {
         if (pod_daemon.happened) {
+            if (pod_daemon_instance.*.len > 0) setInstanceFromCli(pod_daemon_instance.*);
+            if (pod_daemon_test_only.*) {
+                setTestOnlyEnv();
+                if (!hasInstanceEnv()) {
+                    print("Error: --test-only requires --instance or HEXE_INSTANCE\n", .{});
+                    return;
+                }
+            }
             try runPodDaemon(
                 pod_daemon_fg.*,
                 pod_daemon_uuid.*,
@@ -299,18 +439,83 @@ pub fn main() !void {
                 pod_daemon_socket.*,
                 pod_daemon_shell.*,
                 pod_daemon_cwd.*,
+                pod_daemon_labels.*,
+                pod_daemon_write_meta.*,
+                pod_daemon_no_write_meta.*,
+                pod_daemon_write_alias.*,
                 pod_daemon_dbg.*,
                 pod_daemon_log.*,
             );
+        } else if (pod_list.happened) {
+            // No ses dependency; uses ipc.getSocketDir() + .meta files.
+            const alive_only = pod_list_alive.*;
+            const probe = pod_list_probe.* or alive_only;
+            try cli_cmds.runPodList(allocator, pod_list_where.*, probe, alive_only);
+        } else if (pod_new.happened) {
+            if (pod_new_instance.*.len > 0) setInstanceFromCli(pod_new_instance.*);
+            if (pod_new_test_only.*) {
+                setTestOnlyEnv();
+                if (!hasInstanceEnv()) {
+                    print("Error: --test-only requires --instance or HEXE_INSTANCE\n", .{});
+                    return;
+                }
+            }
+            try cli_cmds.runPodNew(
+                allocator,
+                pod_new_name.*,
+                pod_new_shell.*,
+                pod_new_cwd.*,
+                pod_new_labels.*,
+                pod_new_alias.*,
+                pod_new_dbg.*,
+                pod_new_log.*,
+            );
+        } else if (pod_send.happened) {
+            try cli_cmds.runPodSend(
+                allocator,
+                pod_send_uuid.*,
+                pod_send_name.*,
+                pod_send_socket.*,
+                pod_send_enter.*,
+                pod_send_ctrl.*,
+                pod_send_text.*,
+            );
+        } else if (pod_attach.happened) {
+            try cli_cmds.runPodAttach(
+                allocator,
+                pod_attach_uuid.*,
+                pod_attach_name.*,
+                pod_attach_socket.*,
+                pod_attach_detach.*,
+            );
+        } else if (pod_kill.happened) {
+            try cli_cmds.runPodKill(
+                allocator,
+                pod_kill_uuid.*,
+                pod_kill_name.*,
+                pod_kill_signal.*,
+                pod_kill_force.*,
+            );
+        } else if (pod_gc.happened) {
+            try cli_cmds.runPodGc(allocator, pod_gc_dry.*);
         }
         return;
     } else if (mux_cmd.happened) {
         if (mux_new.happened) {
+            if (mux_new_instance.*.len > 0) {
+                setInstanceFromCli(mux_new_instance.*);
+                if (mux_new_test_only.*) setTestOnlyEnv();
+            } else if (mux_new_test_only.*) {
+                // Always isolate test sessions, even if HEXE_INSTANCE is set in the environment.
+                setGeneratedTestInstance();
+            }
             try runMuxNew(mux_new_name.*, mux_new_dbg.*, mux_new_log.*);
         } else if (mux_attach.happened) {
+            if (mux_attach_instance.*.len > 0) setInstanceFromCli(mux_attach_instance.*);
             try runMuxAttach(mux_attach_name.*, mux_attach_dbg.*, mux_attach_log.*);
         } else if (mux_float.happened) {
-            try runMuxFloat(
+            if (mux_float_instance.*.len > 0) setInstanceFromCli(mux_float_instance.*);
+            try cli_cmds.runMuxFloat(
                 allocator,
                 mux_float_uuid.*,
                 mux_float_command.*,
@@ -321,12 +526,55 @@ pub fn main() !void {
                 mux_float_extra_env.*,
                 mux_float_isolated.*,
             );
+        } else if (mux_notify.happened) {
+            if (mux_notify_instance.*.len > 0) setInstanceFromCli(mux_notify_instance.*);
+            try cli_cmds.runNotify(
+                allocator,
+                mux_notify_uuid.*,
+                mux_notify_creator.*,
+                mux_notify_last.*,
+                mux_notify_broadcast.*,
+                mux_notify_msg.*,
+            );
+        } else if (mux_send.happened) {
+            if (mux_send_instance.*.len > 0) setInstanceFromCli(mux_send_instance.*);
+            try cli_cmds.runSend(
+                allocator,
+                mux_send_uuid.*,
+                mux_send_creator.*,
+                mux_send_last.*,
+                mux_send_broadcast.*,
+                mux_send_enter.*,
+                mux_send_ctrl.*,
+                mux_send_text.*,
+            );
+        } else if (mux_focus.happened) {
+            try cli_cmds.runFocusMove(allocator, mux_focus_dir.*);
+        } else if (mux_info.happened) {
+            if (mux_info_instance.*.len > 0) setInstanceFromCli(mux_info_instance.*);
+            try cli_cmds.runInfo(allocator, mux_info_uuid.*, mux_info_creator.*, mux_info_last.*);
         }
     } else if (shp_cmd.happened) {
         if (shp_prompt.happened) {
             try runShpPrompt(shp_prompt_status.*, shp_prompt_duration.*, shp_prompt_right.*, shp_prompt_shell.*, shp_prompt_jobs.*);
         } else if (shp_init.happened) {
             try runShpInit(shp_init_shell.*, shp_init_no_comms.*);
+        } else if (shp_exit_intent.happened) {
+            try cli_cmds.runExitIntent(allocator);
+        } else if (shp_shell_event.happened) {
+            try cli_cmds.runShellEvent(
+                allocator,
+                shp_shell_event_cmd.*,
+                shp_shell_event_status.*,
+                shp_shell_event_duration.*,
+                shp_shell_event_cwd.*,
+                shp_shell_event_jobs.*,
+                shp_shell_event_phase.*,
+                shp_shell_event_running.*,
+                shp_shell_event_started_at.*,
+            );
+        } else if (shp_spinner.happened) {
+            try runShpSpinner(shp_spinner_name.*, shp_spinner_width.*, shp_spinner_interval.*, shp_spinner_hold.*, shp_spinner_loop.*);
         }
     } else if (pop_cmd.happened) {
         if (pop_notify.happened) {
@@ -348,7 +596,7 @@ fn runSesDaemon(foreground: bool, debug: bool, log_file: []const u8) !void {
     try ses.run(.{ .daemon = !foreground, .debug = debug, .log_file = if (log_file.len > 0) log_file else null });
 }
 
-fn runSesInfo(allocator: std.mem.Allocator) !void {
+fn runSesStatus(allocator: std.mem.Allocator) !void {
     const socket_path = try ipc.getSesSocketPath(allocator);
     defer allocator.free(socket_path);
 
@@ -368,11 +616,26 @@ fn runSesInfo(allocator: std.mem.Allocator) !void {
 // POD handlers
 // ============================================================================
 
-fn runPodDaemon(foreground: bool, uuid: []const u8, name: []const u8, socket_path: []const u8, shell: []const u8, cwd: []const u8, debug: bool, log_file: []const u8) !void {
+fn runPodDaemon(
+    foreground: bool,
+    uuid: []const u8,
+    name: []const u8,
+    socket_path: []const u8,
+    shell: []const u8,
+    cwd: []const u8,
+    labels: []const u8,
+    write_meta: bool,
+    no_write_meta: bool,
+    write_alias: bool,
+    debug: bool,
+    log_file: []const u8,
+) !void {
     if (uuid.len == 0 or socket_path.len == 0) {
         print("Error: --uuid and --socket required\n", .{});
         return;
     }
+
+    const effective_write_meta = if (no_write_meta) false else if (write_meta) true else true;
 
     try pod.run(.{
         .daemon = !foreground,
@@ -381,6 +644,9 @@ fn runPodDaemon(foreground: bool, uuid: []const u8, name: []const u8, socket_pat
         .socket_path = socket_path,
         .shell = if (shell.len > 0) shell else null,
         .cwd = if (cwd.len > 0) cwd else null,
+        .labels = if (labels.len > 0) labels else null,
+        .write_meta = effective_write_meta,
+        .write_alias = write_alias,
         .debug = debug,
         .log_file = if (log_file.len > 0) log_file else null,
         .emit_ready = foreground,
@@ -413,203 +679,6 @@ fn runMuxAttach(name: []const u8, debug: bool, log_file: []const u8) !void {
     }
 }
 
-fn runMuxFloat(
-    allocator: std.mem.Allocator,
-    mux_uuid: []const u8,
-    command: []const u8,
-    title: []const u8,
-    cwd: []const u8,
-    result_file: []const u8,
-    pass_env: bool,
-    extra_env: []const u8,
-    isolated: bool,
-) !void {
-    if (command.len == 0) {
-        print("Error: --command is required\n", .{});
-        return;
-    }
-
-    var socket_path_buf: ?[]const u8 = null;
-    if (mux_uuid.len > 0) {
-        socket_path_buf = try ipc.getMuxSocketPath(allocator, mux_uuid);
-    } else {
-        socket_path_buf = std.posix.getenv("HEXE_MUX_SOCKET");
-    }
-
-    const socket_path = socket_path_buf orelse {
-        print("Error: --uuid required (or run inside hexe mux)\n", .{});
-        return;
-    };
-    defer if (mux_uuid.len > 0) allocator.free(socket_path);
-
-    var env_json: std.ArrayList(u8) = .empty;
-    defer env_json.deinit(allocator);
-    var env_file_path: ?[]u8 = null;
-    defer if (env_file_path) |path| allocator.free(path);
-    if (pass_env) {
-        const tmp_uuid = core.ipc.generateUuid();
-        env_file_path = std.fmt.allocPrint(allocator, "/tmp/hexe-float-env-{s}.env", .{tmp_uuid}) catch null;
-        if (env_file_path) |path| {
-            const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch null;
-            if (file) |env_file| {
-                defer env_file.close();
-                var env_map = std.process.getEnvMap(allocator) catch std.process.EnvMap.init(allocator);
-                defer env_map.deinit();
-                var it = env_map.iterator();
-                while (it.next()) |entry| {
-                    env_file.writeAll(entry.key_ptr.*) catch {};
-                    env_file.writeAll("=") catch {};
-                    env_file.writeAll(entry.value_ptr.*) catch {};
-                    env_file.writeAll("\n") catch {};
-                }
-            }
-        }
-    }
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("mux is not running\n", .{});
-            return;
-        }
-        return err;
-    };
-    defer client.close();
-
-    var extra_env_json: std.ArrayList(u8) = .empty;
-    defer extra_env_json.deinit(allocator);
-    if (extra_env.len > 0) {
-        try extra_env_json.appendSlice(allocator, "[");
-        var it = std.mem.splitScalar(u8, extra_env, ',');
-        var first = true;
-        while (it.next()) |item| {
-            const trimmed = std.mem.trim(u8, item, " ");
-            if (trimmed.len == 0) continue;
-            if (!first) try extra_env_json.appendSlice(allocator, ",");
-            try extra_env_json.appendSlice(allocator, "\"");
-            try appendJsonEscaped(&extra_env_json, allocator, trimmed);
-            try extra_env_json.appendSlice(allocator, "\"");
-            first = false;
-        }
-        try extra_env_json.appendSlice(allocator, "]");
-    }
-
-    var msg_buf: std.ArrayList(u8) = .empty;
-    defer msg_buf.deinit(allocator);
-    var writer = msg_buf.writer(allocator);
-    try writer.writeAll("{\"type\":\"float\",\"wait\":true");
-    try writer.writeAll(",\"command\":\"");
-    try writeJsonEscaped(writer, command);
-    try writer.writeAll("\"");
-    if (title.len > 0) {
-        try writer.writeAll(",\"title\":\"");
-        try writeJsonEscaped(writer, title);
-        try writer.writeAll("\"");
-    }
-    if (cwd.len > 0) {
-        try writer.writeAll(",\"cwd\":\"");
-        try writeJsonEscaped(writer, cwd);
-        try writer.writeAll("\"");
-    }
-    if (result_file.len > 0) {
-        try writer.writeAll(",\"result_file\":\"");
-        try writeJsonEscaped(writer, result_file);
-        try writer.writeAll("\"");
-    }
-    if (env_file_path) |path| {
-        try writer.writeAll(",\"env_file\":\"");
-        try writeJsonEscaped(writer, path);
-        try writer.writeAll("\"");
-    }
-    if (env_json.items.len > 0) {
-        try writer.print(",\"env\":{s}", .{env_json.items});
-    }
-    if (extra_env_json.items.len > 0) {
-        try writer.print(",\"extra_env\":{s}", .{extra_env_json.items});
-    }
-    if (isolated) {
-        try writer.writeAll(",\"isolated\":true");
-    }
-    try writer.writeAll("}");
-
-    var conn = client.toConnection();
-    conn.sendLine(msg_buf.items) catch |err| {
-        print("Error: {s}\n", .{@errorName(err)});
-        return;
-    };
-
-    var resp_buf: [65536]u8 = undefined;
-    const response = conn.recvLine(&resp_buf) catch null;
-    if (response == null) {
-        print("No response from mux\n", .{});
-        return;
-    }
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.?, .{}) catch {
-        print("Invalid response from mux\n", .{});
-        return;
-    };
-    defer parsed.deinit();
-
-    const root = parsed.value.object;
-    if (root.get("type")) |t| {
-        if (std.mem.eql(u8, t.string, "float_result")) {
-            const stdout_content = if (root.get("stdout")) |v| v.string else "";
-            if (stdout_content.len > 0) {
-                _ = std.posix.write(std.posix.STDOUT_FILENO, stdout_content) catch {};
-                _ = std.posix.write(std.posix.STDOUT_FILENO, "\n") catch {};
-            }
-            const exit_code: u8 = if (root.get("exit_code")) |v| @intCast(@max(@as(i64, 0), v.integer)) else 0;
-            std.process.exit(exit_code);
-        }
-        if (std.mem.eql(u8, t.string, "error")) {
-            if (root.get("message")) |m| {
-                print("Error: {s}\n", .{m.string});
-            }
-            return;
-        }
-    }
-
-    print("Unexpected response from mux\n", .{});
-}
-
-fn appendJsonEscaped(list: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
-            else => {
-                if (ch < 0x20) {
-                    try list.append(allocator, ' ');
-                } else {
-                    try list.append(allocator, ch);
-                }
-            },
-        }
-    }
-}
-
-fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (ch < 0x20) {
-                    try writer.writeByte(' ');
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
-        }
-    }
-}
-
 // ============================================================================
 // SHP handlers
 // ============================================================================
@@ -633,218 +702,224 @@ fn runShpInit(shell: []const u8, no_comms: bool) !void {
     }
 }
 
+fn runShpSpinner(name: []const u8, width_i: i64, interval_i: i64, hold_i: i64, loop: bool) !void {
+    const stdout = std.fs.File.stdout();
+
+    if (name.len == 0) {
+        print("Error: spinner name required\n", .{});
+        return;
+    }
+
+    const width: u8 = if (width_i > 0 and width_i <= 64) @intCast(width_i) else 8;
+    const interval_ms: u64 = if (interval_i > 0 and interval_i <= 10_000) @intCast(interval_i) else 75;
+    const hold_frames: u8 = if (hold_i >= 0 and hold_i <= 60) @intCast(hold_i) else 9;
+
+    const start_ms: u64 = @intCast(std.time.milliTimestamp());
+
+    if (!loop) {
+        const now_ms: u64 = start_ms;
+        const frame = shp.animations.renderAnsiWithOptions(name, now_ms, start_ms, width, interval_ms, hold_frames);
+        try stdout.writeAll(frame);
+        try stdout.writeAll("\n");
+        return;
+    }
+
+    while (true) {
+        const now_ms: u64 = @intCast(std.time.milliTimestamp());
+        const frame = shp.animations.renderAnsiWithOptions(name, now_ms, start_ms, width, interval_ms, hold_frames);
+
+        // NOTE: frame includes ANSI escapes; do not truncate/pad by bytes.
+        // Use EL (erase to end of line) so variable-length frames don't leave artifacts.
+        stdout.writeAll("\r") catch break;
+        stdout.writeAll(frame) catch break;
+        stdout.writeAll("\x1b[0K") catch break;
+        std.Thread.sleep(interval_ms * std.time.ns_per_ms);
+    }
+
+    // Clear line on exit.
+    stdout.writeAll("\r\n") catch {};
+}
+
 // ============================================================================
 // POP handlers
 // ============================================================================
 
 fn runPopNotify(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, message: []const u8) !void {
+    const wire = core.wire;
+    const posix = std.posix;
+
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
+    var target_uuid: [32]u8 = undefined;
+    if (uuid.len >= 32) {
+        @memcpy(&target_uuid, uuid[0..32]);
+    } else {
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --uuid required (or run inside hexe mux)\n", .{});
             return;
-        }
-        return err;
+        };
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+        } else return;
+    }
+
+    const fd = cli_cmds.connectSesCliChannel(allocator) orelse return;
+    defer posix.close(fd);
+
+    const timeout_ms: i32 = if (timeout > 0) @intCast(timeout) else 3000;
+    const tn = wire.TargetedNotify{
+        .uuid = target_uuid,
+        .timeout_ms = timeout_ms,
+        .msg_len = @intCast(message.len),
     };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [4096]u8 = undefined;
-
-    // Determine target UUID: explicit > current pane
-    var target_uuid: ?[]const u8 = null;
-    if (uuid.len > 0) {
-        target_uuid = uuid;
-    } else {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
-    }
-
-    if (target_uuid) |t| {
-        const timeout_ms = if (timeout > 0) timeout else 3000; // Default 3 seconds
-        const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_notify\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}", .{ t, message, timeout_ms });
-        try conn.sendLine(msg);
-    } else {
-        print("Error: --uuid required (or run inside hexe mux)\n", .{});
-        return;
-    }
-
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch return;
-        defer parsed.deinit();
-
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                if (parsed.value.object.get("message")) |m| {
-                    print("Error: {s}\n", .{m.string});
-                }
-            }
-        }
-    }
+    wire.writeControlWithTrail(fd, .targeted_notify, std.mem.asBytes(&tn), message) catch {};
 }
 
 fn runPopConfirm(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, message: []const u8) !void {
+    const wire = core.wire;
+    const posix = std.posix;
+
     if (message.len == 0) {
         print("Error: message is required\n", .{});
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
+    var target_uuid: [32]u8 = undefined;
+    if (uuid.len >= 32) {
+        @memcpy(&target_uuid, uuid[0..32]);
+    } else {
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --uuid required (or run inside hexe mux)\n", .{});
             return;
-        }
-        return err;
-    };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [4096]u8 = undefined;
-
-    // Determine target UUID
-    var target_uuid: ?[]const u8 = null;
-    if (uuid.len > 0) {
-        target_uuid = uuid;
-    } else {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
-    }
-
-    if (target_uuid) |t| {
-        if (timeout > 0) {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"timeout_ms\":{d}}}", .{ t, message, timeout });
-            try conn.sendLine(msg);
-        } else {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_confirm\",\"uuid\":\"{s}\",\"message\":\"{s}\"}}", .{ t, message });
-            try conn.sendLine(msg);
-        }
-    } else {
-        print("Error: --uuid required (or run inside hexe mux)\n", .{});
-        return;
-    }
-
-    // Wait for response (blocking)
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
-            std.process.exit(1);
         };
-        defer parsed.deinit();
-
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                if (parsed.value.object.get("message")) |m| {
-                    print("Error: {s}\n", .{m.string});
-                }
-                std.process.exit(1);
-            } else if (std.mem.eql(u8, t.string, "pop_response")) {
-                if (parsed.value.object.get("confirmed")) |conf| {
-                    if (conf == .bool and conf.bool) {
-                        std.process.exit(0); // Confirmed
-                    }
-                }
-                std.process.exit(1); // Cancelled, timeout, or not confirmed
-            }
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+        } else {
+            std.process.exit(1);
         }
     }
-    std.process.exit(1);
+
+    const fd = cli_cmds.connectSesCliChannel(allocator) orelse std.process.exit(1);
+    // Don't close fd — we need to read the response.
+
+    const timeout_ms: i32 = if (timeout > 0) @intCast(timeout) else 0;
+    const pc = wire.PopConfirm{
+        .uuid = target_uuid,
+        .timeout_ms = timeout_ms,
+        .msg_len = @intCast(message.len),
+    };
+    wire.writeControlWithTrail(fd, .pop_confirm, std.mem.asBytes(&pc), message) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+
+    // Wait for binary PopResponse.
+    const hdr = wire.readControlHeader(fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type != .pop_response or hdr.payload_len < @sizeOf(wire.PopResponse)) {
+        posix.close(fd);
+        std.process.exit(1);
+    }
+    const resp = wire.readStruct(wire.PopResponse, fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    posix.close(fd);
+
+    if (resp.response_type == 1) {
+        std.process.exit(0); // Confirmed
+    }
+    std.process.exit(1); // Cancelled or timeout
 }
 
 fn runPopChoose(allocator: std.mem.Allocator, uuid: []const u8, timeout: i64, items: []const u8, message: []const u8) !void {
+    const wire = core.wire;
+    const posix = std.posix;
+
     if (items.len == 0) {
         print("Error: --items is required\n", .{});
         return;
     }
 
-    const socket_path = try ipc.getSesSocketPath(allocator);
-    defer allocator.free(socket_path);
-
-    var client = ipc.Client.connect(socket_path) catch |err| {
-        if (err == error.ConnectionRefused or err == error.FileNotFound) {
-            print("ses daemon is not running\n", .{});
-            return;
-        }
-        return err;
-    };
-    defer client.close();
-
-    var conn = client.toConnection();
-    var buf: [8192]u8 = undefined;
-
-    // Determine target UUID
-    var target_uuid: ?[]const u8 = null;
-    if (uuid.len > 0) {
-        target_uuid = uuid;
+    var target_uuid: [32]u8 = undefined;
+    if (uuid.len >= 32) {
+        @memcpy(&target_uuid, uuid[0..32]);
     } else {
-        target_uuid = std.posix.getenv("HEXE_PANE_UUID");
+        const env_uuid = std.posix.getenv("HEXE_PANE_UUID") orelse {
+            print("Error: --uuid required (or run inside hexe mux)\n", .{});
+            return;
+        };
+        if (env_uuid.len >= 32) {
+            @memcpy(&target_uuid, env_uuid[0..32]);
+        } else {
+            std.process.exit(1);
+        }
     }
 
-    if (target_uuid) |t| {
-        // Build items JSON array from comma-separated string
-        var items_json: std.ArrayList(u8) = .empty;
-        defer items_json.deinit(allocator);
-        try items_json.appendSlice(allocator, "[");
+    // Build trailing data: title + length-prefixed items.
+    var trail: std.ArrayList(u8) = .empty;
+    defer trail.deinit(allocator);
 
-        var it = std.mem.splitScalar(u8, items, ',');
-        var first = true;
-        while (it.next()) |item| {
-            const trimmed = std.mem.trim(u8, item, " ");
-            if (trimmed.len > 0) {
-                if (!first) try items_json.appendSlice(allocator, ",");
-                try items_json.appendSlice(allocator, "\"");
-                try items_json.appendSlice(allocator, trimmed);
-                try items_json.appendSlice(allocator, "\"");
-                first = false;
-            }
-        }
-        try items_json.appendSlice(allocator, "]");
+    const title = if (message.len > 0) message else "Select option";
+    try trail.appendSlice(allocator, title);
 
-        const title = if (message.len > 0) message else "Select option";
-        if (timeout > 0) {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s},\"timeout_ms\":{d}}}", .{ t, title, items_json.items, timeout });
-            try conn.sendLine(msg);
-        } else {
-            const msg = try std.fmt.bufPrint(&buf, "{{\"type\":\"pop_choose\",\"uuid\":\"{s}\",\"message\":\"{s}\",\"items\":{s}}}", .{ t, title, items_json.items });
-            try conn.sendLine(msg);
+    // Count and encode items.
+    var item_count: u16 = 0;
+    var it = std.mem.splitScalar(u8, items, ',');
+    while (it.next()) |item| {
+        const trimmed = std.mem.trim(u8, item, " ");
+        if (trimmed.len > 0) {
+            const len: u16 = @intCast(trimmed.len);
+            try trail.appendSlice(allocator, std.mem.asBytes(&len));
+            try trail.appendSlice(allocator, trimmed);
+            item_count += 1;
         }
-    } else {
-        print("Error: --uuid required (or run inside hexe mux)\n", .{});
+    }
+
+    if (item_count == 0) {
+        print("Error: no valid items provided\n", .{});
         return;
     }
 
-    // Wait for response (blocking)
-    var resp_buf: [1024]u8 = undefined;
-    if (try conn.recvLine(&resp_buf)) |r| {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, r, .{}) catch {
-            std.process.exit(1);
-        };
-        defer parsed.deinit();
+    const fd = cli_cmds.connectSesCliChannel(allocator) orelse std.process.exit(1);
 
-        if (parsed.value.object.get("type")) |t| {
-            if (std.mem.eql(u8, t.string, "error")) {
-                if (parsed.value.object.get("message")) |m| {
-                    print("Error: {s}\n", .{m.string});
-                }
-                std.process.exit(1);
-            } else if (std.mem.eql(u8, t.string, "pop_response")) {
-                if (parsed.value.object.get("selected")) |sel| {
-                    if (sel == .integer) {
-                        print("{d}\n", .{sel.integer}); // Output selected index
-                        std.process.exit(0);
-                    }
-                }
-                std.process.exit(1); // Cancelled or timeout
-            }
-        }
+    const timeout_ms: i32 = if (timeout > 0) @intCast(timeout) else 0;
+    const pc = wire.PopChoose{
+        .uuid = target_uuid,
+        .timeout_ms = timeout_ms,
+        .title_len = @intCast(title.len),
+        .item_count = item_count,
+    };
+    wire.writeControlWithTrail(fd, .pop_choose, std.mem.asBytes(&pc), trail.items) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+
+    // Wait for binary PopResponse.
+    const hdr = wire.readControlHeader(fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    const msg_type: wire.MsgType = @enumFromInt(hdr.msg_type);
+    if (msg_type != .pop_response or hdr.payload_len < @sizeOf(wire.PopResponse)) {
+        posix.close(fd);
+        std.process.exit(1);
     }
-    std.process.exit(1);
+    const resp = wire.readStruct(wire.PopResponse, fd) catch {
+        posix.close(fd);
+        std.process.exit(1);
+    };
+    posix.close(fd);
+
+    if (resp.response_type == 2) {
+        print("{d}\n", .{resp.selected_idx});
+        std.process.exit(0);
+    }
+    std.process.exit(1); // Cancelled or timeout
 }

@@ -1,10 +1,15 @@
 const std = @import("std");
 const posix = std.posix;
+const core = @import("core");
+const wire = core.wire;
+const pod_protocol = core.pod_protocol;
 
 const terminal = @import("terminal.zig");
 
 const State = @import("state.zig").State;
+const Pane = @import("pane.zig").Pane;
 
+const mux = @import("main.zig");
 const loop_input = @import("loop_input.zig");
 const loop_ipc = @import("loop_ipc.zig");
 const loop_render = @import("loop_render.zig");
@@ -24,8 +29,8 @@ pub fn runMainLoop(state: *State) !void {
     // Some terminals will start emitting CSI-u sequences when they see unknown
     // keyboard mode requests, and any parsing mismatch can leak garbage into the
     // underlying shell (e.g. "3u" fragments).
-    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1006h");
-    defer stdout.writeAll("\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
+    try stdout.writeAll("\x1b[?1049h\x1b[2J\x1b[3J\x1b[H\x1b[0m\x1b(B\x1b)0\x0f\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    defer stdout.writeAll("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l") catch {};
 
     // Build poll fds.
     var poll_fds: [17]posix.pollfd = undefined; // stdin + up to 16 panes
@@ -35,7 +40,10 @@ pub fn runMainLoop(state: *State) !void {
     var last_render: i64 = std.time.milliTimestamp();
     var last_status_update: i64 = last_render;
     var last_pane_sync: i64 = last_render;
-    const status_update_interval: i64 = 250; // Update status bar every 250ms
+    // Update status bar periodically.
+    // This is also used to drive lightweight animations.
+    const status_update_interval_base: i64 = 250;
+    const status_update_interval_anim: i64 = 75;
     const pane_sync_interval: i64 = 1000; // Sync pane info (CWD, process) every 1s
 
     // Main loop.
@@ -114,50 +122,89 @@ pub fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Build poll list: stdin + all pane PTYs.
+        // Build poll list: stdin + all local pane PTYs.
         var fd_count: usize = 1;
         poll_fds[0] = .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 };
 
         var pane_it = state.currentLayout().splitIterator();
         while (pane_it.next()) |pane| {
-            if (fd_count < poll_fds.len) {
-                poll_fds[fd_count] = .{ .fd = pane.*.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
-                fd_count += 1;
+            if (pane.*.hasPollableFd()) {
+                if (fd_count < poll_fds.len) {
+                    poll_fds[fd_count] = .{ .fd = pane.*.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+                    fd_count += 1;
+                }
             }
         }
 
-        // Add floats.
+        // Add local floats (pod floats get data via VT channel).
         for (state.floats.items) |pane| {
+            if (pane.hasPollableFd()) {
+                if (fd_count < poll_fds.len) {
+                    poll_fds[fd_count] = .{ .fd = pane.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+                    fd_count += 1;
+                }
+            }
+        }
+
+        // Add SES VT channel fd (multiplexed output for all pod panes).
+        var ses_vt_fd_idx: ?usize = null;
+        if (state.ses_client.getVtFd()) |vt_fd| {
             if (fd_count < poll_fds.len) {
-                poll_fds[fd_count] = .{ .fd = pane.getFd(), .events = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR, .revents = 0 };
+                ses_vt_fd_idx = fd_count;
+                poll_fds[fd_count] = .{ .fd = vt_fd, .events = posix.POLL.IN, .revents = 0 };
                 fd_count += 1;
             }
         }
 
-        // Add ses connection fd if connected.
+        // Add SES control channel fd (async messages: notifications, shell events).
         var ses_fd_idx: ?usize = null;
-        if (state.ses_client.conn) |conn| {
+        if (state.ses_client.getCtlFd()) |ctl_fd| {
             if (fd_count < poll_fds.len) {
                 ses_fd_idx = fd_count;
-                poll_fds[fd_count] = .{ .fd = conn.fd, .events = posix.POLL.IN, .revents = 0 };
+                poll_fds[fd_count] = .{ .fd = ctl_fd, .events = posix.POLL.IN, .revents = 0 };
                 fd_count += 1;
             }
         }
 
-        // Add IPC server fd for incoming connections.
-        var ipc_fd_idx: ?usize = null;
-        if (state.ipc_server) |srv| {
-            if (fd_count < poll_fds.len) {
-                ipc_fd_idx = fd_count;
-                poll_fds[fd_count] = .{ .fd = srv.fd, .events = posix.POLL.IN, .revents = 0 };
-                fd_count += 1;
-            }
-        }
 
         // Calculate poll timeout - wait for next frame, status update, or input.
         const now = std.time.milliTimestamp();
         const since_render = now - last_render;
         const since_status = now - last_status_update;
+        const want_anim = blk: {
+            const uuid = state.getCurrentFocusedUuid() orelse break :blk false;
+
+            // If a float is focused, allow fast refresh (spinners in statusbar).
+            if (state.active_floating != null) break :blk true;
+
+            // suppress while alt-screen is active (for split-focused panes)
+            const alt = if (state.currentLayout().getFocusedPane()) |pane| pane.vt.inAltScreen() else false;
+            if (alt) break :blk false;
+
+            // Prefer direct fg_process; fallback to cached process name.
+            const fg = if (state.active_floating) |idx| blk3: {
+                if (idx < state.floats.items.len) {
+                    if (state.floats.items[idx].getFgProcess()) |p| break :blk3 p;
+                }
+                break :blk3 @as(?[]const u8, null);
+            } else if (state.currentLayout().getFocusedPane()) |pane| pane.getFgProcess() else null;
+
+            const proc_name = fg orelse blk4: {
+                if (state.getPaneProc(uuid)) |pi| {
+                    if (pi.name) |n| break :blk4 n;
+                }
+                break :blk4 @as(?[]const u8, null);
+            };
+            if (proc_name == null) break :blk false;
+
+            const shells = [_][]const u8{ "bash", "zsh", "fish", "sh", "dash", "nu", "xonsh", "pwsh", "cmd", "elvish" };
+            for (shells) |s| {
+                if (std.mem.eql(u8, proc_name.?, s)) break :blk false;
+            }
+
+            break :blk true;
+        };
+        const status_update_interval: i64 = if (want_anim) status_update_interval_anim else status_update_interval_base;
         const until_status: i64 = @max(0, status_update_interval - since_status);
         const until_key_timer: i64 = blk: {
             if (state.nextKeyTimerDeadlineMs(now)) |deadline| {
@@ -171,6 +218,28 @@ pub fn runMainLoop(state: *State) !void {
 
         // Check if status bar needs periodic update.
         const now2 = std.time.milliTimestamp();
+
+        // Auto-scroll while selecting when the mouse is near the top/bottom.
+        // This allows selecting hidden content by holding the mouse at the edge.
+        if (state.mouse_selection.active and state.mouse_selection.edge_scroll != .none) {
+            const interval_ms: i64 = 30;
+            if (now2 - state.mouse_selection_last_autoscroll_ms >= interval_ms) {
+                state.mouse_selection_last_autoscroll_ms = now2;
+                if (state.mouse_selection.pane_uuid) |uuid| {
+                    if (state.findPaneByUuid(uuid)) |p| {
+                        switch (state.mouse_selection.edge_scroll) {
+                            .up => p.scrollUp(1),
+                            .down => p.scrollDown(1),
+                            .none => {},
+                        }
+                        // Recompute cursor in buffer coordinates for the current
+                        // viewport after the scroll.
+                        state.mouse_selection.update(p, state.mouse_selection.last_local.x, state.mouse_selection.last_local.y);
+                        state.needs_render = true;
+                    }
+                }
+            }
+        }
         if (now2 - last_status_update >= status_update_interval) {
             state.needs_render = true;
             last_status_update = now2;
@@ -191,10 +260,17 @@ pub fn runMainLoop(state: *State) !void {
 
         pane_it = state.currentLayout().splitIterator();
         while (pane_it.next()) |pane| {
+            if (!pane.*.hasPollableFd()) continue;
             if (idx < fd_count) {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
                     if (pane.*.poll(&buffer)) |had_data| {
-                        if (had_data) state.needs_render = true;
+                        if (had_data) {
+                            // If the viewport is scrolled, new output still changes what should be visible:
+                            // lines may be pushed into/out of scrollback, even if the top line stays anchored.
+                            // Force the render snapshot to refresh so the contents don't "freeze".
+                            pane.*.vt.invalidateRenderState();
+                            state.needs_render = true;
+                        }
                         if (pane.*.takeOscExpectResponse()) {
                             state.osc_reply_target_uuid = pane.*.uuid;
                         }
@@ -216,10 +292,14 @@ pub fn runMainLoop(state: *State) !void {
         defer dead_floating.deinit(allocator);
 
         for (state.floats.items, 0..) |pane, fi| {
+            if (!pane.hasPollableFd()) continue;
             if (idx < fd_count) {
                 if (poll_fds[idx].revents & posix.POLL.IN != 0) {
                     if (pane.poll(&buffer)) |had_data| {
-                        if (had_data) state.needs_render = true;
+                        if (had_data) {
+                            pane.vt.invalidateRenderState();
+                            state.needs_render = true;
+                        }
                         if (pane.takeOscExpectResponse()) {
                             state.osc_reply_target_uuid = pane.uuid;
                         }
@@ -236,17 +316,62 @@ pub fn runMainLoop(state: *State) !void {
             }
         }
 
-        // Handle ses messages.
+        // Handle SES VT channel (multiplexed pod output for all pod panes).
+        if (ses_vt_fd_idx) |vidx| {
+            if (poll_fds[vidx].revents & posix.POLL.IN != 0) {
+                const vt_fd = state.ses_client.getVtFd().?;
+                // Read as many frames as available without blocking.
+                var vt_frames: usize = 0;
+                while (vt_frames < 64) : (vt_frames += 1) {
+                    const hdr = wire.tryReadMuxVtHeader(vt_fd) catch break;
+                    if (hdr.len > buffer.len) {
+                        // Frame too large — skip it.
+                        var remaining: usize = hdr.len;
+                        while (remaining > 0) {
+                            const chunk = @min(remaining, buffer.len);
+                            wire.readExact(vt_fd, buffer[0..chunk]) catch break;
+                            remaining -= chunk;
+                        }
+                        continue;
+                    }
+                    if (hdr.len > 0) {
+                        wire.readExact(vt_fd, buffer[0..hdr.len]) catch break;
+                    }
+
+                    if (state.findPaneByPaneId(hdr.pane_id)) |pane| {
+                        if (hdr.frame_type == @intFromEnum(pod_protocol.FrameType.output)) {
+                            mux.debugLog("vt recv: pane_id={d} output len={d}", .{ hdr.pane_id, hdr.len });
+                            pane.feedPodOutput(buffer[0..hdr.len]);
+                            pane.vt.invalidateRenderState();
+                            state.needs_render = true;
+                        } else if (hdr.frame_type == @intFromEnum(pod_protocol.FrameType.backlog_end)) {
+                            mux.debugLog("vt recv: pane_id={d} backlog_end", .{hdr.pane_id});
+                            // Backlog replay finished — force full redraw.
+                            pane.vt.invalidateRenderState();
+                            state.needs_render = true;
+                            state.force_full_render = true;
+                        }
+                    } else {
+                        mux.debugLog("vt recv: unknown pane_id={d}", .{hdr.pane_id});
+                    }
+                }
+            }
+        }
+
+        // Handle ses control messages.
         if (ses_fd_idx) |sidx| {
             if (poll_fds[sidx].revents & posix.POLL.IN != 0) {
                 loop_ipc.handleSesMessage(state, &buffer);
             }
         }
 
-        // Handle IPC connections (for --notify / ad-hoc floats).
-        if (ipc_fd_idx) |iidx| {
-            if (poll_fds[iidx].revents & posix.POLL.IN != 0) {
-                loop_ipc.handleIpcConnection(state, &buffer);
+        // Check for dead pod panes (no per-pane fd to detect HUP).
+        {
+            var pod_pane_it = state.currentLayout().splitIterator();
+            while (pod_pane_it.next()) |pane| {
+                if (!pane.*.hasPollableFd() and !pane.*.isAlive()) {
+                    dead_splits.append(allocator, pane.*.id) catch {};
+                }
             }
         }
 

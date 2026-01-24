@@ -15,7 +15,7 @@ const loop_core = @import("loop_core.zig");
 
 var debug_enabled: bool = false;
 
-fn debugLog(comptime fmt: []const u8, args: anytype) void {
+pub fn debugLog(comptime fmt: []const u8, args: anytype) void {
     if (!debug_enabled) return;
     std.debug.print("[mux] " ++ fmt ++ "\n", args);
 }
@@ -36,7 +36,7 @@ pub fn run(mux_args: MuxArgs) !void {
 
     // Handle --notify: send to parent mux and exit.
     if (mux_args.notify_message) |msg| {
-        sendNotifyToParentMux(msg);
+        sendNotifyToParentMux(allocator, msg);
         return;
     }
 
@@ -87,8 +87,19 @@ pub fn run(mux_args: MuxArgs) !void {
         // Will be handled after state init.
     }
 
+    // Ignore SIGPIPE so writes to disconnected pod sockets return EPIPE
+    // instead of killing the mux process.
+    const sigpipe_action = std.os.linux.Sigaction{
+        .handler = .{ .handler = std.os.linux.SIG.IGN },
+        .mask = std.os.linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.os.linux.sigaction(posix.SIG.PIPE, &sigpipe_action, null);
+
     // Redirect stderr to a log file or /dev/null to avoid display corruption.
-    redirectStderr(mux_args.log_file);
+    // When --debug is set without --logfile, default to /tmp/hexe.
+    const effective_log: ?[]const u8 = if (mux_args.log_file) |p| (if (p.len > 0) p else null) else if (mux_args.debug) "/tmp/hexe" else null;
+    redirectStderr(effective_log);
     debug_enabled = mux_args.debug;
     debugLog("started", .{});
 
@@ -99,6 +110,25 @@ pub fn run(mux_args: MuxArgs) !void {
     var state = try State.init(allocator, size.cols, size.rows, mux_args.debug, mux_args.log_file);
     defer state.deinit();
 
+    // Show notification for config status.
+    switch (state.config.status) {
+        .missing => state.notifications.showFor("Config not found (~/.config/hexe/mux.lua), using defaults", 5000),
+        .@"error" => {
+            if (state.config.status_message) |msg| {
+                const err_msg = std.fmt.allocPrint(allocator, "Config error: {s}", .{msg}) catch null;
+                if (err_msg) |m| {
+                    state.notifications.showFor(m, 8000);
+                    allocator.free(m);
+                } else {
+                    state.notifications.showFor("Config error, using defaults", 5000);
+                }
+            } else {
+                state.notifications.showFor("Config error, using defaults", 5000);
+            }
+        },
+        .loaded => {},
+    }
+
     // Set custom session name if provided.
     if (mux_args.name) |custom_name| {
         const duped = allocator.dupe(u8, custom_name) catch null;
@@ -108,14 +138,8 @@ pub fn run(mux_args: MuxArgs) !void {
         }
     }
 
-    // Set HEXE_MUX_SOCKET environment for child processes.
-    if (state.socket_path) |path| {
-        const path_z = allocator.dupeZ(u8, path) catch null;
-        if (path_z) |p| {
-            _ = c.setenv("HEXE_MUX_SOCKET", p.ptr, 1);
-            allocator.free(p);
-        }
-    }
+    // Set HEXE_MUX_SOCKET as a flag for shell integrations.
+    _ = c.setenv("HEXE_MUX_SOCKET", "1", 1);
 
     // Connect to ses daemon FIRST (start it if needed).
     state.ses_client.connect() catch {};
@@ -200,20 +224,18 @@ fn redirectStderr(log_file: ?[]const u8) void {
     devnull.close();
 }
 
-fn sendNotifyToParentMux(message: []const u8) void {
-    const socket_path = std.posix.getenv("HEXE_MUX_SOCKET") orelse {
-        _ = posix.write(posix.STDERR_FILENO, "Not inside a hexe-mux session (HEXE_MUX_SOCKET not set)\n") catch {};
-        return;
-    };
+fn sendNotifyToParentMux(allocator: std.mem.Allocator, message: []const u8) void {
+    const wire = core.wire;
 
-    var client = core.ipc.Client.connect(socket_path) catch {
-        _ = posix.write(posix.STDERR_FILENO, "Failed to connect to mux\n") catch {};
-        return;
-    };
+    const ses_path = core.ipc.getSesSocketPath(allocator) catch return;
+    defer allocator.free(ses_path);
+
+    var client = core.ipc.Client.connect(ses_path) catch return;
     defer client.close();
+    const fd = client.fd;
 
-    var conn = client.toConnection();
-    var buf: [1024]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{{\"type\":\"notify\",\"message\":\"{s}\"}}", .{message}) catch return;
-    conn.sendLine(msg) catch {};
+    // CLI handshake + notify message.
+    _ = posix.write(fd, &.{wire.SES_HANDSHAKE_CLI}) catch return;
+    const notify = wire.Notify{ .msg_len = @intCast(message.len) };
+    wire.writeControlWithTrail(fd, .notify, std.mem.asBytes(&notify), message) catch {};
 }

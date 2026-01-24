@@ -125,8 +125,12 @@ pub fn performDisown(state: *State) void {
 
                 // Create a new shell via ses in the same directory and replace the pane's backend.
                 if (state.ses_client.createPane(null, cwd, null, null, null, null)) |result| {
-                    defer state.allocator.free(result.socket_path);
-                    p.replaceWithPod(result.socket_path, result.uuid) catch {
+                    const vt_fd = state.ses_client.getVtFd() orelse {
+                        state.notifications.show("Disown failed: no VT channel");
+                        state.needs_render = true;
+                        return;
+                    };
+                    p.replaceWithPod(result.pane_id, vt_fd, result.uuid) catch {
                         state.notifications.show("Disown failed: couldn't replace pane");
                         state.needs_render = true;
                         return;
@@ -280,9 +284,12 @@ pub fn performAdopt(state: *State, orphan_uuid: [32]u8, destroy_current: bool) v
             state.notifications.show("Swapped panes (old pane orphaned)");
         }
 
-        defer state.allocator.free(result.socket_path);
+        const vt_fd = state.ses_client.getVtFd() orelse {
+            state.notifications.show("Failed to replace pane: no VT channel");
+            return;
+        };
 
-        pane.replaceWithPod(result.socket_path, result.uuid) catch {
+        pane.replaceWithPod(result.pane_id, vt_fd, result.uuid) catch {
             state.notifications.show("Failed to replace pane");
             return;
         };
@@ -451,8 +458,13 @@ pub fn createAdhocFloat(
 
     if (use_pod and state.ses_client.isConnected()) {
         if (state.ses_client.createPane(command, cwd, null, null, env, extra_env)) |result| {
-            defer state.allocator.free(result.socket_path);
-            try pane.initWithPod(state.allocator, id, content_x, content_y, content_w, content_h, result.socket_path, result.uuid);
+            if (state.ses_client.getVtFd()) |vt_fd| {
+                try pane.initWithPod(state.allocator, id, content_x, content_y, content_w, content_h, result.pane_id, vt_fd, result.uuid);
+            } else {
+                const merged_env = mergeEnvLines(state.allocator, env, extra_env) catch null;
+                defer if (merged_env) |slice| state.allocator.free(slice);
+                try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, command, cwd, merged_env);
+            }
         } else |_| {
             const merged_env = mergeEnvLines(state.allocator, env, extra_env) catch null;
             defer if (merged_env) |slice| state.allocator.free(slice);
@@ -473,6 +485,10 @@ pub fn createAdhocFloat(
         if (t.len > 0) {
             pane.float_title = try state.allocator.dupe(u8, t);
         }
+    }
+
+    if (state.ses_client.isConnected()) {
+        state.ses_client.updatePaneName(pane.uuid, pane.float_title) catch {};
     }
 
     pane.border_x = outer_x;
@@ -552,8 +568,11 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
     // Try to create pane via ses if available.
     if (state.ses_client.isConnected()) {
         if (state.ses_client.createPane(float_def.command, current_dir, null, null, null, extra_env)) |result| {
-            defer state.allocator.free(result.socket_path);
-            try pane.initWithPod(state.allocator, id, content_x, content_y, content_w, content_h, result.socket_path, result.uuid);
+            if (state.ses_client.getVtFd()) |vt_fd| {
+                try pane.initWithPod(state.allocator, id, content_x, content_y, content_w, content_h, result.pane_id, vt_fd, result.uuid);
+            } else {
+                try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command, current_dir, extra_env);
+            }
         } else |_| {
             // Fall back to local spawn.
             try pane.initWithCommand(state.allocator, id, content_x, content_y, content_w, content_h, float_def.command, current_dir, extra_env);
@@ -572,6 +591,10 @@ pub fn createNamedFloat(state: *State, float_def: *const core.FloatDef, current_
         if (t.len > 0) {
             pane.float_title = state.allocator.dupe(u8, t) catch null;
         }
+    }
+
+    if (state.ses_client.isConnected()) {
+        state.ses_client.updatePaneName(pane.uuid, pane.float_title) catch {};
     }
     // For global floats (special or pwd), set per-tab visibility.
     // For tab-bound floats, use simple visible field.

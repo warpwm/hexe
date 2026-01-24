@@ -31,6 +31,7 @@ const FocusContext = core.Config.FocusContext;
 const state_tabs = @import("state_tabs.zig");
 const state_serialize = @import("state_serialize.zig");
 const state_sync = @import("state_sync.zig");
+const mouse_selection = @import("mouse_selection.zig");
 
 pub const TabFocusKind = enum { split, float };
 
@@ -41,6 +42,10 @@ pub const PaneShellInfo = struct {
     duration_ms: ?u64 = null,
     jobs: ?u16 = null,
 
+    // Running command telemetry (best-effort, sourced from shell integration).
+    running: bool = false,
+    started_at_ms: ?u64 = null,
+
     pub fn deinit(self: *PaneShellInfo, allocator: std.mem.Allocator) void {
         if (self.cmd) |c| allocator.free(c);
         if (self.cwd) |c| allocator.free(c);
@@ -48,7 +53,52 @@ pub const PaneShellInfo = struct {
     }
 };
 
+pub const PaneProcInfo = struct {
+    name: ?[]u8 = null,
+    pid: ?i32 = null,
+
+    pub fn deinit(self: *PaneProcInfo, allocator: std.mem.Allocator) void {
+        if (self.name) |n| allocator.free(n);
+        self.* = .{};
+    }
+};
+
 pub const State = struct {
+    pub const MouseDragSplitResize = struct {
+        split: *layout_mod.LayoutNode.Split,
+        dir: layout_mod.SplitDir,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    };
+
+    pub const MouseDragFloatMove = struct {
+        uuid: [32]u8,
+        start_x: u16,
+        start_y: u16,
+        orig_x: u16,
+        orig_y: u16,
+    };
+
+    pub const MouseDragFloatResize = struct {
+        uuid: [32]u8,
+        edge_mask: u8,
+        start_x: u16,
+        start_y: u16,
+        orig_x: u16,
+        orig_y: u16,
+        orig_w: u16,
+        orig_h: u16,
+    };
+
+    pub const MouseDrag = union(enum) {
+        none,
+        split_resize: MouseDragSplitResize,
+        float_move: MouseDragFloatMove,
+        float_resize: MouseDragFloatResize,
+    };
+
     allocator: std.mem.Allocator,
     config: core.Config,
     pop_config: pop.PopConfig,
@@ -76,8 +126,7 @@ pub const State = struct {
     popups: pop.PopupManager,
     pending_action: ?PendingAction,
     exit_from_shell_death: bool,
-    /// IPC client waiting for exit_intent decision (fd kept open)
-    pending_exit_intent_fd: ?posix.fd_t,
+    pending_exit_intent: bool,
     /// If non-zero and in the future, skip confirm_on_exit for the next last-pane death.
     exit_intent_deadline_ms: i64,
     adopt_orphans: [32]OrphanedPaneInfo = undefined,
@@ -91,8 +140,6 @@ pub const State = struct {
     uuid: [32]u8,
     session_name: []const u8,
     session_name_owned: ?[]const u8,
-    ipc_server: ?core.ipc.Server,
-    socket_path: ?[]const u8,
 
     osc_reply_target_uuid: ?[32]u8,
     osc_reply_buf: std.ArrayList(u8),
@@ -107,8 +154,36 @@ pub const State = struct {
 
     pending_float_requests: std.AutoHashMap([32]u8, PendingFloatRequest),
 
+    mouse_selection: mouse_selection.MouseSelection,
+    mouse_selection_last_autoscroll_ms: i64,
+
+    mouse_drag: MouseDrag,
+
+    // Float title rename (inline editing)
+    float_rename_uuid: ?[32]u8,
+    float_rename_buf: std.ArrayList(u8),
+
+    // Title click counter (for double-click rename)
+    mouse_title_last_ms: i64,
+    mouse_title_click_count: u8,
+    mouse_title_last_uuid: ?[32]u8,
+    mouse_title_last_x: u16,
+    mouse_title_last_y: u16,
+
+    mouse_click_last_ms: i64,
+    mouse_click_count: u8,
+    mouse_click_last_pane_uuid: ?[32]u8,
+    mouse_click_last_x: u16,
+    mouse_click_last_y: u16,
+
     /// Shell-provided metadata (last command, status, duration) keyed by pane UUID.
     pane_shell: std.AutoHashMap([32]u8, PaneShellInfo),
+
+    /// Best-effort foreground process info keyed by pane UUID.
+    ///
+    /// For local PTY panes we can read this directly in mux.
+    /// For pod panes we query it from ses (which can inspect /proc).
+    pane_proc: std.AutoHashMap([32]u8, PaneProcInfo),
 
     // Keybinding timers (hold/double-tap delayed press)
     key_timers: std.ArrayList(PendingKeyTimer),
@@ -122,12 +197,6 @@ pub const State = struct {
 
         const uuid = core.ipc.generateUuid();
         const session_name = core.ipc.generateSessionName();
-
-        const socket_path = core.ipc.getMuxSocketPath(allocator, &uuid) catch null;
-        var ipc_server: ?core.ipc.Server = null;
-        if (socket_path) |path| {
-            ipc_server = core.ipc.Server.init(allocator, path) catch null;
-        }
 
         return .{
             .allocator = allocator,
@@ -154,7 +223,7 @@ pub const State = struct {
             .popups = pop.PopupManager.init(allocator),
             .pending_action = null,
             .exit_from_shell_death = false,
-            .pending_exit_intent_fd = null,
+            .pending_exit_intent = false,
             .exit_intent_deadline_ms = 0,
             .skip_dead_check = false,
             .pending_pop_response = false,
@@ -164,8 +233,6 @@ pub const State = struct {
             .uuid = uuid,
             .session_name = session_name,
             .session_name_owned = null,
-            .ipc_server = ipc_server,
-            .socket_path = socket_path,
 
             .osc_reply_target_uuid = null,
             .osc_reply_buf = .empty,
@@ -174,29 +241,85 @@ pub const State = struct {
 
             .pending_float_requests = std.AutoHashMap([32]u8, PendingFloatRequest).init(allocator),
 
+            .mouse_selection = .{},
+            .mouse_selection_last_autoscroll_ms = 0,
+
+            .mouse_drag = .none,
+
+            .float_rename_uuid = null,
+            .float_rename_buf = .empty,
+
+            .mouse_title_last_ms = 0,
+            .mouse_title_click_count = 0,
+            .mouse_title_last_uuid = null,
+            .mouse_title_last_x = 0,
+            .mouse_title_last_y = 0,
+
+            .mouse_click_last_ms = 0,
+            .mouse_click_count = 0,
+            .mouse_click_last_pane_uuid = null,
+            .mouse_click_last_x = 0,
+            .mouse_click_last_y = 0,
+
             .pane_shell = std.AutoHashMap([32]u8, PaneShellInfo).init(allocator),
+
+            .pane_proc = std.AutoHashMap([32]u8, PaneProcInfo).init(allocator),
 
             .key_timers = .empty,
         };
     }
 
+    pub fn beginFloatRename(self: *State, pane: *Pane) void {
+        const title = pane.float_title orelse return;
+        if (title.len == 0) return;
+
+        self.float_rename_uuid = pane.uuid;
+        self.float_rename_buf.clearRetainingCapacity();
+
+        const cap: usize = 64;
+        const slice = title[0..@min(title.len, cap)];
+        self.float_rename_buf.appendSlice(self.allocator, slice) catch {};
+        self.needs_render = true;
+    }
+
+    pub fn clearFloatRename(self: *State) void {
+        self.float_rename_uuid = null;
+        self.float_rename_buf.clearRetainingCapacity();
+        self.needs_render = true;
+    }
+
+    pub fn commitFloatRename(self: *State) void {
+        const uuid = self.float_rename_uuid orelse return;
+        const pane = self.findPaneByUuid(uuid) orelse {
+            self.clearFloatRename();
+            return;
+        };
+
+        const new_title = std.mem.trim(u8, self.float_rename_buf.items, " \t\r\n");
+        if (pane.float_title) |old| {
+            self.allocator.free(old);
+            pane.float_title = null;
+        }
+        if (new_title.len > 0) {
+            pane.float_title = self.allocator.dupe(u8, new_title) catch null;
+        }
+
+        // Best-effort: store title in ses memory for reattach.
+        if (self.ses_client.isConnected()) {
+            self.ses_client.updatePaneName(pane.uuid, pane.float_title) catch {};
+        }
+
+        self.clearFloatRename();
+        self.renderer.invalidate();
+        self.force_full_render = true;
+        self.syncStateToSes();
+    }
+
     pub fn deinit(self: *State) void {
-        var ses_shutdown_done = false;
-
+        // When exiting normally (not detach), tell SES to kill our panes.
+        // When detaching, panes stay alive for later reattach.
         if (!self.detach_mode and self.ses_client.isConnected()) {
-            // Persist sticky float metadata before shutdown.
-            for (self.floats.items) |pane| {
-                if (pane.sticky and pane.float_key != 0) {
-                    if (pane.getPwd()) |cwd| {
-                        self.ses_client.setSticky(pane.uuid, cwd, pane.float_key) catch {};
-                    }
-                }
-            }
-
-            // Tell ses this is a normal shutdown so it kills panes
-            // instead of treating the disconnect as a crash.
-            self.ses_client.shutdown(true) catch {};
-            ses_shutdown_done = true;
+            self.ses_client.shutdown(false) catch {};
         }
 
         // Free shell metadata.
@@ -208,34 +331,25 @@ pub const State = struct {
             self.pane_shell.deinit();
         }
 
+        // Free proc metadata.
+        {
+            var it = self.pane_proc.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.pane_proc.deinit();
+        }
+
         self.key_timers.deinit(self.allocator);
 
         // Deinit floats.
         for (self.floats.items) |pane| {
-            if (!self.detach_mode and self.ses_client.isConnected() and !ses_shutdown_done) {
-                if (pane.sticky) {
-                    if (pane.float_key != 0) {
-                        if (pane.getPwd()) |cwd| {
-                            self.ses_client.setSticky(pane.uuid, cwd, pane.float_key) catch {};
-                        }
-                    }
-                    self.ses_client.orphanPane(pane.uuid) catch {};
-                } else {
-                    self.ses_client.killPane(pane.uuid) catch {};
-                }
-            }
             pane.deinit();
             self.allocator.destroy(pane);
         }
         self.floats.deinit(self.allocator);
 
         for (self.tabs.items) |*tab| {
-            if (!self.detach_mode and self.ses_client.isConnected() and !ses_shutdown_done) {
-                var pane_it = tab.layout.splits.valueIterator();
-                while (pane_it.next()) |pane_ptr| {
-                    self.ses_client.killPane(pane_ptr.*.uuid) catch {};
-                }
-            }
             tab.deinit();
         }
         self.tabs.deinit(self.allocator);
@@ -249,18 +363,13 @@ pub const State = struct {
         self.popups.deinit();
         var req_it = self.pending_float_requests.iterator();
         while (req_it.next()) |entry| {
-            _ = posix.close(entry.value_ptr.fd);
             if (entry.value_ptr.result_path) |path| {
                 self.allocator.free(path);
             }
         }
         self.pending_float_requests.deinit();
-        if (self.ipc_server) |*srv| {
-            srv.deinit();
-        }
-        if (self.socket_path) |path| {
-            self.allocator.free(path);
-        }
+
+        self.float_rename_buf.deinit(self.allocator);
         if (self.session_name_owned) |owned| {
             self.allocator.free(owned);
         }
@@ -298,6 +407,10 @@ pub const State = struct {
         return state_tabs.findPaneByUuid(self, uuid);
     }
 
+    pub fn findPaneByPaneId(self: *State, pane_id: u16) ?*Pane {
+        return state_tabs.findPaneByPaneId(self, pane_id);
+    }
+
     pub fn createTab(self: *State) !void {
         return state_tabs.createTab(self);
     }
@@ -310,8 +423,8 @@ pub const State = struct {
         return state_tabs.adoptStickyPanes(self);
     }
 
-    pub fn adoptAsFloat(self: *State, uuid: [32]u8, socket_path: []const u8, pid: posix.pid_t, float_def: *const core.FloatDef, cwd: []const u8) !void {
-        return state_tabs.adoptAsFloat(self, uuid, socket_path, pid, float_def, cwd);
+    pub fn adoptAsFloat(self: *State, uuid: [32]u8, pane_id: u16, float_def: *const core.FloatDef, cwd: []const u8) !void {
+        return state_tabs.adoptAsFloat(self, uuid, pane_id, float_def, cwd);
     }
 
     pub fn nextTab(self: *State) void {
@@ -411,8 +524,49 @@ pub const State = struct {
         }
     }
 
+    pub fn setPaneShellRunning(self: *State, uuid: [32]u8, running: bool, started_at_ms: ?u64, cmd: ?[]const u8, cwd: ?[]const u8, jobs: ?u16) void {
+        var entry = self.pane_shell.getPtr(uuid);
+        if (entry == null) {
+            self.pane_shell.put(uuid, .{}) catch return;
+            entry = self.pane_shell.getPtr(uuid);
+        }
+        if (entry) |info| {
+            info.running = running;
+            if (started_at_ms) |t| info.started_at_ms = t;
+            if (cmd) |c| {
+                if (info.cmd) |old| self.allocator.free(old);
+                info.cmd = self.allocator.dupe(u8, c) catch info.cmd;
+            }
+            if (cwd) |c| {
+                if (info.cwd) |old| self.allocator.free(old);
+                info.cwd = self.allocator.dupe(u8, c) catch info.cwd;
+            }
+            if (jobs) |j| info.jobs = j;
+        }
+    }
+
+    pub fn setPaneProc(self: *State, uuid: [32]u8, name: ?[]const u8, pid: ?i32) void {
+        var entry = self.pane_proc.getPtr(uuid);
+        if (entry == null) {
+            self.pane_proc.put(uuid, .{}) catch return;
+            entry = self.pane_proc.getPtr(uuid);
+        }
+        if (entry) |info| {
+            if (name) |n| {
+                if (info.name) |old| self.allocator.free(old);
+                info.name = self.allocator.dupe(u8, n) catch info.name;
+            }
+            if (pid) |p| info.pid = p;
+        }
+    }
+
     pub fn getPaneShell(self: *const State, uuid: [32]u8) ?PaneShellInfo {
         if (self.pane_shell.get(uuid)) |v| return v;
+        return null;
+    }
+
+    pub fn getPaneProc(self: *const State, uuid: [32]u8) ?PaneProcInfo {
+        if (self.pane_proc.get(uuid)) |v| return v;
         return null;
     }
 };

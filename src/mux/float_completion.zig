@@ -1,33 +1,13 @@
 const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
+const wire = core.wire;
 
 const State = @import("state.zig").State;
 const Pane = @import("pane.zig").Pane;
 
-fn writeJsonEscaped(writer: anytype, value: []const u8) !void {
-    for (value) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (ch < 0x20) {
-                    try writer.writeByte(' ');
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
-        }
-    }
-}
-
 pub fn handleBlockingFloatCompletion(state: *State, pane: *Pane) void {
     const entry = state.pending_float_requests.fetchRemove(pane.uuid) orelse return;
-    var conn = core.ipc.Connection{ .fd = entry.value.fd };
-    defer conn.close();
 
     const exit_code = pane.getExitCode();
     var stdout: ?[]u8 = null;
@@ -46,15 +26,13 @@ pub fn handleBlockingFloatCompletion(state: *State, pane: *Pane) void {
         state.allocator.free(path);
     }
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(state.allocator);
-    var writer = buf.writer(state.allocator);
-
-    writer.print("{{\"type\":\"float_result\",\"uuid\":\"{s}\",\"exit_code\":{d},\"stdout\":\"", .{ pane.uuid, exit_code }) catch return;
-    if (stdout) |out| {
-        writeJsonEscaped(writer, out) catch return;
-    }
-    writer.writeAll("\"}\n") catch return;
-
-    conn.send(buf.items) catch {};
+    // Send FloatResult to SES on the ctl channel.
+    const ctl_fd = state.ses_client.getCtlFd() orelse return;
+    const output = stdout orelse "";
+    const result = wire.FloatResult{
+        .uuid = pane.uuid,
+        .exit_code = exit_code,
+        .output_len = @intCast(output.len),
+    };
+    wire.writeControlWithTrail(ctl_fd, .float_result, std.mem.asBytes(&result), output) catch {};
 }

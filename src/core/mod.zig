@@ -4,7 +4,13 @@ pub const pty = @import("pty.zig");
 pub const vt = @import("vt.zig");
 pub const config = @import("config.zig");
 pub const ipc = @import("ipc.zig");
+pub const wire = @import("wire.zig");
 pub const pod_protocol = @import("pod_protocol.zig");
+pub const pod_meta = @import("pod_meta.zig");
+pub const lua_runtime = @import("lua_runtime.zig");
+
+pub const LuaRuntime = lua_runtime.LuaRuntime;
+pub const ConfigStatus = lua_runtime.ConfigStatus;
 
 pub const Pty = pty.Pty;
 pub const VT = vt.VT;
@@ -23,5 +29,8 @@ pub const SplitsConfig = config.SplitsConfig;
 pub const PanesConfig = config.PanesConfig;
 pub const StatusModule = config.StatusModule;
 pub const OutputDef = config.OutputDef;
+pub const WhenDef = config.WhenDef;
+pub const WhenTokens = config.WhenTokens;
+pub const SpinnerDef = config.SpinnerDef;
 pub const NotificationStyleConfig = config.NotificationStyleConfig;
 pub const NotificationConfig = config.NotificationConfig;

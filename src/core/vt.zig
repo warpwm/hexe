@@ -4,6 +4,13 @@ const std = @import("std");
 pub const ghostty = @import("ghostty-vt");
 pub const Terminal = ghostty.Terminal;
 
+// Ghostty's `max_scrollback` is measured in BYTES (rounded up to its internal
+// page size), not in lines.
+//
+// We set this to match the pod backlog size so the interactive in-mux
+// scrollback feels consistent with detach/reattach behavior.
+const DEFAULT_SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
+
 const ReadonlyStream = @TypeOf((@as(*Terminal, undefined)).vtStream());
 
 /// Thin wrapper around ghostty Terminal
@@ -14,6 +21,10 @@ pub const VT = struct {
     render_state: ghostty.RenderState = .empty,
     width: u16 = 0,
     height: u16 = 0,
+    // NOTE: Do NOT cache RenderState across calls.
+    // Ghostty's "visible viewport" for main-screen scrollback can change due to
+    // viewport movement even when no new output is fed. Caching at this layer can
+    // cause panes to appear visually frozen while scrolling.
 
     /// Initialize the VT in-place.
     ///
@@ -23,7 +34,11 @@ pub const VT = struct {
     pub fn init(self: *VT, allocator: std.mem.Allocator, width: u16, height: u16) !void {
         self.* = .{ .allocator = allocator, .width = width, .height = height };
 
-        self.terminal = try Terminal.init(allocator, .{ .cols = width, .rows = height });
+        self.terminal = try Terminal.init(allocator, .{
+            .cols = width,
+            .rows = height,
+            .max_scrollback = DEFAULT_SCROLLBACK_BYTES,
+        });
         errdefer self.terminal.deinit(allocator);
 
         self.stream = self.terminal.vtStream();
@@ -43,6 +58,14 @@ pub const VT = struct {
     /// state for sequences that arrive split across PTY reads.
     pub fn feed(self: *VT, data: []const u8) !void {
         try self.stream.nextSlice(data);
+    }
+
+    /// Mark the VT as needing a fresh render snapshot.
+    ///
+    /// Kept for API compatibility with callers, but RenderState is currently not
+    /// cached so this is a no-op.
+    pub fn invalidateRenderState(self: *VT) void {
+        _ = self;
     }
 
     /// Resize the virtual terminal

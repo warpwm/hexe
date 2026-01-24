@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const core = @import("core");
 const ipc = core.ipc;
+const wire = core.wire;
 const ses = @import("main.zig");
 
 /// Pane state - minimal, just keeps process alive
@@ -26,6 +27,11 @@ pub const Pane = struct {
     pod_socket_path: []const u8,
     child_pid: posix.pid_t,
     state: PaneState,
+
+    // Binary protocol fields (Phase 3+4)
+    pane_id: u16 = 0,
+    pod_vt_fd: ?posix.fd_t = null,
+    pod_ctl_fd: ?posix.fd_t = null,
 
     // For sticky pwd floats
     sticky_pwd: ?[]const u8,
@@ -195,6 +201,10 @@ pub const Client = struct {
     session_name: ?[]const u8, // Pokemon name for this session
     last_mux_state: ?[]const u8, // most recent synced state for crash recovery
 
+    // Binary protocol channels (Phase 3+4)
+    mux_ctl_fd: ?posix.fd_t = null,
+    mux_vt_fd: ?posix.fd_t = null,
+
     pub fn init(allocator: std.mem.Allocator, id: usize, fd: posix.fd_t) Client {
         return .{
             .id = id,
@@ -266,6 +276,13 @@ pub const SesState = struct {
     orphan_timeout_hours: u32,
     dirty: bool,
 
+    // Binary protocol state (Phase 3+4)
+    next_pane_id: u16 = 1,
+    pane_id_to_pod_vt: std.AutoHashMap(u16, posix.fd_t),
+    pod_vt_to_pane_id: std.AutoHashMap(posix.fd_t, u16),
+    /// Fds that need to be added to the server poll set (populated by connectPodVt).
+    pending_poll_fds: std.ArrayList(posix.fd_t),
+
     pub fn init(_: std.mem.Allocator) SesState {
         // Always use page_allocator to avoid GPA issues after fork/daemonization
         const page_alloc = std.heap.page_allocator;
@@ -277,7 +294,52 @@ pub const SesState = struct {
             .next_client_id = 1,
             .orphan_timeout_hours = 24,
             .dirty = false,
+            .pane_id_to_pod_vt = std.AutoHashMap(u16, posix.fd_t).init(page_alloc),
+            .pod_vt_to_pane_id = std.AutoHashMap(posix.fd_t, u16).init(page_alloc),
+            .pending_poll_fds = .empty,
         };
+    }
+
+    pub fn allocPaneId(self: *SesState) u16 {
+        const id = self.next_pane_id;
+        self.next_pane_id +%= 1;
+        if (self.next_pane_id == 0) self.next_pane_id = 1;
+        return id;
+    }
+
+    /// Connect the VT data channel (③) to a POD socket.
+    /// On success, stores the fd in the pane and populates routing tables.
+    pub fn connectPodVt(self: *SesState, uuid: [32]u8, pod_socket_path: []const u8, pane_id: u16) void {
+        const client = core.ipc.Client.connect(pod_socket_path) catch {
+            ses.debugLog("connectPodVt: failed to connect to {s}", .{pod_socket_path});
+            return;
+        };
+        const fd = client.fd;
+
+        // Send handshake byte.
+        const handshake = [_]u8{wire.POD_HANDSHAKE_SES_VT};
+        wire.writeAll(fd, &handshake) catch {
+            posix.close(fd);
+            return;
+        };
+
+        // Store in pane.
+        if (self.panes.getPtr(uuid)) |pane| {
+            if (pane.pod_vt_fd) |old_fd| {
+                _ = self.pod_vt_to_pane_id.remove(old_fd);
+                posix.close(old_fd);
+            }
+            pane.pod_vt_fd = fd;
+        }
+
+        // Populate routing tables.
+        self.pane_id_to_pod_vt.put(pane_id, fd) catch {};
+        self.pod_vt_to_pane_id.put(fd, pane_id) catch {};
+
+        // Queue fd for poll set addition by the server loop.
+        self.pending_poll_fds.append(self.allocator, fd) catch {};
+
+        ses.debugLog("connectPodVt: pane_id={d} fd={d}", .{ pane_id, fd });
     }
 
     pub fn markDirty(self: *SesState) void {
@@ -290,6 +352,8 @@ pub const SesState = struct {
         while (pane_iter.next()) |pane| {
             // ses is registry-only; do not kill pods on shutdown.
             var p = pane;
+            if (p.pod_vt_fd) |fd| posix.close(fd);
+            if (p.pod_ctl_fd) |fd| posix.close(fd);
             p.deinit();
         }
         self.panes.deinit();
@@ -304,9 +368,14 @@ pub const SesState = struct {
 
         // Cleanup clients
         for (self.clients.items) |*client| {
+            if (client.mux_ctl_fd) |fd| posix.close(fd);
+            if (client.mux_vt_fd) |fd| posix.close(fd);
             client.deinit();
         }
         self.clients.deinit(self.allocator);
+
+        self.pane_id_to_pod_vt.deinit();
+        self.pod_vt_to_pane_id.deinit();
     }
 
     /// Add a new client connection
@@ -633,6 +702,8 @@ pub const SesState = struct {
 
         const now = std.time.timestamp();
 
+        const pane_id = self.allocPaneId();
+
         const pane = Pane{
             .uuid = uuid,
             .name = name,
@@ -646,11 +717,15 @@ pub const SesState = struct {
             .session_id = null,
             .created_at = now,
             .orphaned_at = null,
+            .pane_id = pane_id,
             .allocator = self.allocator,
         };
 
         try self.panes.put(uuid, pane);
         self.dirty = true;
+
+        // Connect VT channel (③) to POD — best-effort.
+        self.connectPodVt(uuid, pod_socket_path, pane_id);
 
         // Add to client's pane list
         if (self.getClient(client_id)) |client| {
@@ -704,6 +779,21 @@ pub const SesState = struct {
         try args_list.append(self.allocator, exe_path);
         try args_list.append(self.allocator, "pod");
         try args_list.append(self.allocator, "daemon");
+
+        // Propagate instance/test-only flags for debugging/clarity.
+        // Runtime behavior is primarily controlled by environment (HEXE_INSTANCE).
+        if (posix.getenv("HEXE_INSTANCE")) |inst| {
+            if (inst.len > 0) {
+                try args_list.append(self.allocator, "--instance");
+                try args_list.append(self.allocator, inst);
+            }
+        }
+        if (posix.getenv("HEXE_TEST_ONLY")) |v| {
+            if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+                try args_list.append(self.allocator, "--test-only");
+            }
+        }
+
         try args_list.append(self.allocator, "--uuid");
         try args_list.append(self.allocator, uuid[0..]);
         try args_list.append(self.allocator, "--name");
@@ -733,7 +823,11 @@ pub const SesState = struct {
         var env_map_storage: ?std.process.EnvMap = null;
         defer if (env_map_storage) |*map| map.deinit();
 
-        if (env != null or extra_env != null) {
+        const instance_env = posix.getenv("HEXE_INSTANCE");
+        const test_only_env = posix.getenv("HEXE_TEST_ONLY");
+        const needs_runtime_env = (instance_env != null and instance_env.?.len > 0) or (test_only_env != null and test_only_env.?.len > 0);
+
+        if (env != null or extra_env != null or needs_runtime_env) {
             var env_map = if (env == null)
                 try std.process.getEnvMap(self.allocator)
             else
@@ -753,6 +847,15 @@ pub const SesState = struct {
                     if (sep == 0 or sep + 1 > entry.len) continue;
                     try env_map.put(entry[0..sep], entry[sep + 1 ..]);
                 }
+            }
+
+            // Force instance/test-only values from this ses process.
+            // This prevents user-provided env overrides from escaping the instance namespace.
+            if (instance_env) |inst| {
+                if (inst.len > 0) try env_map.put("HEXE_INSTANCE", inst);
+            }
+            if (test_only_env) |v| {
+                if (v.len > 0) try env_map.put("HEXE_TEST_ONLY", v);
             }
 
             env_map_storage = env_map;

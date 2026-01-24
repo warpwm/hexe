@@ -239,25 +239,16 @@ pub fn syncPaneUnfocus(self: anytype, pane: *Pane) void {
 pub fn refreshPaneCwd(self: anytype, pane: *Pane) ?[]const u8 {
     switch (pane.backend) {
         .pod => {
-            if (self.ses_client.getPaneCwd(pane.uuid)) |cwd| {
-                pane.setSesCwd(cwd);
-            }
+            // Fire-and-forget: response updates pane CWD via handleSesMessage.
+            self.ses_client.requestPaneCwd(pane.uuid);
         },
         .local => {},
     }
     return pane.getRealCwd();
 }
 
-pub fn getSpawnCwd(self: anytype, pane: *Pane) ?[]const u8 {
-    switch (pane.backend) {
-        .pod => {
-            if (self.ses_client.getPaneCwd(pane.uuid)) |cwd| {
-                pane.setSesCwd(cwd);
-                return cwd;
-            }
-        },
-        .local => {},
-    }
+pub fn getSpawnCwd(_: anytype, pane: *Pane) ?[]const u8 {
+    // Use cached CWD (async requests keep it updated).
     return pane.getRealCwd();
 }
 
@@ -274,6 +265,17 @@ pub fn syncFocusedPaneInfo(self: anytype) void {
     if (p.uuid[0] == 0) return;
 
     _ = self.refreshPaneCwd(p);
+
+    // Best-effort process detection.
+    // - local PTY panes: query directly
+    // - pod panes: fire-and-forget request (response updates cache via handleSesMessage)
+    const fg_proc_local = p.getFgProcess();
+    const fg_pid_local: ?i32 = if (p.getFgPid()) |pid| @intCast(pid) else null;
+    if (fg_proc_local) |proc_name| {
+        self.setPaneProc(p.uuid, proc_name, fg_pid_local);
+    } else if (p.backend == .pod) {
+        self.ses_client.requestPaneProcess(p.uuid);
+    }
 
     const pane_type: SesClient.PaneType = if (p.floating) .float else .split;
     const cursor = p.getCursorPos();
@@ -295,8 +297,8 @@ pub fn syncFocusedPaneInfo(self: anytype) void {
         alt_screen,
         .{ .cols = p.width, .rows = p.height },
         p.getRealCwd(),
-        null,
-        null,
+        fg_proc_local,
+        if (p.getFgPid()) |pid| pid else null,
         layout_path,
     ) catch {};
 }

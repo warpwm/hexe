@@ -128,40 +128,6 @@ pub const Connection = struct {
         }
     }
 
-    /// Receive data without file descriptor
-    pub fn recv(self: *Connection, buf: []u8) !usize {
-        return posix.read(self.fd, buf);
-    }
-
-    /// Send a line (data + newline)
-    pub fn sendLine(self: *Connection, data: []const u8) !void {
-        try self.send(data);
-        try self.send("\n");
-    }
-
-    /// Receive a line (up to newline, newline not included in result)
-    pub fn recvLine(self: *Connection, buf: []u8) !?[]const u8 {
-        var i: usize = 0;
-        while (i < buf.len) {
-            const n = posix.read(self.fd, buf[i .. i + 1]) catch |err| {
-                if (err == error.WouldBlock) {
-                    if (i == 0) return null;
-                    continue;
-                }
-                return err;
-            };
-            if (n == 0) {
-                if (i == 0) return null;
-                return buf[0..i];
-            }
-            if (buf[i] == '\n') {
-                return buf[0..i];
-            }
-            i += 1;
-        }
-        return buf[0..i];
-    }
-
     /// Send data along with a file descriptor using SCM_RIGHTS
     pub fn sendWithFd(self: *Connection, data: []const u8, fd_to_send: posix.fd_t) !void {
         var iov: c.struct_iovec = .{
@@ -359,10 +325,36 @@ pub fn generateTabName() []const u8 {
     return constellation_names[index];
 }
 
+fn sanitizeInstanceName(out: []u8, raw: []const u8) []const u8 {
+    // Keep instance names filesystem- and socket-friendly.
+    // NOTE: Unix domain socket paths have tight limits; keep this short.
+    const max_len: usize = @min(out.len, 24);
+    var n: usize = 0;
+    for (raw) |ch| {
+        if (n >= max_len) break;
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '.';
+        out[n] = if (ok) ch else '_';
+        n += 1;
+    }
+    return out[0..n];
+}
+
 /// Get the socket directory path
 pub fn getSocketDir(allocator: std.mem.Allocator) ![]const u8 {
     // Use XDG_RUNTIME_DIR if available, otherwise /tmp
     const runtime_dir = std.posix.getenv("XDG_RUNTIME_DIR") orelse "/tmp";
+
+    const instance_raw = std.posix.getenv("HEXE_INSTANCE");
+    if (instance_raw) |inst| {
+        if (inst.len > 0) {
+            var buf: [32]u8 = undefined;
+            const sanitized = sanitizeInstanceName(buf[0..], inst);
+            if (sanitized.len > 0) {
+                return std.fmt.allocPrint(allocator, "{s}/hexe/{s}", .{ runtime_dir, sanitized });
+            }
+        }
+    }
+
     return std.fmt.allocPrint(allocator, "{s}/hexe", .{runtime_dir});
 }
 
@@ -383,13 +375,6 @@ pub fn isSesRunning(allocator: std.mem.Allocator) bool {
     return true;
 }
 
-/// Get a mux socket path for a given UUID
-pub fn getMuxSocketPath(allocator: std.mem.Allocator, uuid: []const u8) ![]const u8 {
-    const dir = try getSocketDir(allocator);
-    defer allocator.free(dir);
-    return std.fmt.allocPrint(allocator, "{s}/mux-{s}.sock", .{ dir, uuid });
-}
-
 /// Get a pod socket path for a given pane UUID
 pub fn getPodSocketPath(allocator: std.mem.Allocator, uuid: []const u8) ![]const u8 {
     const dir = try getSocketDir(allocator);
@@ -405,6 +390,20 @@ pub fn getSesStatePath(allocator: std.mem.Allocator) ![]const u8 {
         break :blk try std.fmt.allocPrint(allocator, "{s}/.local/state", .{home});
     };
     defer if (state_home_env == null) allocator.free(state_home);
+
+    const instance_raw = posix.getenv("HEXE_INSTANCE");
+    if (instance_raw) |inst| {
+        if (inst.len > 0) {
+            var buf: [32]u8 = undefined;
+            const sanitized = sanitizeInstanceName(buf[0..], inst);
+            if (sanitized.len > 0) {
+                const dir = try std.fmt.allocPrint(allocator, "{s}/hexe/{s}", .{ state_home, sanitized });
+                defer allocator.free(dir);
+                std.fs.cwd().makePath(dir) catch {};
+                return std.fmt.allocPrint(allocator, "{s}/hexe/{s}/ses_state.json", .{ state_home, sanitized });
+            }
+        }
+    }
 
     const dir = try std.fmt.allocPrint(allocator, "{s}/hexe", .{state_home});
     defer allocator.free(dir);
